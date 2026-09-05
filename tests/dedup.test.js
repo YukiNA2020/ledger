@@ -98,7 +98,7 @@ test('跨源高置信：同额同期自动合并（渠道保留，银行遮蔽�
 
 test('自动合并后统计只计一次；撤销后恢复两条', () => {
   const channel = mkTxn({ type: 'expense', source: 'wechat', amount: 4500, date: '2026-05-02' });
-  const bank = mkTxn({ type: 'expense', source: 'bank', amount: 4500, date: '2026-05-02' });
+  const bank = mkTxn({ type: 'expense', source: 'bank', amount: 4500, date: '2026-05-02', merchant: '快捷支付-微信支付' });
   const m = Core.matchDuplicates([bank], [channel]);
   Core.applyAutoMerge(m.autoMerged[0]);
 
@@ -142,6 +142,36 @@ test('不同金额不匹配', () => {
   const m = Core.matchDuplicates(incoming, existing);
   assert.strictEqual(m.autoMerged.length, 0);
   assert.strictEqual(m.needConfirm.length, 0);
+});
+
+test('银行摘要未确认支付渠道时不自动合并', () => {
+  const existing = [mkTxn({ type: 'expense', source: 'wechat', amount: 4500, date: '2026-05-02', merchant: '肯德基' })];
+  const incoming = [mkTxn({ type: 'expense', source: 'bank', amount: 4500, date: '2026-05-02', merchant: '银行卡消费' })];
+  const m = Core.matchDuplicates(incoming, existing);
+  assert.strictEqual(m.autoMerged.length, 0);
+  assert.strictEqual(m.needConfirm.length, 1);
+  assert.match(m.needConfirm[0].reason, /未确认支付渠道/);
+});
+
+test('同金额近日期存在多个候选时不自动合并', () => {
+  const existing = [
+    mkTxn({ type: 'expense', source: 'wechat', amount: 2000, date: '2026-05-02', merchant: '早餐店' }),
+    mkTxn({ type: 'expense', source: 'wechat', amount: 2000, date: '2026-05-02', merchant: '便利店' })
+  ];
+  const incoming = [mkTxn({ type: 'expense', source: 'bank', amount: 2000, date: '2026-05-02', merchant: '财付通-微信支付' })];
+  const m = Core.matchDuplicates(incoming, existing);
+  assert.strictEqual(m.autoMerged.length, 0);
+  assert.strictEqual(m.needConfirm.length, 1);
+  assert.match(m.needConfirm[0].reason, /候选不唯一/);
+});
+
+test('银行渠道痕迹与渠道账单冲突时不匹配', () => {
+  const existing = [mkTxn({ type: 'expense', source: 'alipay', amount: 4500, date: '2026-05-02', merchant: '肯德基' })];
+  const incoming = [mkTxn({ type: 'expense', source: 'bank', amount: 4500, date: '2026-05-02', merchant: '财付通-微信支付' })];
+  const m = Core.matchDuplicates(incoming, existing);
+  assert.strictEqual(m.autoMerged.length, 0);
+  assert.strictEqual(m.needConfirm.length, 0);
+  assert.strictEqual(m.unique.length, 1);
 });
 
 /* ---------- 提现两端 → 转账 ---------- */

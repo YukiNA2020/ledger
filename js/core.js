@@ -510,15 +510,22 @@
 
   // 智能推荐类型映射：交易类型文本 → expense/income/transfer/refund/ignore
   function suggestTypeMappings(records) {
-    var seen = {}, map = {};
+    var seen = {}, mixed = {}, map = {};
     records.forEach(function (r) {
       var key = r.type || '(空)';
-      if (seen[key]) return;
-      seen[key] = 1;
       var t = defaultTypeOf(r);
       if (t === 'transfer' && !r.transferLike && r.direction === 'neutral') t = 'ignore';
-      map[key] = t;
+      if (!seen[key]) {
+        seen[key] = 1;
+        map[key] = t;
+      } else if (map[key] !== t) {
+        // 银行文件常用同一个类型名承载收入和支出；方向混合时不做整类覆盖，
+        // buildTxns 会按每行原始 direction 决定收支。
+        mixed[key] = 1;
+        delete map[key];
+      }
     });
+    Object.keys(mixed).forEach(function (key) { delete map[key]; });
     return map;
   }
 
@@ -591,6 +598,17 @@
   function isChannelSource(s) { return s === 'wechat' || s === 'alipay'; }
   function isBankSource(s) { return /^bank/.test(s); }
 
+  // 银行摘要通常只保留支付渠道（微信/财付通、支付宝/蚂蚁），未必保留真实商户。
+  // 只有渠道痕迹明确且近日期候选唯一时，才允许跨源自动合并。
+  function bankChannelHint(t) {
+    var text = [t && t.merchant, t && t.note].filter(Boolean).join(' ');
+    var wechat = /(微信|财付通|wechat)/i.test(text);
+    var alipay = /(支付宝|蚂蚁|alipay)/i.test(text);
+    if (wechat && !alipay) return 'wechat';
+    if (alipay && !wechat) return 'alipay';
+    return null;
+  }
+
   // matchDuplicates(incoming, existing) → 三层去重决策。
   // incoming: 待入库交易；existing: 已有交易（未被合并遮蔽的）。
   // 返回 { autoMerged: [{inc, kept, kind}], needConfirm: [{inc, cand, kind, reason}], transferPairs, unique }
@@ -661,6 +679,11 @@
           // 同源但单号不同（如手动来源）不算；同源导入已被 buildTxns 幂等处理
           if (ex.source !== 'manual') return;
         }
+        // 银行摘要已明确渠道时，排除与之冲突的渠道账单。
+        var bank = isBankSource(inc.source) ? inc : (isBankSource(ex.source) ? ex : null);
+        var channel = isChannelSource(inc.source) ? inc : (isChannelSource(ex.source) ? ex : null);
+        var hint = bank && channel ? bankChannelHint(bank) : null;
+        if (hint && hint !== channel.source) return;
         cands.push(ex);
       });
       if (!cands.length) { unique.push(inc); return; }
@@ -679,11 +702,23 @@
         return;
       }
       if ((incChannel && bestBank) || (incBank && bestChannel)) {
-        if (diff <= 2) {
-          // 高置信自动合并：保留渠道记录（含商户与分类），银行记录标记已映射
+        var bankTxn = incBank ? inc : best;
+        var channelTxn = incChannel ? inc : best;
+        var channelHint = bankChannelHint(bankTxn);
+        var nearCrossSource = cands.filter(function (x) {
+          var cross = (incChannel && isBankSource(x.source)) || (incBank && isChannelSource(x.source));
+          return cross && dayDiff(inc, x) <= 2;
+        });
+        if (diff <= 2 && channelHint === channelTxn.source && nearCrossSource.length === 1) {
+          // 高置信自动合并：渠道明确、候选唯一；保留渠道记录（含商户与分类）
           var keep = incChannel ? inc : best, shadow = incChannel ? best : inc;
           claimed[shadow.id] = 1;
-          autoMerged.push({ inc: inc, kept: keep, shadow: shadow, kind: 'cross-source', reason: '金额相同、日期相差' + diff + '天' });
+          autoMerged.push({ inc: inc, kept: keep, shadow: shadow, kind: 'cross-source', reason: '支付渠道一致、金额相同、日期相差' + diff + '天且候选唯一' });
+        } else if (diff <= 2) {
+          var why = nearCrossSource.length > 1
+            ? '同金额近日期候选不唯一，需人工确认'
+            : '金额和日期接近，但银行摘要未确认支付渠道';
+          needConfirm.push({ inc: inc, cand: best, kind: 'low-confidence', reason: why });
         } else if (diff <= 31) {
           needConfirm.push({ inc: inc, cand: best, kind: 'low-confidence', reason: '金额相同但日期相差' + diff + '天' });
         } else unique.push(inc);
@@ -1297,6 +1332,68 @@
     };
   }
 
+  /* ------------------------------ 备份与恢复 ------------------------------ */
+
+  function createBackup(state, appVersion, exportedAt) {
+    state = state || {};
+    return {
+      app: 'ledger',
+      appVersion: appVersion || '',
+      schemaVersion: 1,
+      exportedAt: exportedAt || new Date().toISOString(),
+      accounts: Array.isArray(state.accounts) ? state.accounts : [],
+      categories: Array.isArray(state.categories) ? state.categories : [],
+      txns: Array.isArray(state.txns) ? state.txns : [],
+      // 备份为可迁移明文；恢复后默认关闭应用锁，避免携带无法使用的内存密钥状态。
+      settings: Object.assign({}, state.settings || {}, { lock: { enabled: false } })
+    };
+  }
+
+  function restoreStateFromBackup(data) {
+    if (!data || data.app !== 'ledger') throw new Error('不是小账本的备份文件');
+    if (!Array.isArray(data.txns)) throw new Error('备份缺少有效的交易数据');
+    if (data.schemaVersion != null && data.schemaVersion !== 1) {
+      throw new Error('不支持的备份版本：' + data.schemaVersion);
+    }
+    if (data.accounts != null && !Array.isArray(data.accounts)) throw new Error('备份账户数据格式错误');
+    if (data.categories != null && !Array.isArray(data.categories)) throw new Error('备份分类数据格式错误');
+    if (data.settings != null && (typeof data.settings !== 'object' || Array.isArray(data.settings))) {
+      throw new Error('备份设置数据格式错误');
+    }
+    return {
+      accounts: data.accounts || defaultAccounts(),
+      categories: data.categories || defaultCategories(),
+      txns: data.txns,
+      settings: Object.assign(defaultSettings(), data.settings || {}, { lock: { enabled: false } })
+    };
+  }
+
+  function transactionsToCSV(txns, accounts, categories) {
+    var accountMap = {}, categoryMap = {};
+    (accounts || []).forEach(function (a) { accountMap[a.id] = a.name; });
+    (categories || []).forEach(function (c) { categoryMap[c.id] = c.name; });
+    var sourceNames = { manual: '手动', wechat: '微信', alipay: '支付宝', bank: '银行' };
+    function csvCell(value) {
+      var text = String(value == null ? '' : value);
+      return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+    }
+    var header = '日期,时间,类型,金额(元),账户,转入账户,分类,商户/对方,备注,来源';
+    var rows = visibleTxns(txns || []).slice().sort(function (a, b) {
+      return (b.date + (b.time || '')).localeCompare(a.date + (a.time || ''));
+    }).map(function (t) {
+      return [
+        t.date, t.time || '',
+        { expense: '支出', income: '收入', transfer: '转账' }[t.type] || t.type,
+        centsToYuan(t.amount),
+        accountMap[t.account] || (t.account ? '已删除账户' : '未指定账户'),
+        t.type === 'transfer' ? (accountMap[t.accountTo] || (t.accountTo ? '已删除账户' : '未指定账户')) : '',
+        t.type === 'transfer' ? '' : (categoryMap[t.category] || '未分类'),
+        t.merchant || '', t.note || '', sourceNames[t.source] || t.source || ''
+      ].map(csvCell).join(',');
+    });
+    return '\uFEFF' + header + '\n' + rows.join('\n');
+  }
+
   /* ------------------------------ 导出 API ------------------------------ */
 
   return {
@@ -1348,6 +1445,9 @@
     rollupByRoot: rollupByRoot,
     defaultAccounts: defaultAccounts,
     defaultCategories: defaultCategories,
-    defaultSettings: defaultSettings
+    defaultSettings: defaultSettings,
+    createBackup: createBackup,
+    restoreStateFromBackup: restoreStateFromBackup,
+    transactionsToCSV: transactionsToCSV
   };
 });

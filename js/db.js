@@ -90,9 +90,12 @@
   function clearAll() {
     return open().then(function () {
       if (useFallback) {
-        Object.keys(g.localStorage).forEach(function (k) {
-          if (k.indexOf('ledger:') === 0) g.localStorage.removeItem(k);
-        });
+        var keys = [];
+        for (var i = 0; i < g.localStorage.length; i++) {
+          var key = g.localStorage.key(i);
+          if (key && key.indexOf('ledger:') === 0) keys.push(key);
+        }
+        keys.forEach(function (k) { g.localStorage.removeItem(k); });
         return;
       }
       return new Promise(function (resolve, reject) {

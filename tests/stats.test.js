@@ -185,3 +185,21 @@ test('suggestTypeMappings：类型映射智能推荐', () => {
   assert.strictEqual(map['微信红包'], 'income');
   assert.strictEqual(map['退款'], 'refund');
 });
+
+test('suggestTypeMappings：同一银行类型混合收支时保留逐行方向', () => {
+  const records = [
+    { type: '银行-招商银行', direction: 'income', transferLike: false },
+    { type: '银行-招商银行', direction: 'expense', transferLike: false }
+  ];
+  const map = Core.suggestTypeMappings(records);
+  assert.strictEqual(map['银行-招商银行'], undefined);
+
+  const built = Core.buildTxns(records.map((r, i) => Object.assign({
+    date: `2026-05-0${i + 1}`, time: '', amountCents: 1000,
+    payee: '虚构交易', product: '', method: '招商银行', rawId: `bank-mixed-${i}`
+  }, r)), {
+    source: 'bank', accounts: Core.defaultAccounts(), categories: Core.defaultCategories(),
+    typeMapping: map, accountMapping: { '招商银行': 'acc-bank' }, existingTxns: []
+  });
+  assert.deepStrictEqual(built.txns.map(t => t.type), ['income', 'expense']);
+});

@@ -1,0 +1,23 @@
+{
+  "app": "ledger",
+  "appVersion": "2.0.0-rc.3",
+  "schemaVersion": 1,
+  "exportedAt": "2026-09-05T08:00:00.000Z",
+  "txns": [
+    {
+      "id": "acceptance-restore-1",
+      "date": "2026-09-05",
+      "time": "08:00",
+      "type": "expense",
+      "amount": 32100,
+      "account": "acc-cash",
+      "accountTo": null,
+      "category": "cat-food",
+      "merchant": "虚构恢复测试",
+      "note": "RC3 固定备份",
+      "source": "manual",
+      "rawId": "",
+      "status": ""
+    }
+  ]
+}

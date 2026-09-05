@@ -5,7 +5,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Charts = window.Charts;
-  var APP_VERSION = '2.0.0-rc.1';
+  var APP_VERSION = '2.0.0-rc.3';
 
   /* ================= 状态 ================= */
   var state = {
@@ -1782,36 +1782,15 @@
   /* ================= 数据备份 ================= */
 
   function exportJson() {
-    var backup = {
-      app: 'ledger', appVersion: APP_VERSION, schemaVersion: 1, exportedAt: new Date().toISOString(),
-      accounts: state.accounts, categories: state.categories, txns: state.txns,
-      settings: Object.assign({}, state.settings, { lock: { enabled: false } })
-    };
+    var backup = Core.createBackup(state, APP_VERSION);
     var d = todayDateStr();
     download('ledger-backup-' + d + '.json', JSON.stringify(backup, null, 2), 'application/json');
     toast('已导出 JSON 备份（请妥善保管）');
   }
 
   function exportCsv() {
-    var header = '日期,时间,类型,金额(元),账户,转入账户,分类,商户/对方,备注,来源\n';
-    var rows = Core.visibleTxns(state.txns).slice().sort(function (a, b) {
-      return (b.date + (b.time || '')).localeCompare(a.date + (a.time || ''));
-    }).map(function (t) {
-      var arr = [
-        t.date, t.time || '',
-        { expense: '支出', income: '收入', transfer: '转账' }[t.type] || t.type,
-        Core.centsToYuan(t.amount),
-        accountName(t.account), t.type === 'transfer' ? accountName(t.accountTo) : '',
-        t.type === 'transfer' ? '' : (txnCategory(t) ? txnCategory(t).name : '未分类'),
-        t.merchant || '', t.note || '',
-        t.source === 'manual' ? '手动' : (SOURCE_NAME[t.source] || t.source)
-      ];
-      return arr.map(function (v) {
-        v = String(v == null ? '' : v);
-        return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
-      }).join(',');
-    }).join('\n');
-    download('ledger-detail-' + todayDateStr() + '.csv', '\uFEFF' + header + rows, 'text/csv;charset=utf-8');
+    var csv = Core.transactionsToCSV(state.txns, state.accounts, state.categories);
+    download('ledger-detail-' + todayDateStr() + '.csv', csv, 'text/csv;charset=utf-8');
     toast('已导出 CSV 明细（带 BOM，Excel 中文不乱码）');
   }
 
@@ -1819,15 +1798,17 @@
     file.text().then(function (txt) {
       var data;
       try { data = JSON.parse(txt); } catch (e) { toast('不是有效的 JSON 文件', 'err'); return; }
-      if (data.app !== 'ledger' || !Array.isArray(data.txns)) { toast('不是小账本的备份文件', 'err'); return; }
+      var restored;
+      try { restored = Core.restoreStateFromBackup(data); }
+      catch (e2) { toast(e2.message || '备份文件校验失败', 'err'); return; }
       confirmSheet('恢复备份',
-        '备份时间：' + esc((data.exportedAt || '').replace('T', ' ').slice(0, 19)) + '<br>包含 ' + data.txns.length + ' 笔交易、' +
-        (data.accounts || []).length + ' 个账户。<br><b>恢复将覆盖当前全部数据</b>，建议先导出当前数据备份。',
+        '备份时间：' + esc((data.exportedAt || '').replace('T', ' ').slice(0, 19)) + '<br>包含 ' + restored.txns.length + ' 笔交易、' +
+        restored.accounts.length + ' 个账户。<br><b>恢复将覆盖当前全部数据</b>，建议先导出当前数据备份。',
         '覆盖恢复', function () {
-          state.accounts = data.accounts || Core.defaultAccounts();
-          state.categories = data.categories || Core.defaultCategories();
-          state.txns = data.txns || [];
-          state.settings = Object.assign(Core.defaultSettings(), data.settings || {}, { lock: { enabled: false } });
+          state.accounts = restored.accounts;
+          state.categories = restored.categories;
+          state.txns = restored.txns;
+          state.settings = restored.settings;
           save().then(function () {
             toast('恢复完成');
             route('home');
