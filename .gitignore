@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Local exports that may contain personal financial data
+ledger-backup-*.json
+ledger-detail-*.csv
+ledger-report-*.html
