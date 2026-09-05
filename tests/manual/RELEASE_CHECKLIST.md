@@ -52,7 +52,8 @@
 
 - **P1-001（界面布线）**：`app.js` 的 change 事件委托先查 `closest('[data-change]')`，而 `#wiz-file`、`#file-restore` 两个文件输入均无该属性，导致「导入账单选文件」和「从备份恢复」在界面上完全无响应（此前 P0 验收仅覆盖 Core 逻辑与浏览器 harness 的纯函数路径）。
   - 修复：change 处理器先按 `type="file"` 分流；用户取消选择（files 为空）直接忽略，保持状态不变。
-  - 回归：新增自动化页面 `tests/app-wiring.html`（启动 / 导入解析 / 恢复闭环 3 项），修复前 1/3、修复后 **3/3**；Node 98→103 全绿（新增往返深比较 1 项 + 原有）。
+  - 回归：新增自动化页面 `tests/app-wiring.html`（启动 / 导入解析 / 恢复闭环 3 项），修复前 1/3、修复后 **3/3**；Node 98→99 全绿（新增往返深比较 1 项）。
+  - 注：`tests/manual/evidence/` 下的导出样本文件受 `.gitignore` 数据文件规则保护，仅留存本机，不入库；校验值以本表记录为准。
 
 ### 保留人工执行的检查项（依赖真实文件系统/办公软件/真机）
 
@@ -62,7 +63,48 @@
 - [ ] 「从备份恢复」点击后**取消**文件选择器：应用无报错、当前数据不变。
 - [ ] iOS Safari/PWA 与 Android Chrome/PWA 真机过一遍 P3.3 清单。
 
-## P3.2 离线与 Service Worker 升级（待执行）
+## P3.2 离线与 Service Worker 升级（2026-09-05 22:10–23:59 CST）
+
+### 代码审查与修复
+
+- **修复 activate 清理范围**：原 `sw.js` 在 activate 阶段删除同源**所有**非当前缓存（`k !== CACHE`），会误删同源其他应用的 Cache Storage。已改为仅清理 `ledger-` 前缀且非当前缓存的条目。
+- 缓存清单（ASSETS）覆盖全部应用壳资源：`./`、index.html、styles.css、js/{core,db,charts,app}.js、manifest、3 个图标；`install` 使用 `addAll` 原子填充，任一资源失败即安装失败，不会产生半可用缓存。
+- fetch 处理器永不代理外域请求（`url.origin !== location.origin` 直接放行）。
+
+### 离线业务验收（origin `http://127.0.0.1:8421/`）
+
+| 步骤 | 结果 |
+|---|---|
+| 在线首次访问，SW 激活、壳资源进入 Cache Storage | ✅（`ledger-v2.0.0-rc.3`） |
+| 停止本地 HTTP 服务（`curl` 确认端口不可达） | ✅ |
+| 完全关闭页面后重新打开同一 URL（离线冷启动） | ✅ 首页完整渲染、底部导航可用、SW 接管 |
+| 离线新增支出 ¥7.77（虚构离线交易）→ IndexedDB 落库 | ✅ |
+| 离线刷新后记录与首页汇总正确 | ✅ |
+| 离线编辑为 ¥8.88 → 刷新仍在 | ✅ |
+| 离线删除（强确认）→ 刷新后为空 | ✅ |
+| 无外域请求 | ✅（代码审查 + fetch 处理器逻辑限制） |
+
+### 旧版本升级验收（origin `http://127.0.0.1:8601/`，同一端口切换服务）
+
+流程：`git worktree` 检出 `58f261a`（rc.1）→ 8601 端口安装 rc.1 SW（缓存 `ledger-v2.0.0-rc.1`）→ 种入 1 笔虚构交易 + 外来缓存 `other-app-cache-v1` → 切换同一端口至当前分支（rc.3）→ 正常重访。
+
+| 断言 | 结果 |
+|---|---|
+| `controllerchange` 触发，新 SW 接管 | ✅ |
+| 缓存变为 `ledger-v2.0.0-rc.3`，`ledger-v2.0.0-rc.1` 被删除 | ✅ |
+| **外来缓存 `other-app-cache-v1` 未被误删** | ✅（验证本次 activate 修复） |
+| IndexedDB 数据保留（升级保留账户 + 交易） | ✅ |
+| 再次重访后页面显示新版本 `2.0.0-rc.3` | ✅ |
+| 余额正确（1234.00 − 67.89 = 1,166.11） | ✅ |
+| 升级后无外域请求 | ✅ |
+
+注：升级首次重访时页面 JS 仍为旧版本（旧 SW 缓存优先接管期正常行为），第二次重访显示新版本；与既有「版本号失效」机制一致。
+
+### 环境观察（不影响产品结论）
+
+- ZCode 内置浏览器（Electron/Chromium 146）对 SW 更新检查有额外限制：`registration.update()` 与 `updateViaCache:'none'` 重复注册均未触发 updatefound；页面客户端全部关闭后再注册才能强制重新 install。真实浏览器（Chrome/Safari）按标准更新流程验证，本机人工可复测。
+- 本地 `python3 -m http.server` 无 Cache-Control 头，Chromium 启发式缓存可能延迟 sw.js 更新检查；生产/日常部署建议静态服务对 `sw.js` 返回 `Cache-Control: no-cache`（已记录至 README 待办）。
+- install 的 `addAll` 原子性保证「成功=完整缓存 / 失败=无缓存」；自动化过程中人为清空 Cache Storage 后运行时回填只覆盖实际请求过的资源，属测试造成的非真实状态，产品路径不受影响。
 
 ## P3.3 手机尺寸与交互检查（待执行）
 

@@ -27,7 +27,8 @@ self.addEventListener('install', function (e) {
 self.addEventListener('activate', function (e) {
   e.waitUntil(
     caches.keys().then(function (keys) {
-      return Promise.all(keys.filter(function (k) { return k !== CACHE; })
+      // 仅清理本应用的旧版本缓存（ledger- 前缀且非当前缓存），不影响同源其他应用
+      return Promise.all(keys.filter(function (k) { return k.indexOf('ledger-') === 0 && k !== CACHE; })
         .map(function (k) { return caches.delete(k); }));
     }).then(function () { return self.clients.claim(); })
   );
