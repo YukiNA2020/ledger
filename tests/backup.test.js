@@ -49,3 +49,47 @@ test('CSV 导出包含 BOM、中文字段并正确转义逗号和引号', () => 
   assert.match(csv, /"虚构,商户"/);
   assert.match(csv, /"备注""测试"""/);
 });
+
+test('备份往返去除 exportedAt 后按 id 深比较一致（P3.1 闭环）', () => {
+  const txns = [
+    { id: 'rt-1', date: '2026-08-01', time: '09:00', type: 'expense', amount: 12345,
+      account: 'acc-wechat', category: 'cat-food', merchant: '虚构,"商户"甲', note: '备注"引"', source: 'manual' },
+    { id: 'rt-2', date: '2026-08-02', time: '10:00', type: 'transfer', amount: 100000,
+      account: 'acc-wechat', accountTo: 'acc-bank', category: null, merchant: '', note: '', source: 'manual' },
+    { id: 'rt-3', date: '2026-08-03', time: '11:00', type: 'income', amount: 5000,
+      account: 'acc-wechat', category: 'cat-redpacket', merchant: '虚构退款来款', source: 'wechat', rawId: 'wx:rt3', refundFlag: true,
+      refundOf: 'rt-1' },
+    { id: 'rt-4', date: '2026-08-04', type: 'expense', amount: 250000, account: 'acc-bank',
+      category: 'cat-transport', merchant: '虚构差旅', source: 'manual', reimburseFlag: true,
+      recurringKey: 'rc-1@2026-08-04' }
+  ];
+  const state = {
+    accounts: Core.defaultAccounts(),
+    categories: Core.defaultCategories(),
+    txns, settings: Object.assign(Core.defaultSettings(), {
+      budgets: { total: 300000, cats: { 'cat-food': 50000 } },
+      recurring: [{ id: 'rc-1', name: '房租', type: 'expense', amount: 250000, frequency: 'monthly', day: 4, active: true }]
+    })
+  };
+  const backup1 = Core.createBackup(state, '2.0.0', '2026-09-05T08:00:00.000Z');
+  const restored = Core.restoreStateFromBackup(JSON.parse(JSON.stringify(backup1)));
+  const backup2 = Core.createBackup(restored, '2.0.0', '2026-09-05T09:00:00.000Z');
+
+  const strip = b => {
+    const { exportedAt, ...rest } = b;
+    const sortById = arr => arr.slice().sort((a, b2) => (a.id < b2.id ? -1 : a.id > b2.id ? 1 : 0));
+    return {
+      ...rest,
+      accounts: sortById(rest.accounts),
+      categories: sortById(rest.categories),
+      txns: sortById(rest.txns)
+    };
+  };
+  assert.deepStrictEqual(strip(backup2), strip(backup1), '两次导出（去 exportedAt、按 id 排序）应完全一致');
+  // 关联字段不得在往返中丢失
+  const byId = Object.fromEntries(backup2.txns.map(t => [t.id, t]));
+  assert.strictEqual(byId['rt-3'].refundOf, 'rt-1');
+  assert.strictEqual(byId['rt-4'].reimburseFlag, true);
+  assert.strictEqual(byId['rt-4'].recurringKey, 'rc-1@2026-08-04');
+  assert.strictEqual(byId['rt-2'].accountTo, 'acc-bank');
+});

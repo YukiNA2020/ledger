@@ -2336,16 +2336,16 @@
     if (fn) { e.preventDefault(); fn(el); }
   });
   document.addEventListener('change', function (e) {
-    var el = e.target.closest('[data-change]');
+    var t = e.target;
+    // 文件输入不带 data-change，必须先按 id 分流，否则选择文件后无响应
+    if (t && t.tagName === 'INPUT' && t.type === 'file') {
+      if (!t.files || !t.files[0]) return; // 用户取消选择：保持当前状态不变
+      if (t.id === 'wiz-file') wizFileChosen(t.files[0]);
+      else if (t.id === 'file-restore') restoreBackup(t.files[0]);
+      return;
+    }
+    var el = t.closest('[data-change]');
     if (!el) return;
-    if (el.id === 'wiz-file') {
-      if (el.files && el.files[0]) wizFileChosen(el.files[0]);
-      return;
-    }
-    if (el.id === 'file-restore') {
-      if (el.files && el.files[0]) restoreBackup(el.files[0]);
-      return;
-    }
     var fn = changes[el.dataset.change];
     if (fn) fn(el);
   });

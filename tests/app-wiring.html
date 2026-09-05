@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>小账本应用布线验收</title>
+  <style>
+    body{font-family:system-ui,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;color:#1f2937}
+    h1{font-size:24px}.summary{padding:14px;border-radius:10px;background:#f3f4f6;margin:16px 0}
+    li{margin:10px 0}.pass{color:#15803d}.fail{color:#b91c1c}pre{white-space:pre-wrap;background:#f8fafc;padding:12px}
+    /* 以下为被测应用骨架（与 index.html 一致），app.js 需要这些节点才能启动 */
+    #app{display:none}
+  </style>
+</head>
+<body>
+  <h1>小账本应用布线验收</h1>
+  <div id="summary" class="summary">正在执行……</div>
+  <ol id="results"></ol>
+  <pre id="error" hidden></pre>
+
+  <!-- 被测应用骨架：与 index.html 结构一致 -->
+  <div id="app">
+    <div id="lock-screen" class="hidden"></div>
+    <main id="view"></main>
+    <nav id="tabbar" class="hidden"></nav>
+  </div>
+  <div id="sheet-mask" class="hidden"><div id="sheet"></div></div>
+  <div id="toast"></div>
+
+  <script src="../js/core.js"></script>
+  <script src="../js/db.js"></script>
+  <script src="../js/charts.js"></script>
+  <script src="../js/app.js"></script>
+  <script src="app-wiring.js"></script>
+</body>
+</html>
