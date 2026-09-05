@@ -96,6 +96,7 @@ ledger/
 │   ├── charts.js         # 自绘 SVG 环形图/柱状图
 │   └── app.js            # 界面层：路由/渲染/导入向导/预算/体检/报销/周期记账/设置
 ├── tests/                # node:test 单测（98 例）+ 浏览器验收页 + fixtures 样例账单
+├── docs/stages/          # 第三至第五阶段实施方案与 Agent 交接入口
 └── *.md                  # 计划文档体系（Plan/Roadmap/PRD/STATUS/TEST/Prompt Log）
 ```
 

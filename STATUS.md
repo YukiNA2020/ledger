@@ -75,7 +75,18 @@ V3.0 — 小程序版（uni-app 迁移，个人主体微信小程序）（待细
 > 2026-08-16：V1.0 MVP 经用户验收通过；V2.0（除 V2.4 可选增强外）开发完成并通过验证（node 单测 86/86 + 浏览器实测含离线加载）。
 > 2026-09-05：建立 Git 基线，将当前版本统一为 v2.0.0-rc.1；区分开发自测、浏览器冒烟与正式验收。
 > 2026-09-05：完成 P0 验收，修复银行混合收支方向覆盖与同金额误合并风险；v2.0.0-rc.3 达到 98/98 Node 测试、9/9 浏览器原生验收。
-> 下一步：执行 TEST.md 的 P1 发布检查与自动化；完成后发布并标记 v2.0.0。
+> 2026-09-05：第三至第五阶段已形成独立执行包，范围、技术方案、测试门禁和 Agent 交接提示见 `docs/stages/`。
+> 下一步：按 `docs/stages/03-v2-release/IMPLEMENTATION.md` 执行 P1 发布检查与自动化；完成后发布并标记 v2.0.0。
+
+### 后续阶段执行文档
+
+| 阶段 | 执行文档 | 当前状态 |
+|---|---|---|
+| 第三阶段：V2 发布检查与正式发布 | [`docs/stages/03-v2-release/IMPLEMENTATION.md`](./docs/stages/03-v2-release/IMPLEMENTATION.md) | 可立即交给实施 Agent |
+| 第四阶段：V2.4 可选增强 | [`docs/stages/04-v2.4-enhancements/IMPLEMENTATION.md`](./docs/stages/04-v2.4-enhancements/IMPLEMENTATION.md) | 待第三阶段完成并由用户确认范围 |
+| 第五阶段：V3 微信小程序 | [`docs/stages/05-v3-miniapp/IMPLEMENTATION.md`](./docs/stages/05-v3-miniapp/IMPLEMENTATION.md) | 待 V2.0 正式发布；V2.4 非强依赖 |
+
+统一入口与跨阶段规则见 [`docs/stages/README.md`](./docs/stages/README.md)。
 
 | 层级 | 版本 | 名称 | 状态 | 备注 |
 |------|------|------|------|------|
