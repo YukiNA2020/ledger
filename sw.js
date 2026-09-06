@@ -2,7 +2,7 @@
  * 策略：缓存优先（静态资源版本随 CACHE 版本号更新）；导航请求离线回退 index.html。
  * 注意：修改任何前端文件后需递增 CACHE 版本号以触发更新。
  */
-var CACHE = 'ledger-v2.0.0-rc.3';
+var CACHE = 'ledger-v2.0.0-rc.3-p3';
 var ASSETS = [
   './',
   './index.html',

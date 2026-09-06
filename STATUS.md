@@ -1,5 +1,7 @@
 # 小账本（Ledger）项目状态同步
 
+> **历史状态说明（2026-09-06）：** 本文件记录 v1/v2 实施历史。项目已冻结新的 v3“个人财务决策台”定义；当前产品范围、架构和实施顺序以 [README.md](./README.md)、[PRODUCT.md](./PRODUCT.md)、[ARCHITECTURE.md](./ARCHITECTURE.md) 和 [ROADMAP.md](./ROADMAP.md) 为准。旧 v3 微信小程序计划已取消，不再是当前路线。
+
 > 文档用途：项目阶段、版本状态、已知风险和下一步行动的唯一状态入口；具体测试证据见 TEST.md，版本变化见 CHANGELOG.md。
 > 创建时间：2026-08-16
 > 最近更新：2026-09-05
