@@ -1,11 +1,12 @@
 /* 小账本 app.js — 界面层：路由/渲染/交互 + 导入向导状态机
- * 依赖：core.js（纯逻辑）、db.js（存储+加密）、charts.js（SVG 图表）
+ * 依赖：core.js（纯逻辑）、db.js（存储+加密）、charts.js（SVG 图表）、domain.js（v3 资产领域）
  * 架构：内存数组是全量权威数据，每次变更全量写回 IndexedDB（个人量级 <2万条）。
+ * v3 Phase 1：home 为资产决策台（tplDashboard），原月度记账首页下沉为 cashflow 现金流页。
  */
 (function () {
   'use strict';
-  var Core = window.Core, DB = window.DB, Charts = window.Charts;
-  var APP_VERSION = '2.0.0-rc.3';
+  var Core = window.Core, DB = window.DB, Charts = window.Charts, Domain = window.Domain;
+  var APP_VERSION = '2.1.0-phase1';
 
   /* ================= 状态 ================= */
   var state = {
@@ -13,6 +14,7 @@
     page: 'home',
     ym: null,            // 当前查看月份 'YYYY-MM'
     txns: [], accounts: [], categories: [], settings: Core.defaultSettings(),
+    assets: Domain.emptyAssets(), // v3 资产集合（Phase 1）
     addDraft: null, editId: null,
     listFilters: { type: '', account: '', category: '', q: '' },
     selectMode: false, selectedIds: {},
@@ -95,7 +97,7 @@
     }
     return DB.saveAll({
       accounts: state.accounts, categories: state.categories,
-      txns: state.txns, settings: state.settings
+      txns: state.txns, settings: state.settings, assets: state.assets
     }).catch(function (e) {
       console.error(e);
       toast('数据保存失败：' + (e && e.message || e), 'err');
@@ -135,6 +137,8 @@
       state.categories = raw.categories || Core.defaultCategories();
       state.settings = raw.settings || Core.defaultSettings();
       state.txns = raw.txns || [];
+      // v3 资产集合：旧存储缺 assets 键时归一化为空集合（S1.1 旧状态兼容）
+      state.assets = Domain.normalizeAssets(raw.assets);
       // 应用锁：txns 为密文时先锁屏
       if (raw.txns && raw.txns.enc) {
         renderLockScreen();
@@ -221,7 +225,7 @@
   }
   function route(page) {
     if (!state.ready) return;
-    if (['home', 'list', 'stats', 'settings', 'add', 'import', 'accounts', 'categories',
+    if (['home', 'cashflow', 'list', 'stats', 'settings', 'add', 'import', 'accounts', 'categories',
       'budget', 'health', 'reimburse', 'recurring'].indexOf(page) < 0) page = 'home';
     state.page = page;
     if (page !== 'add') { state.editId = null; }
@@ -240,7 +244,7 @@
 
   function renderTabbar() {
     var tabs = [
-      { id: 'home', icon: '🏠', label: '首页' },
+      { id: 'home', icon: '🧭', label: '资产' },
       { id: 'list', icon: '📋', label: '明细' },
       { id: '__add', icon: '', label: '' },
       { id: 'stats', icon: '📊', label: '统计' },
@@ -258,7 +262,8 @@
     var view = $('#view');
     var html = '';
     switch (state.page) {
-      case 'home': html = tplHome(); break;
+      case 'home': html = tplDashboard(); break;
+      case 'cashflow': html = tplCashflow(); break;
       case 'add': html = tplAdd(); break;
       case 'list': html = tplList(); break;
       case 'stats': html = tplStats(); break;
@@ -282,7 +287,133 @@
       '<button data-action="ym:next">›</button></div>';
   }
 
-  function tplHome() {
+  /* ================= 资产决策台（v3 Phase 1） ================= */
+
+  // 阻塞码 → 用户可读提示（detail 为标的符号/币种/账户名等）
+  var BLOCKER_LABELS = {
+    fx_missing: '缺少汇率', fx_stale: '汇率已过期',
+    quote_missing: '缺少行情', quote_stale: '行情已过期',
+    balance_missing: '余额未核实', balance_stale: '余额未在本月确认',
+    liability_missing: '负债余额未核实',
+    instrument_missing: '持仓缺少标的信息', holding_invalid: '持仓数量无效',
+    pool_missing: '资金池未分类', classification_unconfirmed: '标的分类未确认',
+    asset_class_invalid: '资产类别无效'
+  };
+  var RISK_CLASS_LABELS = {
+    cash: '现金', fixed_income: '固收', broad_equity: '宽基权益',
+    theme_equity: '主题权益', stock: '个股', other: '其他'
+  };
+
+  function blockerText(b) {
+    return (BLOCKER_LABELS[b.code] || b.code) + (b.detail ? '（' + b.detail + '）' : '');
+  }
+
+  function tplDashboard() {
+    var ov = Domain.computeOverview(state.assets, { now: todayDateStr(), settings: state.settings });
+    var statusChip;
+    if (ov.valuationStatus === 'formal') {
+      statusChip = '<span class="dash-chip ok">✅ 数据完整 · 正式口径</span>';
+    } else if (ov.valuationStatus === 'estimate') {
+      statusChip = '<span class="dash-chip warn">⚠️ 估算口径 · 暂不能生成正式建议</span>';
+    } else {
+      statusChip = '<span class="dash-chip">空状态</span>';
+    }
+    var html = '<div class="dash-head"><div><div class="dash-title">资产决策台</div>' +
+      '<div class="small muted">数据日 ' + esc(ov.asOf) + '</div></div>' + statusChip + '</div>';
+
+    /* 空状态：不虚构任何总额（S1.4） */
+    if (ov.isEmpty) {
+      return html + '<div class="empty dash-empty"><div class="e-icon">🧭</div><b>还没有资产数据</b>' +
+        '<div class="small muted" style="line-height:1.8;margin-top:6px">这里将展示净资产、可投资资产、安全储备与风险配比。<br>' +
+        '资产与负债的录入功能在后续版本提供；当前可先记录现金流，或通过「我的 → 恢复备份」导入包含资产数据的备份文件。</div>' +
+        '<button class="btn primary" data-action="nav:cashflow">去记一笔现金流</button>' +
+        '<button class="btn" data-action="nav:import">导入账单</button></div>';
+    }
+
+    /* 估算口径的阻塞项列表 */
+    var blockerHtml = ov.blockers.length
+      ? '<div class="card dash-blockers"><b class="small">以下数据问题使结果为估算口径：</b><div class="db-list">' +
+        ov.blockers.map(function (b) { return '<div class="db-item">· ' + esc(blockerText(b)) + '</div>'; }).join('') +
+        '</div></div>'
+      : '';
+
+    /* 净资产 hero */
+    var hero =
+      '<div class="card dash-hero"><div class="small muted">净资产</div>' +
+      '<div class="dash-net">' + Core.fmtMoney(ov.netWorthMinor) + '<span class="unit"> CNY</span></div>' +
+      '<div class="dash-sub"><span>总资产 ' + Core.fmtMoney(ov.totalAssetsMinor) + '</span>' +
+      '<span>总负债 ' + Core.fmtMoney(ov.totalLiabilitiesMinor) + '</span></div></div>';
+
+    /* 资金池 */
+    var poolDefs = [
+      { key: 'safetyMinor', name: '安全储备', hint: '应急与短期确定用途' },
+      { key: 'investableMinor', name: '可投资', hint: '现金 + 证券市值' },
+      { key: 'restrictedMinor', name: '受限资产', hint: '公积金等长期锁定' }
+    ];
+    var poolCards = '<div class="dash-pools">' + poolDefs.map(function (p) {
+      return '<div class="pool-card"><div class="p-name">' + p.name + '</div>' +
+        '<div class="p-val">' + Core.fmtMoney(ov.pools[p.key]) + '</div>' +
+        '<div class="p-hint">' + p.hint + '</div></div>';
+    }).join('') + '</div>';
+
+    /* 风险资产类别配比（占可投资资产） */
+    var riskRows = ov.riskClasses.filter(function (r) { return r.valueMinor > 0; }).map(function (r) {
+      return '<div class="risk-row"><span class="r-name">' + (RISK_CLASS_LABELS[r.assetClass] || r.assetClass) + '</span>' +
+        '<span class="r-bar"><i style="width:' + Math.min(r.pct || 0, 100) + '%"></i></span>' +
+        '<span class="r-val">' + Core.fmtMoney(r.valueMinor) + '</span>' +
+        '<span class="r-pct">' + (r.pct == null ? '—' : r.pct + '%') + '</span></div>';
+    }).join('');
+    var riskCard = '<div class="card"><div class="row small muted"><b>风险资产类别配比</b>' +
+      '<span style="margin-left:auto">占可投资资产 ' + Core.fmtMoney(ov.pools.investableMinor) + '</span></div>' +
+      (riskRows || '<div class="small muted" style="padding:8px 0">暂无可投资资产</div>') +
+      '<div class="small muted" style="margin-top:8px">投资现金计入「现金」类别；受限资产与安全储备不参与配比。</div></div>';
+
+    /* 可新增投资资金 */
+    var newFundsCard =
+      '<div class="card"><div class="row small muted"><b>本月可新增投资资金</b>' +
+      '<span style="margin-left:auto">' + (ov.canAdvise ? '正式口径' : '估算') + '</span></div>' +
+      '<div class="dash-net" style="font-size:26px">' + Core.fmtMoney(ov.newFundsAvailableMinor) + '<span class="unit"> CNY</span></div>' +
+      '<div class="dash-sub"><span>可投资现金 ' + Core.fmtMoney(ov.investableCashMinor) + '</span>' +
+      '<span>近期应付款 ' + Core.fmtMoney(ov.duePayablesMinor) + '</span>' +
+      '<span>储备缺口 ' + Core.fmtMoney(ov.safetyGapMinor) + '</span></div></div>';
+
+    /* 待办与权益状态 */
+    var todoHtml = '';
+    if (ov.todos.length || ov.entitlements.length) {
+      todoHtml = '<div class="card"><div class="row small muted"><b>待办与状态</b></div>';
+      ov.todos.forEach(function (t) {
+        if (t.code === 'safety_target_unset') {
+          todoHtml += '<div class="todo-item">· 安全储备目标未设置，储备缺口暂按 0 计算</div>';
+        }
+      });
+      ov.entitlements.forEach(function (e) {
+        todoHtml += '<div class="todo-item">· 保障权益「' + esc(e.name) + '」：' + esc(e.status || '状态未知') +
+          '（无确认余额，不计入资产）</div>';
+      });
+      todoHtml += '</div>';
+    }
+
+    /* 口径说明（折叠） */
+    var caliber =
+      '<details class="card dash-caliber"><summary class="small muted">数据口径说明</summary>' +
+      '<div class="small muted" style="line-height:1.9;margin-top:8px">' +
+      '· 净资产 = 总资产 − 总负债；负债不冲减总资产。<br>' +
+      '· 可投资资产 = 标记为可投资的现金与证券市值；安全储备与受限资产不进入。<br>' +
+      '· 外币按同一估值日汇率折算为 CNY；汇率或行情缺失时该项不计入，绝不按 1:1 估算。<br>' +
+      '· 行情/汇率超过 5 个自然日、余额未在本月核对、分类未确认时，结果为估算口径。<br>' +
+      '· 可新增投资资金 = 可投资现金 − 近期应付款 − 安全储备缺口，下限为 0。</div></details>';
+
+    /* 现金流入口（旧记账首页下沉后保留入口，S1.4） */
+    var cashflowEntry =
+      '<div class="card dash-entry" data-action="nav:cashflow">' +
+      '<div><b>现金流与预算</b><div class="small muted">记账、账单导入、预算与消费体检</div></div>' +
+      '<span class="arrow">›</span></div>';
+
+    return html + blockerHtml + hero + poolCards + riskCard + newFundsCard + todoHtml + caliber + cashflowEntry;
+  }
+
+  /* ================= 现金流页（原月度记账首页） ================= */
+  function tplCashflow() {
     var y = +state.ym.slice(0, 4), m = +state.ym.slice(5, 7);
     var agg = Core.aggregate(state.txns, { year: y, month: m, categories: state.categories });
     var totalAsset = liveAccounts().reduce(function (s, a) { return s + Core.accountBalance(a, state.txns); }, 0);
@@ -1801,14 +1932,20 @@
       var restored;
       try { restored = Core.restoreStateFromBackup(data); }
       catch (e2) { toast(e2.message || '备份文件校验失败', 'err'); return; }
+      var v3 = restored.assets;
+      var v3Count = v3.assetAccounts.length + v3.assetUnits.length + v3.liabilities.length +
+        v3.entitlements.length + v3.instruments.length + v3.holdings.length;
       confirmSheet('恢复备份',
         '备份时间：' + esc((data.exportedAt || '').replace('T', ' ').slice(0, 19)) + '<br>包含 ' + restored.txns.length + ' 笔交易、' +
-        restored.accounts.length + ' 个账户。<br><b>恢复将覆盖当前全部数据</b>，建议先导出当前数据备份。',
+        restored.accounts.length + ' 个账户' +
+        (v3Count > 0 ? '、v3 资产数据 ' + v3Count + ' 条' : '') +
+        '。<br><b>恢复将覆盖当前全部数据</b>，建议先导出当前数据备份。',
         '覆盖恢复', function () {
           state.accounts = restored.accounts;
           state.categories = restored.categories;
           state.txns = restored.txns;
           state.settings = restored.settings;
+          state.assets = Domain.normalizeAssets(restored.assets); // v1 备份 → 空集合（S1.1）
           save().then(function () {
             toast('恢复完成');
             route('home');
@@ -1831,6 +1968,7 @@
       state.categories = Core.defaultCategories();
       state.txns = [];
       state.settings = Core.defaultSettings();
+      state.assets = Domain.emptyAssets();
       return save();
     }).then(function () {
       closeSheet();
@@ -1862,6 +2000,7 @@
   /* ================= 事件分发 ================= */
   var actions = {
     'nav:home': function () { nav('home'); },
+    'nav:cashflow': function () { nav('cashflow'); },
     'nav:list': function () { nav('list'); },
     'nav:stats': function () { nav('stats'); },
     'nav:settings': function () { nav('settings'); },

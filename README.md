@@ -5,10 +5,10 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 ## 当前状态
 
 - 已完成：原小账本 `v2.0.0-rc.3`，包含手动记账、多源账单导入、跨源核对、预算和消费体检等能力。
-- 当前代码版本仍是 `v2.0.0-rc.3`；v3 只完成了产品、架构和实施规格，尚未开始功能实现。
-- 当前实现是浏览器 IndexedDB；目标架构为 Mac 本地服务、SQLite 与浏览器界面。
-- 本轮不从零重写：优先复用 `js/core.js` 中已经验证的解析、统计和账务口径。
-- 本仓库中的 v3 文档是交给后续执行 Agent 的唯一实施依据，不代表对应能力已经上线。
+- **v3 Phase 1「资产领域基础」已完成并验收（2026-09-14，`v2.1.0-phase1`）**：资产领域模型与 CNY/HKD/USD 折算聚合（`js/domain.js`）、首页资产决策台（空状态/估算口径/正式口径）、原首页下沉为现金流页、备份 Schema v2（旧 v1 备份仍可恢复）。
+- 当前实现仍是浏览器 IndexedDB；下一阶段 Phase 2 将引入 Mac 本地服务与 SQLite。
+- 本轮不从零重写：复用 `js/core.js` 中已经验证的解析、统计和账务口径。
+- 本仓库中的 v3 文档是交给后续执行 Agent 的唯一实施依据；下一阶段入口见 [NEXT_AGENT.md](./NEXT_AGENT.md)。
 
 ## 产品一句话
 
@@ -69,11 +69,13 @@ python3 -m http.server 8421 --bind 127.0.0.1
 
 ```bash
 cd ledger
-node --test
+node --test          # 133 项（2026-09-14 基线）
+python3 -m http.server 8421 --bind 127.0.0.1
+# 浏览器接线验收：http://127.0.0.1:8421/tests/app-wiring.html
 ```
 
-开发要求与门禁见 [AGENTS.md](./AGENTS.md)。
+开发要求与门禁见 [AGENTS.md](./AGENTS.md)，测试证据见 [TEST.md](./TEST.md)。
 
 ## 下一步
 
-由执行 Agent 按 [ROADMAP.md](./ROADMAP.md) 从 Phase 1 开始。开始编码前必须先阅读 [DECISIONS.md](./DECISIONS.md) 和 [ACCEPTANCE.md](./ACCEPTANCE.md)，确认基线测试、改动边界与回滚点；不得把 Phase 1—4 合并成一次重写。
+Phase 1 已完成。由执行 Agent 按 [ROADMAP.md](./ROADMAP.md) 实施 Phase 2「本地服务与 SQLite」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)。开始编码前必须先完成架构只读技术验证、阅读 [DECISIONS.md](./DECISIONS.md) 和 [ACCEPTANCE.md](./ACCEPTANCE.md)，确认基线测试、改动边界与回滚点；不得把多个 Phase 合并成一次重写。

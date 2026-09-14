@@ -1,5 +1,5 @@
 /* 小账本 db.js — 数据层：IndexedDB kv 封装 + 应用锁加密（PBKDF2 + AES-GCM）
- * 存储键：accounts / categories / txns / settings
+ * 存储键：accounts / categories / txns / settings / assets（v3 资产集合，Phase 1 新增）
  * txns 明文为数组；开启应用锁后为 { enc:1, alg, kdf, iter, salt, iv, data(base64) }。
  * 浏览器不支持 IndexedDB（如部分 file:// 场景）时自动退化为 localStorage。
  */
@@ -177,21 +177,24 @@
 
   /* ---------------------- 状态读写 ---------------------- */
 
-  // 读取全部原始存储（不做解密）：{accounts, categories, txns, settings}
+  // 读取全部原始存储（不做解密）：{accounts, categories, txns, settings, assets}
+  // assets 在旧版本存储中可能不存在（undefined），由调用方归一化为空集合。
   function loadRaw() {
-    return Promise.all([get('accounts'), get('categories'), get('txns'), get('settings')])
+    return Promise.all([get('accounts'), get('categories'), get('txns'), get('settings'), get('assets')])
       .then(function (r) {
-        return { accounts: r[0], categories: r[1], txns: r[2], settings: r[3] };
+        return { accounts: r[0], categories: r[1], txns: r[2], settings: r[3], assets: r[4] };
       });
   }
 
   // 全量保存。state.txns 为数组；若 lockEnabled 且内存有密钥 → 加密落盘。
+  // state.assets 仅在有值时写入，兼容只保存 v2 四键的旧调用方。
   function saveAll(state) {
     var jobs = [
       set('accounts', state.accounts),
       set('categories', state.categories),
       set('settings', state.settings)
     ];
+    if (state.assets != null) jobs.push(set('assets', state.assets));
     var txnsJob;
     if (state.settings && state.settings.lock && state.settings.lock.enabled && _key) {
       txnsJob = encryptJSON(_key, state.txns).then(function (blob) { return set('txns', blob); });

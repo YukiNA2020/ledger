@@ -31,6 +31,7 @@
 | D-021 | 不增加应用登录或二次密码 | 依赖 macOS 用户账户；本地服务只监听 loopback |
 | D-022 | 当前旧应用没有真实用户数据 | 初始实施不必为现有 IndexedDB 编写正式历史迁移器，但 Phase 2 开始前必须再次核实 |
 | D-023 | MVP 以连续两个月真实使用验证 | 两个月内优先修复流程和口径，不以堆功能代替验证 |
+| D-024 | Phase 1 过渡期把 v3 资产集合（assetAccounts/assetUnits/liabilities/entitlements/instruments/holdings/quotes/fxRates）作为单个 IndexedDB KV 键 `assets` 整组存取，备份 Schema 升级为 v2（新增 `assets` 字段），v1 备份恢复为空集合 | Phase 1 只做领域与界面骨架，不引入 SQLite；单一 KV 键把 Schema 迁移边界收敛到一处，Phase 2 SQLite 接管后此键整体废弃，不影响 domain.js 纯逻辑（2026-09-14） |
 
 ## 2. 架构默认值
 

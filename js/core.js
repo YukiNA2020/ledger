@@ -1,6 +1,6 @@
 /* 小账本 core.js — 纯逻辑层（无 DOM / 无存储依赖，node 可单测）
  * 模块职责：金额转换、CSV 解析（微信/支付宝/银行）、自动分类、
- *           账户名匹配、跨源去重匹配、聚合统计。
+ *           账户名匹配、跨源去重匹配、聚合统计、备份 Schema v2（v1/v2 均可恢复）。
  * 约定：所有金额一律以「分」为整数存储，避免浮点误差。
  */
 (function (root, factory) {
@@ -1334,16 +1334,28 @@
 
   /* ------------------------------ 备份与恢复 ------------------------------ */
 
+  // v3 资产集合键（Schema v2 新增；键名与 js/domain.js 的 ASSET_KEYS 保持一致，见 ARCHITECTURE §5.1/5.2）
+  var V3_ASSET_KEYS = ['assetAccounts', 'assetUnits', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
+
+  function emptyV3Assets() {
+    var a = { schemaVersion: 1 };
+    V3_ASSET_KEYS.forEach(function (k) { a[k] = []; });
+    return a;
+  }
+
   function createBackup(state, appVersion, exportedAt) {
     state = state || {};
+    var assets = state.assets && typeof state.assets === 'object' && !Array.isArray(state.assets)
+      ? state.assets : emptyV3Assets();
     return {
       app: 'ledger',
       appVersion: appVersion || '',
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: exportedAt || new Date().toISOString(),
       accounts: Array.isArray(state.accounts) ? state.accounts : [],
       categories: Array.isArray(state.categories) ? state.categories : [],
       txns: Array.isArray(state.txns) ? state.txns : [],
+      assets: assets,
       // 备份为可迁移明文；恢复后默认关闭应用锁，避免携带无法使用的内存密钥状态。
       settings: Object.assign({}, state.settings || {}, { lock: { enabled: false } })
     };
@@ -1352,7 +1364,8 @@
   function restoreStateFromBackup(data) {
     if (!data || data.app !== 'ledger') throw new Error('不是小账本的备份文件');
     if (!Array.isArray(data.txns)) throw new Error('备份缺少有效的交易数据');
-    if (data.schemaVersion != null && data.schemaVersion !== 1) {
+    var version = data.schemaVersion == null ? 1 : data.schemaVersion;
+    if (version !== 1 && version !== 2) {
       throw new Error('不支持的备份版本：' + data.schemaVersion);
     }
     if (data.accounts != null && !Array.isArray(data.accounts)) throw new Error('备份账户数据格式错误');
@@ -1360,10 +1373,23 @@
     if (data.settings != null && (typeof data.settings !== 'object' || Array.isArray(data.settings))) {
       throw new Error('备份设置数据格式错误');
     }
+    // v1 备份没有 v3 资产集合，恢复为空集合（S1.1 旧状态兼容）；v2 逐键校验透传。
+    var assets = emptyV3Assets();
+    if (version === 2) {
+      if (data.assets != null && (typeof data.assets !== 'object' || Array.isArray(data.assets))) {
+        throw new Error('备份资产数据格式错误');
+      }
+      if (data.assets) {
+        V3_ASSET_KEYS.forEach(function (k) {
+          if (data.assets[k] != null) assets[k] = Array.isArray(data.assets[k]) ? data.assets[k] : [];
+        });
+      }
+    }
     return {
       accounts: data.accounts || defaultAccounts(),
       categories: data.categories || defaultCategories(),
       txns: data.txns,
+      assets: assets,
       settings: Object.assign(defaultSettings(), data.settings || {}, { lock: { enabled: false } })
     };
   }

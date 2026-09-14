@@ -248,3 +248,34 @@ button, .btn { touch-action: manipulation; }
   body { background: #eef0f3; }
   #app { background: var(--bg); min-height: 100vh; box-shadow: 0 0 40px rgba(0, 0, 0, .06); }
 }
+
+/* ---------- v3 Phase 1：资产决策台 ---------- */
+.dash-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 2px 12px; }
+.dash-title { font-size: 20px; font-weight: 700; }
+.dash-chip { font-size: 11px; color: var(--ink-2); background: var(--bg-3); border-radius: 8px; padding: 4px 8px; white-space: nowrap; }
+.dash-chip.ok { background: #dcfce7; color: var(--green); }
+.dash-chip.warn { background: #fef3c7; color: #b45309; }
+.dash-empty { padding: 42px 18px; }
+.dash-empty .btn { margin: 14px 6px 0; min-width: 150px; }
+.dash-blockers { border: 1px solid #fde68a; }
+.dash-blockers .db-list { margin-top: 6px; }
+.dash-blockers .db-item { font-size: 12px; color: #92400e; line-height: 1.8; }
+.dash-hero { text-align: center; padding: 18px 14px; }
+.dash-net { font-size: 34px; font-weight: 700; letter-spacing: .5px; font-variant-numeric: tabular-nums; }
+.dash-net .unit { font-size: 14px; color: var(--ink-3); font-weight: 500; }
+.dash-sub { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.dash-pools { display: flex; gap: 10px; margin-bottom: 12px; }
+.pool-card { flex: 1; min-width: 0; background: var(--bg-2); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 10px; text-align: center; }
+.pool-card .p-name { font-size: 12px; color: var(--ink-2); }
+.pool-card .p-val { font-size: 17px; font-weight: 700; margin: 4px 0 2px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pool-card .p-hint { font-size: 10px; color: var(--ink-3); }
+.risk-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; font-size: 13px; }
+.risk-row .r-name { width: 60px; flex: none; }
+.risk-row .r-bar { flex: 1; height: 8px; background: var(--bg-3); border-radius: 4px; overflow: hidden; min-width: 0; }
+.risk-row .r-bar i { display: block; height: 100%; background: var(--blue); border-radius: 4px; }
+.risk-row .r-val { width: 84px; text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+.risk-row .r-pct { width: 46px; text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; flex: none; }
+.todo-item { font-size: 13px; color: var(--ink-2); line-height: 1.9; }
+.dash-caliber summary { cursor: pointer; }
+.dash-entry { display: flex; align-items: center; justify-content: space-between; cursor: pointer; }
+.dash-entry .arrow { color: var(--ink-3); font-size: 22px; }

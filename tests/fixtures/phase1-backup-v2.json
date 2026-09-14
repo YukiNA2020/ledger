@@ -1,0 +1,42 @@
+{
+  "app": "ledger",
+  "appVersion": "2.1.0-phase1",
+  "schemaVersion": 2,
+  "exportedAt": "2026-09-06T08:00:00.000Z",
+  "accounts": [],
+  "categories": [],
+  "txns": [],
+  "assets": {
+    "schemaVersion": 1,
+    "assetAccounts": [
+      { "id": "acc-cmb", "name": "招行储蓄", "kind": "bank", "pool": "safety", "status": "active" },
+      { "id": "acc-hsbc", "name": "汇丰 USD 子账户", "kind": "bank", "pool": "investable", "institution": "香港汇丰", "status": "active" },
+      { "id": "acc-broker", "name": "券商账户", "kind": "broker", "pool": "investable", "status": "active" },
+      { "id": "acc-gjj", "name": "青岛公积金", "kind": "government", "pool": "restricted", "status": "active" }
+    ],
+    "assetUnits": [
+      { "id": "u-cmb", "accountId": "acc-cmb", "currency": "CNY", "balanceMinor": 3000000, "asOf": "2026-09-06", "sourceType": "manual" },
+      { "id": "u-hsbc", "accountId": "acc-hsbc", "currency": "USD", "balanceMinor": 100000, "asOf": "2026-09-06", "sourceType": "manual" },
+      { "id": "u-gjj", "accountId": "acc-gjj", "currency": "CNY", "balanceMinor": 500000, "asOf": "2026-09-06", "sourceType": "manual" }
+    ],
+    "liabilities": [
+      { "id": "l-card", "name": "信用卡待还", "currency": "CNY", "balanceMinor": 200000, "termType": "current", "asOf": "2026-09-06" }
+    ],
+    "entitlements": [
+      { "id": "e-ub", "name": "失业保险待遇资格", "kind": "unemployment", "jurisdiction": "青岛", "status": "active", "balanceMinor": null, "asOf": "2026-09-06" }
+    ],
+    "instruments": [
+      { "id": "ins-voo", "symbol": "VOO", "exchange": "NYSE", "currency": "USD", "name": "标普500 ETF", "instrumentType": "etf", "assetClass": "broad_equity", "exposureMarket": "US", "classificationStatus": "confirmed" }
+    ],
+    "holdings": [
+      { "id": "h-voo", "accountId": "acc-broker", "instrumentId": "ins-voo", "quantity": "10", "costMinor": 45000, "asOf": "2026-09-06" }
+    ],
+    "quotes": [
+      { "instrumentId": "ins-voo", "priceMinor": 5000, "currency": "USD", "priceDate": "2026-09-06", "fetchedAt": "2026-09-06T08:00:00Z", "provider": "fixture", "status": "ok" }
+    ],
+    "fxRates": [
+      { "base": "USD", "quote": "CNY", "rateDecimal": "7.20", "rateDate": "2026-09-06", "fetchedAt": "2026-09-06T08:00:00Z", "provider": "fixture", "status": "ok" }
+    ]
+  },
+  "settings": { "lock": { "enabled": false } }
+}

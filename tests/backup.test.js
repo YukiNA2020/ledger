@@ -34,9 +34,53 @@ test('固定验收备份可恢复并补齐缺省账户与分类', () => {
 });
 
 test('恢复拒绝未来 Schema 和结构损坏的备份', () => {
-  assert.throws(() => Core.restoreStateFromBackup({ app: 'ledger', schemaVersion: 2, txns: [] }), /不支持的备份版本/);
+  // Schema v2 起 assets 进入备份（Phase 1）；更高版本仍必须被拒绝
+  assert.throws(() => Core.restoreStateFromBackup({ app: 'ledger', schemaVersion: 3, txns: [] }), /不支持的备份版本/);
   assert.throws(() => Core.restoreStateFromBackup({ app: 'ledger', schemaVersion: 1, txns: {} }), /交易数据/);
   assert.throws(() => Core.restoreStateFromBackup({ app: 'other', schemaVersion: 1, txns: [] }), /不是小账本/);
+  assert.throws(() => Core.restoreStateFromBackup({ app: 'ledger', schemaVersion: 2, txns: [], assets: 'bad' }), /资产数据/);
+});
+
+test('S1.1 v1 备份恢复后 v3 资产集合初始化为空', () => {
+  const v1 = {
+    app: 'ledger', appVersion: '2.0.0-rc.3', schemaVersion: 1,
+    exportedAt: '2026-09-06T08:00:00.000Z',
+    accounts: [{ id: 'acc-cash', name: '现金' }],
+    categories: [{ id: 'cat-food', name: '餐饮' }],
+    txns: [{ id: 't1', date: '2026-09-05', type: 'expense', amount: 1000, account: 'acc-cash', category: 'cat-food', merchant: '旧版数据', source: 'manual' }],
+    settings: { lock: { enabled: false } }
+  };
+  const restored = Core.restoreStateFromBackup(JSON.parse(JSON.stringify(v1)));
+  // 旧数据保持不变
+  assert.strictEqual(restored.txns.length, 1);
+  assert.strictEqual(restored.txns[0].merchant, '旧版数据');
+  assert.strictEqual(restored.txns[0].amount, 1000);
+  // v3 集合初始化为空，且可再次导出（schemaVersion 升级为 2）
+  assert.deepStrictEqual(restored.assets, {
+    schemaVersion: 1, assetAccounts: [], assetUnits: [], liabilities: [], entitlements: [],
+    instruments: [], holdings: [], quotes: [], fxRates: []
+  });
+  const again = Core.createBackup(restored, '2.0.0-rc.3', '2026-09-06T09:00:00.000Z');
+  assert.strictEqual(again.schemaVersion, 2);
+  assert.strictEqual(Core.restoreStateFromBackup(again).txns.length, 1);
+});
+
+test('S1.1 v2 备份的 v3 资产字段可往返', () => {
+  const Domain = require('../js/domain.js');
+  const assets = Domain.normalizeAssets({
+    assetAccounts: [{ id: 'acc-hsbc', name: '汇丰 USD 子账户', kind: 'bank', pool: 'investable', status: 'active' }],
+    assetUnits: [{ id: 'u-hsbc', accountId: 'acc-hsbc', currency: 'USD', balanceMinor: 100000, asOf: '2026-09-06', sourceType: 'manual' }],
+    entitlements: [{ id: 'e-ub', name: '失业保险待遇资格', kind: 'unemployment', status: 'active', balanceMinor: null, asOf: '2026-09-06' }],
+    fxRates: [{ base: 'USD', quote: 'CNY', rateDecimal: '7.20', rateDate: '2026-09-06', provider: 'fixture', status: 'ok' }]
+  });
+  const state = {
+    accounts: Core.defaultAccounts(), categories: Core.defaultCategories(),
+    txns: [], settings: Core.defaultSettings(), assets
+  };
+  const backup = Core.createBackup(state, '2.1.0-phase1', '2026-09-06T08:00:00.000Z');
+  assert.strictEqual(backup.schemaVersion, 2);
+  const restored = Core.restoreStateFromBackup(JSON.parse(JSON.stringify(backup)));
+  assert.deepStrictEqual(restored.assets, assets); // 旧集合四键 + 新资产集合全部原样保留
 });
 
 test('CSV 导出包含 BOM、中文字段并正确转义逗号和引号', () => {

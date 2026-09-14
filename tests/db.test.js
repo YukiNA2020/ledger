@@ -26,11 +26,21 @@ test('明文状态可在本地存储往返读取', async () => {
     accounts: [{ id: 'acc-bank', name: '测试银行卡' }],
     categories: [{ id: 'cat-food', name: '餐饮' }],
     txns: [{ id: 't1', merchant: '虚构早餐店', amount: 1234 }],
-    settings: { lock: { enabled: false } }
+    settings: { lock: { enabled: false } },
+    assets: { schemaVersion: 1, assetAccounts: [{ id: 'acc-hsbc', name: '汇丰' }], assetUnits: [], liabilities: [], entitlements: [], instruments: [], holdings: [], quotes: [], fxRates: [] }
   };
   await DB.saveAll(state);
   const raw = await DB.loadRaw();
   assert.deepStrictEqual(raw, state);
+});
+
+test('assets 键缺省（旧版本存储）时 loadRaw 返回 undefined，不报错', async () => {
+  await DB.saveAll({
+    accounts: [], categories: [], txns: [], settings: { lock: { enabled: false } }
+  });
+  const raw = await DB.loadRaw();
+  assert.strictEqual(raw.assets, undefined); // 旧存储没有 assets 键：不报错，由调用方归一化为空集合
+  assert.deepStrictEqual(raw.txns, []);
 });
 
 test('应用锁开启后交易以 AES-GCM 密文落盘并可正确解锁', async () => {
