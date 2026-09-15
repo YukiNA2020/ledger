@@ -86,18 +86,27 @@
 
 ## Phase 3｜账户、负债与月度结账
 
+状态：已完成（2026-09-15）；依赖 Phase 2 退出条件全部通过。
+
 目标：形成可信个人资产负债表。
 
 工作项：
 
-1. 机构—账户—币种子账户管理。
-2. 安全储备、可投资、受限资产和保障权益分类。
-3. 青岛公积金、医保、养老及社保卡预设与来源说明。
-4. 负债、近期应付款和净资产计算。
-5. 月度核对清单、结账状态和历史快照。
-6. 根据必要支出估算应急金覆盖月数。
+1. 机构—账户—币种子账户管理。✅ 资产录入页（机构→账户→子账户逐层维护）+ `POST /api/v1/institutions|accounts|account-units` 单条 upsert（机构按名称归一合并，其余按 id 幂等更新，D-031）
+2. 安全储备、可投资、受限资产和保障权益分类。✅ 账户 `pool` 字段（safety/investable/restricted/entitlement）+ 决策台资金池卡片复用 `Domain.computeOverview`
+3. 青岛公积金、医保、养老及社保卡预设与来源说明。✅ 保障权益表单（kind/jurisdiction/status/sourceRef）+ 无余额权益 `balanceMinor=null` 不冒充 0
+4. 负债、近期应付款和净资产计算。✅ `POST /api/v1/liabilities` + 净资产扣减负债（`computeOverview` 既有口径）
+5. 月度核对清单、结账状态和历史快照。✅ `Domain.computeCloseChecklist` + `GET/POST /api/v1/monthly-closes`（formal/estimate、sha256 快照、同月重复结账更新记录并追加快照）+ 月结页与历史列表
+6. 根据必要支出估算应急金覆盖月数。✅ 决策台应急金覆盖卡片 + 服务端按最近 3 个完整月必要支出重算，不采信前端覆盖率
 
 退出条件：一个完整月结账可在 15 分钟内完成；所有金额可追溯到余额、估值或交易。
+
+退出证据（2026-09-15）：
+
+- `node --test` **220/220 通过**（202 基线零回归 + 新增 18 项：`tests/domain-close.test.js` 7 项月结清单/应急金、`tests/server-phase3.test.js` 9 项资源写入与月结 API、迁移 v2 相关 2 项更新）；
+- 浏览器 wiring 验收 **13/13 通过**（新增 S3.1 资产录入不被全量写回抹掉、S3.3 月结门槛与估算快照，连续两轮全绿）；
+- 迁移 v2 `phase3-close-schema`（`monthly_closes` + `close_snapshots`）只加表不改旧表，v1 库前向迁移与备份恢复测试通过；
+- 正式结账门槛由服务端强制：存在阻塞项时 `POST status=formal` 返回 409 `close_blocked`，只能保存估算（S3.3）。
 
 ## Phase 4｜持仓与日终行情
 
