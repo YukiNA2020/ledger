@@ -1,6 +1,6 @@
 /* 小账本 server/repository.js — SQLite repository（Phase 2）
  *
- * 职责：把前端的全量内存状态（旧账本四键 + v3 资产八集合）与 SQLite 正规表互相转换。
+ * 职责：把前端的全量内存状态（旧账本四键 + v3 九类资产事实集合）与 SQLite 正规表互相转换。
  *
  * 设计要点：
  *  1. 单一写入者：所有写操作都在 transaction() 内完成全量替换，因此重复写入天然幂等，不会出现半新半旧。
@@ -62,6 +62,19 @@ function mergeExtra(row, target) {
 const KNOWN = {
   assetAccounts: ['id', 'name', 'kind', 'pool', 'status', 'institution'],
   assetUnits: ['id', 'accountId', 'currency', 'balanceMinor', 'asOf', 'sourceType'],
+  assetTransfers: [
+    'id',
+    'fromUnitId',
+    'toUnitId',
+    'fromCurrency',
+    'toCurrency',
+    'fromAmountMinor',
+    'toAmountMinor',
+    'occurredOn',
+    'sourceType',
+    'note',
+    'createdAt'
+  ],
   liabilities: ['id', 'name', 'currency', 'balanceMinor', 'dueDate', 'termType', 'asOf', 'accountId'],
   entitlements: [
     'id',
@@ -192,6 +205,72 @@ function readAssetUnits(db) {
     };
     return mergeExtra(row, out);
   });
+}
+
+function writeAssetTransfers(db, list, options) {
+  const opts = options || {};
+  // 币种绝不采信载荷里的重复字段：两端币种一律由关联余额单元推导（D-034）。
+  // 全量写入路径过去直接信任载荷中的 fromCurrency/toCurrency，实测可以写出
+  // 「转出单元实际是 HKD、记录却写 USD→HKD」这类与事实矛盾的历史；这里改为
+  // 缺失单元或同币种直接拒绝，让不一致的数据无法落库。
+  const unitCurrency = {};
+  all(db, 'SELECT id, currency FROM account_units').forEach((row) => {
+    unitCurrency[String(row.id)] = row.currency;
+  });
+  const st = db.prepare(
+    `INSERT INTO asset_transfers
+       (id, from_unit_id, to_unit_id, from_currency, to_currency,
+        from_amount_minor, to_amount_minor, occurred_on, source_type, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((t) => {
+    if (!t || !t.id) return;
+    const fromId = String(t.fromUnitId);
+    const toId = String(t.toUnitId);
+    if (fromId === toId) {
+      throw Object.assign(new Error('换汇转出与转入子账户不能相同'), { code: 'same_unit' });
+    }
+    const fromCurrency = unitCurrency[fromId];
+    const toCurrency = unitCurrency[toId];
+    if (!fromCurrency || !toCurrency) {
+      throw Object.assign(
+        new Error('换汇关联的币种子账户不存在：' + (fromCurrency ? toId : fromId)),
+        { code: 'unknown_unit' }
+      );
+    }
+    if (fromCurrency === toCurrency) {
+      throw Object.assign(new Error('换汇两端必须使用不同币种'), { code: 'same_currency' });
+    }
+    st.run(
+      String(t.id),
+      fromId,
+      toId,
+      fromCurrency,
+      toCurrency,
+      NUM(t.fromAmountMinor),
+      NUM(t.toAmountMinor),
+      String(t.occurredOn),
+      STR(t.sourceType) || 'manual',
+      STR(t.note),
+      STR(t.createdAt) || opts.now || new Date().toISOString()
+    );
+  });
+}
+
+function readAssetTransfers(db) {
+  return all(db, 'SELECT * FROM asset_transfers ORDER BY occurred_on DESC, created_at DESC').map((row) => ({
+    id: row.id,
+    fromUnitId: row.from_unit_id,
+    toUnitId: row.to_unit_id,
+    fromCurrency: row.from_currency,
+    toCurrency: row.to_currency,
+    fromAmountMinor: row.from_amount_minor,
+    toAmountMinor: row.to_amount_minor,
+    occurredOn: row.occurred_on,
+    sourceType: row.source_type,
+    note: row.note,
+    createdAt: row.created_at
+  }));
 }
 
 function writeLiabilities(db, list) {
@@ -592,6 +671,7 @@ function writeTxnsBlob(db, blob) {
 const CLEAR_ORDER = [
   'close_snapshots',
   'monthly_closes',
+  'asset_transfers',
   'dedup_candidates',
   'dedup_fingerprints',
   'security_events',
@@ -641,6 +721,7 @@ function readState(db) {
       schemaVersion: ASSETS_SCHEMA_VERSION,
       assetAccounts: readAssetAccounts(db),
       assetUnits: readAssetUnits(db),
+      assetTransfers: readAssetTransfers(db),
       liabilities: readLiabilities(db),
       entitlements: readEntitlements(db),
       instruments: readInstruments(db),
@@ -671,6 +752,7 @@ function writeState(db, state, options) {
     const ctx = { now: now };
     writeInstitutionsAndAccounts(db, assets.assetAccounts, ctx);
     writeAssetUnits(db, assets.assetUnits);
+    writeAssetTransfers(db, assets.assetTransfers, { now: now });
     writeLiabilities(db, assets.liabilities);
     writeEntitlements(db, assets.entitlements);
     writeInstruments(db, assets.instruments);
@@ -866,6 +948,88 @@ function upsertAssetUnit(db, u, options) {
   return get(db, 'SELECT * FROM account_units WHERE id = ?', [String(u.id)]);
 }
 
+function upsertAssetTransfer(db, t, options) {
+  const opts = options || {};
+  if (!t || !t.id) throw Object.assign(new Error('缺少换汇记录 id'), { code: 'invalid_id' });
+  if (t.fromUnitId === t.toUnitId) {
+    throw Object.assign(new Error('换汇转出与转入子账户不能相同'), { code: 'same_unit' });
+  }
+  const from = get(db, 'SELECT id, currency FROM account_units WHERE id = ?', [String(t.fromUnitId)]);
+  const to = get(db, 'SELECT id, currency FROM account_units WHERE id = ?', [String(t.toUnitId)]);
+  if (!from || !to) {
+    throw Object.assign(new Error('换汇关联的币种子账户不存在'), { code: 'unknown_unit' });
+  }
+  if (from.currency === to.currency) {
+    throw Object.assign(new Error('换汇两端必须使用不同币种'), { code: 'same_currency' });
+  }
+  if (!Number.isSafeInteger(t.fromAmountMinor) || t.fromAmountMinor <= 0 ||
+      !Number.isSafeInteger(t.toAmountMinor) || t.toAmountMinor <= 0) {
+    throw Object.assign(new Error('换汇两端金额必须是正整数（最小货币单位）'), { code: 'invalid_amount' });
+  }
+  const createdAt = opts.now || new Date().toISOString();
+  run(
+    db,
+    `INSERT INTO asset_transfers
+       (id, from_unit_id, to_unit_id, from_currency, to_currency,
+        from_amount_minor, to_amount_minor, occurred_on, source_type, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       from_unit_id = excluded.from_unit_id,
+       to_unit_id = excluded.to_unit_id,
+       from_currency = excluded.from_currency,
+       to_currency = excluded.to_currency,
+       from_amount_minor = excluded.from_amount_minor,
+       to_amount_minor = excluded.to_amount_minor,
+       occurred_on = excluded.occurred_on,
+       source_type = excluded.source_type,
+       note = excluded.note`,
+    [
+      String(t.id), String(t.fromUnitId), String(t.toUnitId), from.currency, to.currency,
+      t.fromAmountMinor, t.toAmountMinor, String(t.occurredOn), STR(t.sourceType) || 'manual', STR(t.note), createdAt
+    ]
+  );
+  return readAssetTransfers(db).find((item) => item.id === String(t.id)) || null;
+}
+
+// 手动维护汇率（Phase 3 补充，D-034）：同一个币对只保留一条，重复提交即更新。
+// 追加历史行会让「当前汇率」无法从数据里唯一确定，也让导出与备份越来越难读；
+// 需要历史汇率时由备份版本提供，而不是在活跃表里堆积。
+function upsertFxRate(db, r, options) {
+  const opts = options || {};
+  if (!r || Domain.CURRENCIES.indexOf(r.base) === -1 || Domain.CURRENCIES.indexOf(r.quote) === -1) {
+    throw Object.assign(new Error('汇率币种必须是 CNY/HKD/USD'), { code: 'invalid_currency' });
+  }
+  if (r.base === r.quote) {
+    throw Object.assign(new Error('汇率的两端币种不能相同'), { code: 'same_currency' });
+  }
+  // Domain.parseDecimal 返回的是定点对象 {v, s}，不是数字：这里必须保留原字符串，
+  // 直接 String(rate) 会写进 "[object Object]" 并让所有折算永久失败（P3-5）。
+  const rateText = typeof r.rateDecimal === 'string' ? r.rateDecimal.trim() : String(r.rateDecimal);
+  const rate = Domain.parseDecimal(rateText);
+  if (!rate || !(rate.v > 0)) {
+    throw Object.assign(new Error('汇率必须是大于 0 的定点十进制数'), { code: 'invalid_rate' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r.rateDate || ''))) {
+    throw Object.assign(new Error('汇率日期必须是 YYYY-MM-DD'), { code: 'invalid_rate_date' });
+  }
+  run(db, 'DELETE FROM fx_rates WHERE base = ? AND "quote" = ?', [String(r.base), String(r.quote)]);
+  run(
+    db,
+    `INSERT INTO fx_rates (base, "quote", rate_decimal, rate_date, fetched_at, provider, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(r.base),
+      String(r.quote),
+      rateText,
+      String(r.rateDate),
+      opts.now || new Date().toISOString(),
+      STR(r.provider) || 'manual',
+      STR(r.status) || 'ok'
+    ]
+  );
+  return readFxRates(db).find((x) => x.base === String(r.base) && x.quote === String(r.quote)) || null;
+}
+
 function upsertLiability(db, l, options) {
   const opts = options || {};
   if (!l || !l.id) throw Object.assign(new Error('缺少负债 id'), { code: 'invalid_id' });
@@ -1032,6 +1196,26 @@ function getCloseSnapshotPayload(db, id) {
   }
 }
 
+// 快照明细读取（Phase 3 补充，D-034）：金额下钻需要原始 payload_json 做哈希复核，
+// 因此除解析后的对象外也返回原始字符串，避免调用方各自 stringify 造成哈希口径分叉。
+function getCloseSnapshot(db, id) {
+  const row = get(
+    db,
+    'SELECT id, close_id, month, captured_at, snapshot_type, payload_json, payload_hash FROM close_snapshots WHERE id = ?',
+    [String(id)]
+  );
+  if (!row) return null;
+  return {
+    id: row.id,
+    closeId: row.close_id,
+    month: row.month,
+    capturedAt: row.captured_at,
+    snapshotType: row.snapshot_type,
+    payloadJson: row.payload_json,
+    payloadHash: row.payload_hash
+  };
+}
+
 module.exports = {
   ASSET_KEYS,
   LEGACY_KEYS,
@@ -1041,6 +1225,7 @@ module.exports = {
   clearAll,
   readAssetAccounts,
   readAssetUnits,
+  readAssetTransfers,
   readLiabilities,
   readEntitlements,
   readInstruments,
@@ -1061,11 +1246,14 @@ module.exports = {
   upsertInstitution,
   upsertAssetAccount,
   upsertAssetUnit,
+  upsertAssetTransfer,
   upsertLiability,
   upsertEntitlement,
   listMonthlyCloses,
   getMonthlyCloseByMonth,
   upsertMonthlyClose,
   insertCloseSnapshot,
-  getCloseSnapshotPayload
+  getCloseSnapshotPayload,
+  getCloseSnapshot,
+  upsertFxRate
 };

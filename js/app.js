@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.0-phase3';
+  var APP_VERSION = '2.3.2-phase3';
 
   /* ================= 状态 ================= */
   var state = {
@@ -499,21 +499,30 @@
   // 最近 3 个完整自然月的必要支出均值（分，来自分类「必要」标记的现金流）。
   // 只对有支出记录的月份取平均：没记账的月份不代表没有支出，按 0 摊平会高估覆盖月数。
   // 无法估算 → null，绝不虚构。
+  // 注意：必须传 categories，否则按「必要」标记的分类归类失效、need 恒为 0；
+  // 且 Core.aggregate 的 need 已经是「分」，不能再过一遍 yuanToCents（会把结果放大 100 倍）。
   function avgNecessaryMinor() {
     var total = 0, months = 0;
     for (var i = 1; i <= 3; i++) {
       var ym = ymShift(todayDateStr(), -i);
-      var agg = Core.aggregate(state.txns, { year: +ym.slice(0, 4), month: +ym.slice(5, 7) });
+      var agg = Core.aggregate(state.txns, {
+        year: +ym.slice(0, 4), month: +ym.slice(5, 7), categories: state.categories
+      });
       if (agg.need > 0) { total += agg.need; months += 1; }
     }
     if (!months) return null;
-    return Core.yuanToCents(String(total / months));
+    return Math.round(total / months);
   }
 
   function ymLastDay(ym) {
     var d = new Date(+ym.slice(0, 4), +ym.slice(5, 7), 0);
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
   }
+
+  // 月度结账的对象月：上一个完整自然月（与 tplClose / doMonthlyClose 同一口径）。
+  // 录入表单的「核对日期」默认取该月最后一天，否则新录入当天会被判为「未在结账月份内核对」（P0-A）。
+  function closeTargetMonth() { return ymShift(todayDateStr(), -1); }
+  function closeTargetAsOf() { return ymLastDay(closeTargetMonth()); }
 
   // 资源接口写入后必须重新拉取全量状态：写回事实源是全量覆盖（先清后写），
   // 前端内存里的 assets 若不刷新，下一次记账会把资源接口写入的数据抹掉。
@@ -577,6 +586,24 @@
       (accCards || '<div class="empty"><div class="e-icon">🏦</div><b>还没有资产账户</b>' +
         '<div class="small muted">先建账户，再登记各币种余额</div></div>');
 
+    /* 多币种换汇：独立资产事实，不进入现金流收入/支出。 */
+    var unitMap = {};
+    a.assetUnits.forEach(function (u) { unitMap[u.id] = u; });
+    var transferRows = a.assetTransfers.map(function (t) {
+      var from = unitMap[t.fromUnitId] || {};
+      var to = unitMap[t.toUnitId] || {};
+      var fromAcc = a.assetAccounts.find(function (x) { return x.id === from.accountId; }) || {};
+      var toAcc = a.assetAccounts.find(function (x) { return x.id === to.accountId; }) || {};
+      return '<div class="acc-card"><div class="row"><b>' + esc(t.fromCurrency) + ' → ' + esc(t.toCurrency) + '</b>' +
+        '<span class="small muted" style="margin-left:auto">' + esc(t.occurredOn) + '</span></div>' +
+        '<div class="small muted">' + esc(fromAcc.name || '未知账户') + ' −' + Core.fmtMoney(t.fromAmountMinor) + ' ' + esc(t.fromCurrency) +
+        ' · ' + esc(toAcc.name || '未知账户') + ' +' + Core.fmtMoney(t.toAmountMinor) + ' ' + esc(t.toCurrency) + '</div>' +
+        (t.note ? '<div class="small muted">' + esc(t.note) + '</div>' : '') + '</div>';
+    }).join('');
+    var transferSection = '<div class="sec-head"><b>换汇记录</b>' +
+      '<button class="link small" data-action="asset:transfer">＋记录换汇</button></div>' +
+      (transferRows || '<div class="small muted" style="padding:4px 0 10px">暂无换汇记录</div>');
+
     /* 负债 */
     var liabRows = a.liabilities.map(function (l) {
       var bal = l.balanceMinor == null ? '<span class="muted">未核实</span>' : Core.fmtMoney(l.balanceMinor);
@@ -584,7 +611,9 @@
         '<span class="small muted" style="margin-left:auto">' + bal + ' ' + esc(l.currency || 'CNY') + '</span></div>' +
         '<div class="small muted">' +
         (l.termType === 'current' ? TERM_LABELS.current : (l.termType === 'non_current' ? TERM_LABELS.non_current : '期限未标')) +
-        (l.dueDate ? ' · 到期 ' + esc(l.dueDate) : '') + ' · 核对日 ' + esc(l.asOf || '—') + '</div></div>';
+        (l.dueDate ? ' · 到期 ' + esc(l.dueDate) : '') + ' · 核对日 ' + esc(l.asOf || '—') + '</div>' +
+        '<button class="btn ghost small" data-action="asset:liab" data-id="' + esc(l.id) + '">更新余额 / 核对日期</button>' +
+        '</div>';
     }).join('');
     var liabSection = '<div class="sec-head"><b>负债</b>' +
       '<button class="link small" data-action="asset:liab">＋新增负债</button></div>' +
@@ -593,17 +622,133 @@
     /* 保障权益：只记录状态，不进入资产合计（D-011） */
     var entRows = a.entitlements.map(function (e) {
       var bal = e.balanceMinor == null ? '' : ' · 供参考 ' + Core.fmtMoney(e.balanceMinor);
+      var src = e.sourceRef ? ' · 来源 ' + esc(e.sourceRef) : '';
+      var jur = e.jurisdiction ? esc(e.jurisdiction) + ' · ' : '';
       return '<div class="acc-card"><div class="row"><b>' + esc(e.name) + '</b>' +
         '<span class="small muted" style="margin-left:auto">' + esc(ENT_KIND_LABELS[e.kind] || e.kind || '') + '</span></div>' +
-        '<div class="small muted">' + esc(e.status || '状态未知') + bal + ' · 核对日 ' + esc(e.asOf || '—') + '</div></div>';
+        '<div class="small muted">' + jur + esc(e.status || '状态未知') + bal + ' · 核对日 ' + esc(e.asOf || '—') + src + '</div>' +
+        '<button class="btn ghost small" data-action="asset:ent" data-id="' + esc(e.id) + '">更新状态 / 来源</button>' +
+        '</div>';
     }).join('');
     var entSection = '<div class="sec-head"><b>保障权益</b>' +
       '<button class="link small" data-action="asset:ent">＋新增权益</button></div>' +
       (entRows || '<div class="small muted" style="padding:4px 0 10px">暂无保障权益（社保 / 公积金 / 保险等）</div>');
 
-    return html + accountSection + liabSection + entSection +
+    /* 青岛福利预设（S3.2）：把「明确余额」与「无余额资格」分流到正确的数据模型，
+       避免用户把公积金/医保个人账户余额填进只做展示的权益里（那样不计入总资产）。 */
+    var presetRows = PRESETS.map(function (p) {
+      return '<div class="acc-card"><div class="row"><b>' + esc(p.title) + '</b>' +
+        '<span class="small muted" style="margin-left:auto">' + (p.counts ? '计入资产' : '仅状态') + '</span></div>' +
+        '<div class="small muted">' + esc(p.desc) + '</div>' +
+        '<button class="btn ghost small" data-action="asset:preset" data-id="' + esc(p.id) + '">' + esc(p.cta) + '</button>' +
+        '</div>';
+    }).join('');
+    var presetSection = '<div class="sec-head"><b>福利预设（青岛）</b></div>' + presetRows;
+
+    /* 汇率维护：Phase 3 用手动汇率让外币余额可正式折算；自动行情属于 Phase 4 */
+    var fxRows = a.fxRates.map(function (r) {
+      return '<div class="todo-item small">· ' + esc(r.base) + '→' + esc(r.quote) + ' ' + esc(r.rateDecimal) +
+        '<span class="muted"> 汇率日 ' + esc(r.rateDate || '—') + ' · ' + esc(r.status || 'manual') + '</span></div>';
+    }).join('');
+    var fxSection = '<div class="sec-head"><b>汇率</b>' +
+      '<button class="link small" data-action="asset:fx">＋登记汇率</button></div>' +
+      '<div class="card">' + (fxRows || '<div class="small muted">暂无手动汇率；外币余额缺汇率时不计入汇总，且会阻塞正式结账</div>') +
+      '<div class="small muted" style="margin-top:6px">自动行情将在后续版本接入；在此登记的是「币对 + 汇率 + 汇率日」这一条事实。</div></div>';
+
+    return html + accountSection + transferSection + liabSection + entSection + presetSection + fxSection +
       '<div class="small muted" style="margin-top:12px">说明：权益只展示状态与备注，不计入任何资产合计；' +
-      '外币余额按估值日汇率折算，缺汇率时该项不计入。</div>';
+      '外币余额按估值日汇率折算，缺汇率时该项不计入；换汇只记为资产转移，不计收入或支出。</div>';
+  }
+
+  /* ---------- 福利预设（青岛）----------
+     把「有明确余额」的福利分流成受限资产账户（计入资产，仅计一次），
+     「只有资格没有余额」的福利留在权益表（不计入资产）。 */
+  var PRESETS = [
+    {
+      id: 'pf',
+      title: '青岛公积金余额',
+      desc: '建立「青岛住房公积金」受限资产账户并登记 CNY 明确余额；计入总资产且只计一次。',
+      cta: '登记公积金余额',
+      counts: true,
+      account: { name: '青岛住房公积金', institution: '青岛市住房公积金管理中心', kind: 'government', pool: 'restricted' },
+      entKind: 'housing_fund'
+    },
+    {
+      id: 'mi',
+      title: '医保个人账户余额',
+      desc: '建立「医保个人账户」受限资产账户并登记 CNY 明确余额；计入总资产且只计一次。',
+      cta: '登记医保余额',
+      counts: true,
+      account: { name: '医保个人账户', institution: '青岛市医疗保障局', kind: 'government', pool: 'restricted' },
+      entKind: 'social_security'
+    },
+    {
+      id: 'ent',
+      title: '养老 / 失业等无余额资格',
+      desc: '只记录参保状态与查询来源，不登记金额；权益不计入任何资产合计。',
+      cta: '登记参保状态',
+      counts: false,
+      account: null,
+      entKind: 'social_security',
+      defaultName: '职工基本养老保险'
+    },
+    {
+      id: 'card',
+      title: '社保卡金融账户',
+      desc: '社保卡的银行金融账户，作为普通储蓄卡账户独立管理，不与社保权益合并。',
+      cta: '登记社保卡账户',
+      counts: true,
+      account: { name: '社保卡金融账户', institution: '', kind: 'bank_card', pool: 'safety' },
+      entKind: 'other'
+    }
+  ];
+
+  function presetById(id) {
+    for (var i = 0; i < PRESETS.length; i++) if (PRESETS[i].id === id) return PRESETS[i];
+    return null;
+  }
+
+  function presetSheet(id) {
+    var p = presetById(id);
+    if (!p) { toast('未知预设', 'warn'); return; }
+    var acct = p.account;
+    var fields = '<div class="form-row">' +
+      formItem(p.counts ? '记录名称' : '资格名称',
+        '<input id="ap-name" value="' + esc(acct ? acct.name : (p.defaultName || '')) + '">') +
+      formItem('所属机构（可选）',
+        '<input id="ap-inst" value="' + esc(acct ? acct.institution : '') + '" placeholder="如 青岛市住房公积金管理中心">') +
+      formItem('地区', '<input id="ap-jur" value="青岛">');
+    if (p.counts) {
+      fields += formItem('明确余额（元）', '<input id="ap-bal" type="number" step="0.01" placeholder="0.00">');
+    } else {
+      fields += formItem('参保状态', '<input id="ap-status" value="在缴">');
+    }
+    fields += formItem('核对日期', '<input id="ap-asof" type="date" value="' + closeTargetAsOf() + '">') +
+      formItem('查询来源（链接/渠道）', '<input id="ap-src" placeholder="如 青岛公积金 App / 人社局柜台">') +
+      '</div>' +
+      (p.counts
+        ? '<div class="small muted" style="padding:0 4px 8px">将创建「受限资产 / 储蓄卡」账户并登记 CNY 余额 —— 该金额会进入总资产，且只计一次。</div>'
+        : '<div class="small muted" style="padding:0 4px 8px">只记录资格与状态，不填金额 —— 该权益不计入总资产。</div>') +
+      '<input type="hidden" id="ap-kind" value="' + esc(String(!!p.counts)) + '">' +
+      '<input type="hidden" id="ap-preset" value="' + esc(p.id) + '">' +
+      '<button class="btn primary block" data-action="asset:savePreset">' + esc(p.cta) + '</button>';
+    openSheet(p.title, fields);
+  }
+
+  function assetFxSheet() {
+    var curOpts = Domain.CURRENCIES.map(function (c) { return '<option value="' + esc(c) + '"' + (c === 'CNY' ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('');
+    var baseOpts = Domain.CURRENCIES.map(function (c) { return '<option value="' + esc(c) + '"' + (c === 'USD' ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('');
+    openSheet('登记汇率',
+      '<div class="form-row">' +
+      formItem('基准币种（外币）', '<select id="fx-base">' + baseOpts + '</select>') +
+      formItem('报价币种（目标币种 · 通常 CNY）', '<select id="fx-quote">' + curOpts + '</select>') +
+      formItem('汇率（1 基准币 = ? 报价币）', '<input id="fx-rate" placeholder="如 7.1200" inputmode="decimal">') +
+      formItem('汇率日', '<input id="fx-date" type="date" value="' + todayDateStr() + '">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">折算<b>按登记的币对方向精确匹配</b>，不会自动取倒数：' +
+      '要把 USD 余额折成 CNY，就登记「USD → CNY」。同一币对重复登记会更新该条事实。' +
+      '汇率日超过 5 个自然日会标记为过期（仍可用于折算，但不会让月结变成正式口径）。</div>' +
+      '<button class="btn primary block" data-action="asset:saveFx">保存汇率</button>');
   }
 
   function assetAccountSheet() {
@@ -638,33 +783,71 @@
       '<button class="btn primary block" data-action="asset:saveUnit">保存</button>');
   }
 
-  function assetLiabilitySheet() {
+  function assetTransferSheet() {
     var a = Domain.normalizeAssets(state.assets);
-    var accOpts = '<option value="">不关联账户</option>' + a.assetAccounts.map(function (acc) {
-      return '<option value="' + esc(acc.id) + '">' + esc(acc.name) + '</option>';
+    if (a.assetUnits.length < 2) { toast('请先登记至少两个币种子账户', 'warn'); return; }
+    var accountMap = {};
+    a.assetAccounts.forEach(function (acc) { accountMap[acc.id] = acc.name; });
+    var opts = a.assetUnits.map(function (u) {
+      return '<option value="' + esc(u.id) + '">' + esc(accountMap[u.accountId] || '未知账户') + ' · ' + esc(u.currency) + '</option>';
     }).join('');
-    openSheet('新增负债',
+    openSheet('记录换汇',
       '<div class="form-row">' +
-      formItem('负债名称', '<input id="al-name" placeholder="如 花呗 / 房贷">') +
-      formItem('关联账户（可选）', '<select id="al-acc">' + accOpts + '</select>') +
-      formItem('当前余额', '<input id="al-bal" type="number" step="0.01" placeholder="0.00">') +
-      formItem('到期日（可选）', '<input id="al-due" type="date">') +
-      formItem('期限类型', '<select id="al-term"><option value="current">' + TERM_LABELS.current + '</option>' +
-        '<option value="non_current">' + TERM_LABELS.non_current + '</option></select>') +
+      formItem('转出子账户', '<select id="at-from">' + opts + '</select>') +
+      formItem('转出金额', '<input id="at-from-amount" type="number" min="0" step="0.01" placeholder="0.00">') +
+      formItem('转入子账户', '<select id="at-to">' + opts + '</select>') +
+      formItem('转入金额', '<input id="at-to-amount" type="number" min="0" step="0.01" placeholder="0.00">') +
+      formItem('换汇日期', '<input id="at-date" type="date" value="' + todayDateStr() + '">') +
+      formItem('备注（可选）', '<input id="at-note" placeholder="如 银行牌价及手续费">') +
       '</div>' +
-      '<button class="btn primary block" data-action="asset:saveLiab">创建</button>');
+      '<div class="small muted" style="padding:0 4px 8px">换汇记录不会进入收入或支出，也不会自动改写当前余额；请按银行实际余额分别核对两个子账户。</div>' +
+      '<button class="btn primary block" data-action="asset:saveTransfer">保存换汇</button>');
   }
 
-  function assetEntitlementSheet() {
-    openSheet('新增保障权益',
+  function assetLiabilitySheet(liab) {
+    var a = Domain.normalizeAssets(state.assets);
+    var accOpts = '<option value="">不关联账户</option>' + a.assetAccounts.map(function (acc) {
+      return '<option value="' + esc(acc.id) + '"' + (liab && liab.accountId === acc.id ? ' selected' : '') + '>' +
+        esc(acc.name) + '</option>';
+    }).join('');
+    var l = liab || {};
+    openSheet(liab ? '更新负债' : '新增负债',
       '<div class="form-row">' +
-      formItem('名称', '<input id="ae-name" placeholder="如 城镇职工医保">') +
-      formItem('类型', '<select id="ae-kind">' + optList(ENT_KIND_LABELS, 'social_security') + '</select>') +
-      formItem('当前状态', '<input id="ae-status" placeholder="如 在缴 / 生效中">') +
-      formItem('参考金额（可留空）', '<input id="ae-bal" type="number" step="0.01" placeholder="留空表示无确认余额">') +
+      formItem('负债名称', '<input id="al-name" placeholder="如 花呗 / 房贷" value="' + esc(l.name || '') + '">') +
+      formItem('关联账户（可选）', '<select id="al-acc">' + accOpts + '</select>') +
+      formItem('当前余额', '<input id="al-bal" type="number" step="0.01" placeholder="0.00" value="' +
+        (l.balanceMinor == null ? '' : esc(Domain.parseDecimal(String(l.balanceMinor / 100)) == null ? '' : String(l.balanceMinor / 100))) + '">') +
+      formItem('核对日期', '<input id="al-asof" type="date" value="' + esc(l.asOf || closeTargetAsOf()) + '">') +
+      formItem('到期日（可选）', '<input id="al-due" type="date" value="' + esc(l.dueDate || '') + '">') +
+      formItem('期限类型', '<select id="al-term">' +
+        '<option value="current"' + (l.termType !== 'non_current' ? ' selected' : '') + '>' + TERM_LABELS.current + '</option>' +
+        '<option value="non_current"' + (l.termType === 'non_current' ? ' selected' : '') + '>' + TERM_LABELS.non_current + '</option>' +
+        '</select>') +
       '</div>' +
-      '<div class="small muted" style="padding:0 4px 8px">权益不计入资产合计；金额仅作个人参考展示。</div>' +
-      '<button class="btn primary block" data-action="asset:saveEnt">创建</button>');
+      '<input type="hidden" id="al-id" value="' + esc(l.id || '') + '">' +
+      '<div class="small muted" style="padding:0 4px 8px">核对日期默认为当前结账月份（' + ymLabel(closeTargetMonth()) +
+      '）最后一天；只有落在结账月份内才会被判定为「已核对」，否则正式结账会被阻塞。</div>' +
+      '<button class="btn primary block" data-action="asset:saveLiab">' + (liab ? '保存修改' : '创建') + '</button>');
+  }
+
+  function assetEntitlementSheet(ent) {
+    var e = ent || {};
+    var val = e.balanceMinor == null ? '' : String(e.balanceMinor / 100);
+    openSheet(ent ? '更新保障权益' : '新增保障权益',
+      '<div class="form-row">' +
+      formItem('名称', '<input id="ae-name" placeholder="如 城镇职工医保" value="' + esc(e.name || '') + '">') +
+      formItem('类型', '<select id="ae-kind">' + optList(ENT_KIND_LABELS, e.kind || 'social_security') + '</select>') +
+      formItem('地区', '<input id="ae-jur" placeholder="如 青岛" value="' + esc(e.jurisdiction || '青岛') + '">') +
+      formItem('当前状态', '<input id="ae-status" placeholder="如 在缴 / 生效中" value="' + esc(e.status || '') + '">') +
+      formItem('参考金额（可留空）', '<input id="ae-bal" type="number" step="0.01" placeholder="留空表示无确认余额" value="' + esc(val) + '">') +
+      formItem('核对日期', '<input id="ae-asof" type="date" value="' + esc(e.asOf || closeTargetAsOf()) + '">') +
+      formItem('查询来源（链接/渠道，可选）', '<input id="ae-src" placeholder="如 青岛公积金 App / 人社局柜台" value="' + esc(e.sourceRef || '') + '">' +
+        '<input type="hidden" id="ae-valtype" value="' + esc(e.valuationType || 'reference') + '">' +
+        '<input type="hidden" id="ae-id" value="' + esc(e.id || '') + '">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">权益不计入资产合计，金额仅作个人参考展示。' +
+      '若公积金或医保个人账户已有<b>明确余额</b>，请用上方「福利预设」建立受限资产账户，才会进入总资产。</div>' +
+      '<button class="btn primary block" data-action="asset:saveEnt">' + (ent ? '保存修改' : '创建') + '</button>');
   }
 
   /* ---------- 月度结账页 ---------- */
@@ -700,9 +883,10 @@
     var actionCard = '<div class="card">' + formalBtn + estimateBtn +
       '<div class="small muted" style="margin-top:8px">快照会封存当月净资产、核对清单与应急金覆盖，结账后可在下方回看；同月重复结账会更新记录并追加新快照。</div></div>';
 
-    /* 历史结账 */
+    /* 历史结账：每条都必须能下钻到封存时的单元级事实（ACCEPTANCE：金额可追溯） */
     var histRows = state.closes.map(function (c) {
       var s = c.summary || {};
+      var snapId = c.snapshot && c.snapshot.id;
       return '<div class="acc-card"><div class="row"><b>' + ymLabel(c.month) + '</b>' +
         '<span class="small muted" style="margin-left:auto">' +
         (c.status === 'formal' ? '正式' : '估算') + '</span></div>' +
@@ -710,6 +894,7 @@
         (s.emergencyCoverageMonths != null ? ' · 应急覆盖 ' + s.emergencyCoverageMonths + ' 个月' : '') + '</div>' +
         (c.snapshot ? '<div class="small muted">快照 ' + esc(String(c.snapshot.payloadHash || '').slice(0, 8)) +
           ' · ' + esc(String(c.snapshot.capturedAt || '').slice(0, 10)) + '</div>' : '') +
+        (snapId ? '<button class="btn ghost small" data-action="close:detail" data-id="' + esc(snapId) + '">查看明细</button>' : '') +
         '</div>';
     }).join('');
     var histCard = '<div class="sec-head"><b>历史结账</b></div>' +
@@ -717,6 +902,104 @@
         (state.closesLoaded ? '还没有结账记录' : '加载中…') + '</div>');
 
     return html + checklistCard + actionCard + histCard;
+  }
+
+  /* 结账快照明细：把封存时的单元级事实摊开，让每个汇总金额都能追到来源。
+     金额一律取快照内的 CNY 折算值（当时口径），不重新按今天的汇率折算。 */
+  function closeDetailSheet(snap) {
+    var p = snap.payload || {};
+    var facts = (p.checklist && p.checklist.facts) || {};
+    var ov = p.overview || {};
+    var pools = ov.pools || {};
+
+    function money(minor, currency) {
+      if (minor == null) return '<span class="muted">—</span>';
+      return Core.fmtMoney(minor) + (currency ? ' ' + esc(currency) : '');
+    }
+    function cny(minor, status) {
+      if (minor == null) return '<span class="muted">' + (status === 'missing_fx' ? '缺汇率·未计入' : '—') + '</span>';
+      return Core.fmtMoney(minor) + ' CNY';
+    }
+    function row(cells, head) {
+      var tag = head ? 'th' : 'td';
+      return '<tr>' + cells.map(function (c, i) {
+        return '<' + tag + (i === 0 ? ' style="text-align:left"' : ' style="text-align:right"') + '>' + c + '</' + tag + '>';
+      }).join('') + '</tr>';
+    }
+
+    var unitRows = (facts.units || []).map(function (u) {
+      return row([
+        esc(u.account || '') + '<div class="small muted">' + esc(u.currency || '') +
+        ' · 核对日 ' + esc(u.asOf || '—') + (u.confirmed ? ' · 已核对' : ' · 未核对') + '</div>',
+        money(u.balanceMinor, u.currency),
+        cny(u.valueCnyMinor, u.valueStatus)
+      ]);
+    }).join('');
+    var unitTable = '<div class="sec-head"><b>账户余额（来源：人工核对 / 系统导入）</b></div>' +
+      (unitRows
+        ? '<table class="mini"><thead>' + row(['账户 / 核对日', '原币金额', '折 CNY'], true) + '</thead><tbody>' + unitRows + '</tbody></table>'
+        : '<div class="small muted">该月没有余额记录</div>');
+
+    var liabRows = (facts.liabilities || []).map(function (l) {
+      return row([
+        esc(l.name || '') + '<div class="small muted">' + esc(l.currency || '') +
+        ' · 核对日 ' + esc(l.asOf || '—') + (l.confirmed ? ' · 已核对' : ' · 未核对') + '</div>',
+        money(l.balanceMinor, l.currency),
+        cny(l.valueCnyMinor, l.valueStatus)
+      ]);
+    }).join('');
+    var liabTable = '<div class="sec-head"><b>负债</b></div>' +
+      (liabRows
+        ? '<table class="mini"><thead>' + row(['名称 / 核对日', '原币金额', '折 CNY'], true) + '</thead><tbody>' + liabRows + '</tbody></table>'
+        : '<div class="small muted">该月没有负债记录</div>');
+
+    var holdRows = (facts.holdings || []).map(function (h) {
+      return row([
+        esc(h.symbol || h.instrumentId || '') + '<div class="small muted">' + esc(h.account || '') +
+        ' · 价格日 ' + esc(h.priceDate || '—') + ' · ' + esc(h.priceStatus || '') + '</div>',
+        (h.quantity == null ? '—' : esc(String(h.quantity))) +
+        '<div class="small muted">@ ' + (h.priceMinor == null ? '—' : Core.fmtMoney(h.priceMinor) + ' ' + esc(h.priceCurrency || '')) + '</div>',
+        cny(h.valueCnyMinor, h.valueStatus)
+      ]);
+    }).join('');
+    var holdTable = '<div class="sec-head"><b>持仓估值</b></div>' +
+      (holdRows
+        ? '<table class="mini"><thead>' + row(['标的 / 价格日', '数量 @ 价格', '折 CNY'], true) + '</thead><tbody>' + holdRows + '</tbody></table>'
+        : '<div class="small muted">该月没有持仓</div>');
+
+    var er = p.emergency || {};
+    var erBasis = er.basis || {};
+    var erSource = er.source === 'txns' ? '封存时从现金流事实重算'
+      : er.source === 'client' ? '前端传入（现金流不可用）'
+        : er.source === 'settings' ? '设置中的兜底值' : '不可用';
+    var erMonths = (erBasis.months || []).join('、');
+    var erReason = erBasis.reason === 'txns_encrypted' ? '现金流为密文，无法重算'
+      : erBasis.reason === 'no_necessary_expense' ? '检索区间内没有标记为「必要」的支出' : '';
+    var emergencyLine = er.avgNecessaryMinor == null
+      ? '应急覆盖：无法估算' + (erReason ? '（' + esc(erReason) + '）' : '') +
+        (erMonths ? ' · 检索区间 ' + esc(erMonths) : '')
+      : '应急覆盖：' + (p.emergencyCoverageMonths == null ? '—' : p.emergencyCoverageMonths + ' 个月') +
+        ' · 依据 安全储备 ' + Core.fmtMoney(pools.safetyMinor == null ? 0 : pools.safetyMinor) +
+        ' ÷ 月均必要支出 ' + Core.fmtMoney(er.avgNecessaryMinor) +
+        '（口径：' + esc(erSource) + ' · 取 ' + (erBasis.counted || 0) + ' 个月' +
+        (erMonths ? '：' + esc(erMonths) : '') + '）';
+
+    var body = '<div class="small muted">结账月份 ' + esc(p.month || snap.month || '') +
+      ' · 数据截止 ' + esc(p.asOf || '') + ' · 口径 ' + (p.status === 'formal' ? '正式' : '估算') + '</div>' +
+      '<div class="small muted" style="margin-top:4px">快照 ' + esc(String(snap.payloadHash || '').slice(0, 12)) +
+      ' · 封存于 ' + esc(String(snap.capturedAt || '').slice(0, 19).replace('T', ' ')) + '</div>' +
+      '<div class="card" style="margin-top:8px"><div class="acc-card">' +
+      '<div class="row"><b>净资产</b><span style="margin-left:auto">' + Core.fmtMoney(ov.netWorthMinor == null ? 0 : ov.netWorthMinor) + ' CNY</span></div>' +
+      '<div class="small muted">总资产 ' + Core.fmtMoney(ov.totalAssetsMinor == null ? 0 : ov.totalAssetsMinor) +
+      ' − 负债 ' + Core.fmtMoney(ov.totalLiabilitiesMinor == null ? 0 : ov.totalLiabilitiesMinor) +
+      '（下方三张表逐条加总即为此数）</div>' +
+      '<div class="small muted" style="margin-top:4px">' + emergencyLine + '</div>' +
+      '<div class="small muted">资金池：安全储备 ' + Core.fmtMoney(pools.safetyMinor == null ? 0 : pools.safetyMinor) +
+      ' · 可投资 ' + Core.fmtMoney(pools.investableMinor == null ? 0 : pools.investableMinor) +
+      ' · 受限 ' + Core.fmtMoney(pools.restrictedMinor == null ? 0 : pools.restrictedMinor) + '</div>' +
+      '</div></div>' +
+      unitTable + liabTable + holdTable;
+    openSheet('结账明细 · ' + ymLabel(p.month || snap.month || ''), body);
   }
 
   function doMonthlyClose(status) {
@@ -2276,7 +2559,7 @@
       try { restored = Core.restoreStateFromBackup(data); }
       catch (e2) { toast(e2.message || '备份文件校验失败', 'err'); return; }
       var v3 = restored.assets;
-      var v3Count = v3.assetAccounts.length + v3.assetUnits.length + v3.liabilities.length +
+      var v3Count = v3.assetAccounts.length + v3.assetUnits.length + v3.assetTransfers.length + v3.liabilities.length +
         v3.entitlements.length + v3.instruments.length + v3.holdings.length;
       confirmSheet('恢复备份',
         '备份时间：' + esc((data.exportedAt || '').replace('T', ' ').slice(0, 19)) + '<br>包含 ' + restored.txns.length + ' 笔交易、' +
@@ -2519,10 +2802,15 @@
         balanceMinor = Core.yuanToCents(raw);
         if (balanceMinor == null || balanceMinor < 0) { toast('余额格式不正确', 'warn'); return; }
       }
+      var accountId = $('#au-acc').value;
+      var currency = $('#au-cur').value;
+      var existing = state.assets.assetUnits.find(function (u) {
+        return u.accountId === accountId && u.currency === currency;
+      });
       Store.createResource('account-units', {
-        id: Core.newId('au'),
-        accountId: $('#au-acc').value,
-        currency: $('#au-cur').value,
+        id: existing ? existing.id : Core.newId('au'),
+        accountId: accountId,
+        currency: currency,
         balanceMinor: balanceMinor,
         asOf: $('#au-date').value || todayDateStr(),
         sourceType: 'manual'
@@ -2531,7 +2819,42 @@
         return refreshAssets();
       }).catch(resourceFail);
     },
-    'asset:liab': assetLiabilitySheet,
+    'asset:transfer': assetTransferSheet,
+    'asset:saveTransfer': function () {
+      var fromUnitId = $('#at-from').value;
+      var toUnitId = $('#at-to').value;
+      var from = state.assets.assetUnits.find(function (u) { return u.id === fromUnitId; });
+      var to = state.assets.assetUnits.find(function (u) { return u.id === toUnitId; });
+      if (!from || !to || fromUnitId === toUnitId) { toast('请选择两个不同的币种子账户', 'warn'); return; }
+      if (from.currency === to.currency) { toast('换汇两端币种必须不同', 'warn'); return; }
+      var fromAmountMinor = Core.yuanToCents($('#at-from-amount').value.trim());
+      var toAmountMinor = Core.yuanToCents($('#at-to-amount').value.trim());
+      if (fromAmountMinor == null || fromAmountMinor <= 0 || toAmountMinor == null || toAmountMinor <= 0) {
+        toast('请填写有效的换汇两端金额', 'warn'); return;
+      }
+      Store.createResource('asset-transfers', {
+        id: Core.newId('xfer'),
+        fromUnitId: fromUnitId,
+        toUnitId: toUnitId,
+        fromAmountMinor: fromAmountMinor,
+        toAmountMinor: toAmountMinor,
+        occurredOn: $('#at-date').value || todayDateStr(),
+        sourceType: 'manual',
+        note: $('#at-note').value.trim() || null
+      }).then(function () {
+        closeSheet(); toast('换汇已记为资产转移，不计收支');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'asset:liab': function (el) {
+      var id = el && el.dataset ? el.dataset.id : '';
+      var found = null;
+      if (id) {
+        found = (state.assets.liabilities || []).find(function (x) { return x.id === id; }) || null;
+        if (!found) { toast('找不到该负债记录', 'warn'); return; }
+      }
+      assetLiabilitySheet(found);
+    },
     'asset:saveLiab': function () {
       var name = $('#al-name').value.trim();
       if (!name) { toast('请填写负债名称', 'warn'); return; }
@@ -2541,21 +2864,34 @@
         balanceMinor = Core.yuanToCents(raw);
         if (balanceMinor == null || balanceMinor < 0) { toast('余额格式不正确', 'warn'); return; }
       }
+      // 核对日期必须显式选择：它决定该负债是否算「在结账月份内已核对」，
+      // 直接取今天会让上月结账永久阻塞（P0-A）
+      var asOf = $('#al-asof').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { toast('请选择核对日期', 'warn'); return; }
+      var existingId = $('#al-id').value;
       Store.createResource('liabilities', {
-        id: Core.newId('liab'),
+        id: existingId || Core.newId('liab'),
         name: name,
         accountId: $('#al-acc').value || null,
         currency: 'CNY',
         balanceMinor: balanceMinor,
         dueDate: $('#al-due').value || null,
         termType: $('#al-term').value,
-        asOf: todayDateStr()
+        asOf: asOf
       }).then(function () {
-        closeSheet(); toast('负债已保存');
+        closeSheet(); toast(existingId ? '负债已更新' : '负债已保存');
         return refreshAssets();
       }).catch(resourceFail);
     },
-    'asset:ent': assetEntitlementSheet,
+    'asset:ent': function (el) {
+      var id = el && el.dataset ? el.dataset.id : '';
+      var found = null;
+      if (id) {
+        found = (state.assets.entitlements || []).find(function (x) { return x.id === id; }) || null;
+        if (!found) { toast('找不到该权益记录', 'warn'); return; }
+      }
+      assetEntitlementSheet(found);
+    },
     'asset:saveEnt': function () {
       var name = $('#ae-name').value.trim();
       if (!name) { toast('请填写权益名称', 'warn'); return; }
@@ -2565,17 +2901,120 @@
         balanceMinor = Core.yuanToCents(raw);
         if (balanceMinor == null || balanceMinor < 0) { toast('金额格式不正确', 'warn'); return; }
       }
+      var asOf = $('#ae-asof').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { toast('请选择核对日期', 'warn'); return; }
+      var existingId = $('#ae-id').value;
       Store.createResource('entitlements', {
-        id: Core.newId('ent'),
+        id: existingId || Core.newId('ent'),
         name: name,
         kind: $('#ae-kind').value,
+        jurisdiction: $('#ae-jur').value.trim() || null,
         status: $('#ae-status').value.trim() || null,
         balanceMinor: balanceMinor,
-        asOf: todayDateStr()
+        valuationType: $('#ae-valtype').value || 'reference',
+        sourceRef: $('#ae-src').value.trim() || null,
+        asOf: asOf
       }).then(function () {
-        closeSheet(); toast('权益已保存');
+        closeSheet(); toast(existingId ? '权益已更新' : '权益已保存');
         return refreshAssets();
       }).catch(resourceFail);
+    },
+    'asset:preset': function (el) { presetSheet(el && el.dataset ? el.dataset.id : ''); },
+    'asset:savePreset': function () {
+      var p = presetById($('#ap-preset').value);
+      if (!p) { toast('未知预设', 'warn'); return; }
+      var name = $('#ap-name').value.trim();
+      if (!name) { toast('请填写名称', 'warn'); return; }
+      var institution = $('#ap-inst').value.trim();
+      var jurisdiction = $('#ap-jur').value.trim() || null;
+      var sourceRef = $('#ap-src').value.trim() || null;
+      var asOf = $('#ap-asof').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { toast('请选择核对日期', 'warn'); return; }
+
+      if (!p.counts) {
+        // 无余额资格：只登记状态与来源，明确不写金额
+        Store.createResource('entitlements', {
+          id: Core.newId('ent'),
+          name: name,
+          kind: p.entKind,
+          jurisdiction: jurisdiction,
+          status: $('#ap-status').value.trim() || null,
+          balanceMinor: null,
+          valuationType: 'none',
+          sourceRef: sourceRef,
+          asOf: asOf
+        }).then(function () {
+          closeSheet(); toast('已登记参保状态（不计入资产）');
+          return refreshAssets();
+        }).catch(resourceFail);
+        return;
+      }
+
+      // 有明确余额：先建（或复用）受限资产账户，再登记 CNY 余额，金额因此只计一次
+      var raw = $('#ap-bal').value.trim();
+      var balanceMinor = Core.yuanToCents(raw);
+      if (raw === '' || balanceMinor == null || balanceMinor < 0) { toast('请填写明确的余额金额', 'warn'); return; }
+      var existingAcc = (state.assets.assetAccounts || []).find(function (x) { return x.name === p.account.name; });
+      var accId = existingAcc ? existingAcc.id : Core.newId('aacc');
+      Store.createResource('accounts', {
+        id: accId,
+        name: name,
+        institution: institution,
+        kind: p.account.kind,
+        pool: p.account.pool,
+        status: 'active'
+      }).then(function () {
+        var existingUnit = (state.assets.assetUnits || []).find(function (u) {
+          return u.accountId === accId && u.currency === 'CNY';
+        });
+        return Store.createResource('account-units', {
+          id: existingUnit ? existingUnit.id : Core.newId('au'),
+          accountId: accId,
+          currency: 'CNY',
+          balanceMinor: balanceMinor,
+          asOf: asOf,
+          sourceType: 'manual'
+        });
+      }).then(function () {
+        closeSheet();
+        toast('已登记余额（计入资产，只计一次）');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'asset:fx': assetFxSheet,
+    'asset:saveFx': function () {
+      var base = $('#fx-base').value;
+      var quote = $('#fx-quote').value;
+      if (base === quote) { toast('两个币种不能相同', 'warn'); return; }
+      var rateDecimal = $('#fx-rate').value.trim();
+      if (!/^\d+(\.\d+)?$/.test(rateDecimal) || !(parseFloat(rateDecimal) > 0)) {
+        toast('请输入大于 0 的十进制汇率', 'warn'); return;
+      }
+      var rateDate = $('#fx-date').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(rateDate)) { toast('请选择汇率日', 'warn'); return; }
+      Store.createResource('fx-rates', {
+        base: base, quote: quote, rateDecimal: rateDecimal, rateDate: rateDate,
+        provider: 'manual', status: 'ok'
+      }).then(function () {
+        closeSheet(); toast(base + '→' + quote + ' 汇率已登记');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'close:detail': function (el) {
+      var id = el && el.dataset ? el.dataset.id : '';
+      if (!id) return;
+      Store.getCloseSnapshot(id).then(function (r) {
+        var snap = r && r.snapshot;
+        if (!snap) { toast('快照不存在或已被清理', 'warn'); return; }
+        var payload = null;
+        try { payload = JSON.parse(snap.payloadJson || 'null'); } catch (e) { payload = null; }
+        if (!payload) { toast('快照内容无法解析', 'err'); return; }
+        snap.payload = payload;
+        closeDetailSheet(snap);
+      }).catch(function (e) {
+        if (e && e.status === 404) { toast('快照不存在', 'warn'); return; }
+        resourceFail(e);
+      });
     },
     'close:save': function (el) {
       var status = el.dataset.status === 'formal' ? 'formal' : 'estimate';

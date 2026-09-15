@@ -26,7 +26,10 @@ const dbm = require('./db');
 const { LATEST_VERSION, migrate, currentVersion } = require('./migrations');
 const { BACKUP_KEEP } = require('./config');
 
-const REQUIRED_TABLES = [
+// 必需表随 schema 版本增长：v1 建立基础表，v2 加月结两表，v3 加换汇事实表。
+// 只按「候选库自己声明的版本」校验对应集合 —— 否则一个声称 v3 但被删过表的库
+// 会通过校验（迁移器看到 v3 已应用也不会重建缺表），恢复后在使用中才炸（D-034）。
+const REQUIRED_TABLES_V1 = [
   'schema_migrations',
   'asset_accounts',
   'account_units',
@@ -43,6 +46,22 @@ const REQUIRED_TABLES = [
   'app_settings',
   'service_meta'
 ];
+
+const REQUIRED_TABLES_BY_VERSION = {
+  2: ['monthly_closes', 'close_snapshots'],
+  3: ['asset_transfers']
+};
+
+function requiredTablesFor(version) {
+  let tables = REQUIRED_TABLES_V1.slice();
+  Object.keys(REQUIRED_TABLES_BY_VERSION).forEach((v) => {
+    if (version >= Number(v)) tables = tables.concat(REQUIRED_TABLES_BY_VERSION[v]);
+  });
+  return tables;
+}
+
+// 当前程序（最新 schema 版本）要求的完整表集合：供迁移与备份测试断言「新库表齐备」
+const REQUIRED_TABLES = requiredTablesFor(LATEST_VERSION);
 
 const BACKUP_PREFIX = 'ledger-';
 const LAST_BACKUP_META = 'last_backup_at';
@@ -133,13 +152,17 @@ function validateBackupFile(file) {
     if (String(integrity).toLowerCase() !== 'ok') {
       return { ok: false, reason: '完整性检查未通过：' + integrity };
     }
-    const missing = REQUIRED_TABLES.filter((t) => !dbm.tableExists(db, t));
-    if (missing.length) return { ok: false, reason: '缺少必需表：' + missing.join(', ') };
+    // 先确认可以读出 schema 版本，再按该版本校验必需表（版本表本身也必须在）
+    if (!dbm.tableExists(db, 'schema_migrations')) {
+      return { ok: false, reason: '缺少必需表：schema_migrations' };
+    }
     const version = currentVersion(db);
     if (version < 1) return { ok: false, reason: 'schema 版本为空' };
     if (version > LATEST_VERSION) {
       return { ok: false, reason: '备份来自更新的版本（v' + version + ' > v' + LATEST_VERSION + '）' };
     }
+    const missing = requiredTablesFor(version).filter((t) => !dbm.tableExists(db, t));
+    if (missing.length) return { ok: false, reason: '缺少必需表：' + missing.join(', ') };
     return { ok: true, schemaVersion: version };
   } catch (err) {
     return { ok: false, reason: '无法作为数据库打开：' + (err && err.message ? err.message : String(err)) };
@@ -392,6 +415,8 @@ async function restoreBackup(db, paths, backupPath, options) {
 
 module.exports = {
   REQUIRED_TABLES,
+  REQUIRED_TABLES_V1,
+  requiredTablesFor,
   LAST_BACKUP_META,
   backupFileName,
   listBackups,

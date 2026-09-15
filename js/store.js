@@ -174,7 +174,7 @@
     if (state.settings != null) return false;
     var legacyEmpty = (!state.accounts || state.accounts.length === 0) && (!state.txns || state.txns.length === 0);
     var a = state.assets || {};
-    var keys = ['assetAccounts', 'assetUnits', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
+    var keys = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
     var assetsEmpty = keys.every(function (k) {
       return !a[k] || a[k].length === 0;
     });
@@ -330,6 +330,18 @@
     });
   }
 
+  // 结账快照明细（金额下钻）：只读，返回封存时的单元级事实与哈希
+  function getCloseSnapshot(id) {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        var err = new Error('本地服务未运行，无法读取快照明细');
+        err.code = 'unreachable';
+        throw err;
+      }
+      return apiFetch('/close-snapshots/' + encodeURIComponent(id), { token: false });
+    });
+  }
+
   // month：'YYYY-MM'；opts：{ status: 'formal'|省略, avgNecessaryMinor: 分|省略 }
   // status 缺省时由服务端按核对结果决定（可正式则 formal，否则 estimate）
   function saveMonthlyClose(month, opts) {
@@ -360,6 +372,7 @@
     overview: overview,
     createResource: createResource,
     listMonthlyCloses: listMonthlyCloses,
+    getCloseSnapshot: getCloseSnapshot,
     saveMonthlyClose: saveMonthlyClose
   };
 });

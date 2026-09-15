@@ -285,3 +285,10 @@ button, .btn { touch-action: manipulation; }
 .dash-caliber summary { cursor: pointer; }
 .dash-entry { display: flex; align-items: center; justify-content: space-between; cursor: pointer; }
 .dash-entry .arrow { color: var(--ink-3); font-size: 22px; }
+
+/* Phase 3：结账明细下钻表（快照事实逐条摊开） */
+.mini { width: 100%; border-collapse: collapse; margin: 4px 0 10px; font-size: 12px; }
+.mini th, .mini td { padding: 6px 4px; border-bottom: 1px solid var(--bg-3); vertical-align: top; }
+.mini th { color: var(--ink-3); font-weight: 600; font-size: 11px; }
+.mini td { font-variant-numeric: tabular-nums; }
+.mini .muted, .mini .small { font-size: 11px; }

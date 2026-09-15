@@ -16,6 +16,7 @@ const B = require('../server/backup');
 const R = require('../server/repository');
 const dbm = require('../server/db');
 const config = require('../server/config');
+const M = require('../server/migrations');
 const { setup, loadFixtureState, loadFixtureBackup, listSidecars } = require('./server-helpers');
 
 test('createBackup 生成通过校验的文件，且不留下临时/同伴文件', async () => {
@@ -28,7 +29,7 @@ test('createBackup 生成通过校验的文件，且不留下临时/同伴文件
     assert.match(result.name, /^ledger-\d{8}-\d{6}-manual\.db$/);
     const check = B.validateBackupFile(result.file);
     assert.strictEqual(check.ok, true, check.reason);
-    assert.strictEqual(check.schemaVersion, 2);
+    assert.strictEqual(check.schemaVersion, M.LATEST_VERSION);
 
     const leftovers = fs.readdirSync(ctx.paths.backupDir).filter((n) => !n.endsWith('.db'));
     assert.deepStrictEqual(leftovers, [], '不应留下 .tmp / -wal / -shm 等文件');
@@ -273,4 +274,95 @@ test('Phase 1 的 v2 备份 fixture 结构仍然可解析（不破坏既有备�
   assert.strictEqual(backup.assets.assetAccounts.length, 4);
   assert.strictEqual(backup.assets.assetUnits.length, 3);
   assert.strictEqual(backup.assets.liabilities[0].balanceMinor, 200000);
+});
+
+/* ------------------ Phase 3 补口（P1-C）：按 schema 版本条件校验必需表 ------------------ */
+
+test('P1-C 结构校验按候选库版本条件化：v3 缺 asset_transfers 必须拒绝', async () => {
+  const ctx = setup('ledger-bak-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+    assert.strictEqual(B.validateBackupFile(result.file).ok, true);
+
+    // 人为制造「迁移记录写着 v3，但表被删掉」的损坏库。
+    // createBackup 自身会先校验，无法用它产出损坏文件 —— 复制一份合格备份再破坏结构。
+    assert.ok(M.LATEST_VERSION >= 3, '本用例前提：最新 schema 版本 ≥ 3');
+    const brokenFile = path.join(ctx.paths.backupDir, 'ledger-20260901-120000-broken.db');
+    fs.copyFileSync(result.file, brokenFile);
+    const raw = new DatabaseSync(brokenFile);
+    raw.exec('DROP TABLE asset_transfers');
+    raw.close();
+
+    const check = B.validateBackupFile(brokenFile);
+    assert.strictEqual(check.ok, false, '声称 v3 却缺 asset_transfers 的库不得通过校验');
+    assert.ok(String(check.reason).indexOf('asset_transfers') >= 0, '拒绝原因应点名缺失的表：' + check.reason);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('P1-C 合法的 v2 备份（无 asset_transfers）仍可通过校验与恢复', async () => {
+  const ctx = setup('ledger-bak-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+
+    // 降级为 v2 形态：删掉 v3 才引入的表，并抹掉 v3 迁移记录（同样要绕开 createBackup 的自校验）
+    const v2File = path.join(ctx.paths.backupDir, 'ledger-20260901-130000-v2.db');
+    fs.copyFileSync(result.file, v2File);
+    const raw = new DatabaseSync(v2File);
+    raw.exec('DROP TABLE asset_transfers');
+    raw.exec('DELETE FROM schema_migrations WHERE version >= 3');
+    raw.close();
+
+    const check = B.validateBackupFile(v2File);
+    assert.strictEqual(check.ok, true, 'v2 备份不应被要求携带 v3 的表：' + check.reason);
+    assert.strictEqual(check.schemaVersion, 2);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('P1-C 含换汇记录的备份可完整往返（创建 → 校验 → 恢复）', async () => {
+  const ctx = setup('ledger-bak-');
+  try {
+    const state = loadFixtureState();
+    state.assets.assetTransfers = [];
+    R.writeState(ctx.db, state);
+
+    const acc = R.readAssetAccounts(ctx.db)[0];
+    const units = R.readAssetUnits(ctx.db);
+    assert.ok(acc && units.length >= 2, '前提：标准虚构数据含账户与余额单元');
+
+    // 在已落库的两个单元之间建立换汇事实（币种由单元推导）
+    const a = units[0];
+    const b = units.find((u) => u.currency !== a.currency) || units[1];
+    R.upsertAssetTransfer(ctx.db, {
+      id: 'xfer-bak-1',
+      fromUnitId: a.id,
+      toUnitId: b.id,
+      fromAmountMinor: 10000,
+      toAmountMinor: 9000,
+      occurredOn: '2026-08-20',
+      sourceType: 'manual'
+    }, { now: '2026-08-20T00:00:00Z' });
+
+    const before = R.readAssetTransfers(ctx.db);
+    assert.strictEqual(before.length, 1);
+
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+    const check = B.validateBackupFile(result.file);
+    assert.strictEqual(check.ok, true, check.reason);
+    assert.strictEqual(check.schemaVersion, M.LATEST_VERSION);
+
+    const restored = ctx.adopt(await B.restoreBackup(ctx.db, ctx.paths, result.file));
+    assert.strictEqual(restored.ok, true, restored.reason);
+    const after = R.readAssetTransfers(ctx.db);
+    assert.strictEqual(after.length, 1, '换汇记录必须随备份往返');
+    assert.strictEqual(after[0].fromCurrency, a.currency);
+    assert.strictEqual(after[0].toCurrency, b.currency);
+  } finally {
+    ctx.close();
+  }
 });

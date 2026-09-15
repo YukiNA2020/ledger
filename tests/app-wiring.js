@@ -345,7 +345,7 @@
 
     // S3.1 资产录入页布线：决策台入口 → 新增账户 → 登记余额 → 落库可直读，
     // 且全量写回（记账路径 writeState 先清后写）不会抹掉资源接口写入的数据。
-    await check('资产录入页可建账户并登记余额，且不被全量写回抹掉', async function () {
+    await check('资产录入页可维护双币种并记录不计收支的换汇，且不被全量写回抹掉', async function () {
       // C9 的恢复把资产清掉了：决策台应显示空状态与「录入资产」入口
       clickAction('[data-action="nav:home"]');
       await waitFor(function () { return document.querySelector('#view .dash-empty'); }, 8000, '决策台空状态');
@@ -356,22 +356,49 @@
       // 新增账户（安全储备池）
       clickAction('[data-action="asset:acc"]');
       await waitFor(function () { return document.querySelector('#aa-name'); }, 5000, '账户表单');
-      document.querySelector('#aa-name').value = '布线储蓄卡';
-      document.querySelector('#aa-inst').value = '布线银行';
+      document.querySelector('#aa-name').value = '布线汇丰多币种账户';
+      document.querySelector('#aa-inst').value = '香港汇丰';
       document.querySelector('#aa-pool').value = 'safety';
       clickAction('[data-action="asset:saveAcc"]');
       await waitFor(function () {
-        return document.querySelector('#view').textContent.indexOf('布线储蓄卡') >= 0;
+        return document.querySelector('#view').textContent.indexOf('布线汇丰多币种账户') >= 0;
       }, 5000, '账户出现在列表');
 
-      // 登记余额 3000 CNY，核对日为今天
+      // 同一个汇丰账户分别登记 HKD 与 USD 余额
       clickAction('[data-action="asset:unit"]');
       await waitFor(function () { return document.querySelector('#au-bal'); }, 5000, '余额表单');
+      document.querySelector('#au-cur').value = 'HKD';
       document.querySelector('#au-bal').value = '3000';
       clickAction('[data-action="asset:saveUnit"]');
       await waitFor(function () {
-        return document.querySelector('#view').textContent.indexOf('3,000.00') >= 0;
-      }, 5000, '余额出现在列表');
+        return document.querySelector('#view').textContent.indexOf('3,000.00 HKD') >= 0;
+      }, 5000, 'HKD 余额出现在列表');
+
+      clickAction('[data-action="asset:unit"]');
+      await waitFor(function () { return document.querySelector('#au-bal'); }, 5000, 'USD 余额表单');
+      document.querySelector('#au-cur').value = 'USD';
+      document.querySelector('#au-bal').value = '1000';
+      clickAction('[data-action="asset:saveUnit"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('1,000.00 USD') >= 0;
+      }, 5000, 'USD 余额出现在列表');
+
+      // 记录 HKD→USD 换汇：资产转移单独落库，不新增任何收入/支出流水
+      var beforeTransfer = await apiState();
+      clickAction('[data-action="asset:transfer"]');
+      await waitFor(function () { return document.querySelector('#at-from'); }, 5000, '换汇表单');
+      var findUnitOption = function (select, currency) {
+        return Array.prototype.slice.call(select.options).find(function (o) { return o.textContent.indexOf(currency) >= 0; });
+      };
+      document.querySelector('#at-from').value = findUnitOption(document.querySelector('#at-from'), 'HKD').value;
+      document.querySelector('#at-to').value = findUnitOption(document.querySelector('#at-to'), 'USD').value;
+      document.querySelector('#at-from-amount').value = '780';
+      document.querySelector('#at-to-amount').value = '100';
+      document.querySelector('#at-note').value = '虚构换汇';
+      clickAction('[data-action="asset:saveTransfer"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('HKD → USD') >= 0;
+      }, 5000, '换汇记录出现在列表');
 
       // 新增负债与保障权益
       clickAction('[data-action="asset:liab"]');
@@ -394,10 +421,15 @@
 
       // SQLite 直读：四类资源都已落库
       var st = await apiState();
-      assert((st.assets.assetAccounts || []).some(function (a) { return a.name === '布线储蓄卡' && a.pool === 'safety'; }),
+      assert((st.assets.assetAccounts || []).some(function (a) { return a.name === '布线汇丰多币种账户' && a.pool === 'safety'; }),
         '账户应落库');
-      var unit = (st.assets.assetUnits || []).filter(function (u) { return u.balanceMinor === 300000; });
-      assert(unit.length === 1 && unit[0].sourceType === 'manual', '余额应以最小货币单位落库');
+      var hkdUnit = (st.assets.assetUnits || []).filter(function (u) { return u.currency === 'HKD' && u.balanceMinor === 300000; });
+      var usdUnit = (st.assets.assetUnits || []).filter(function (u) { return u.currency === 'USD' && u.balanceMinor === 100000; });
+      assert(hkdUnit.length === 1 && usdUnit.length === 1, 'HKD 与 USD 余额应分别以最小货币单位落库');
+      var xfer = (st.assets.assetTransfers || [])[0];
+      assert(xfer && xfer.fromCurrency === 'HKD' && xfer.toCurrency === 'USD' &&
+        xfer.fromAmountMinor === 78000 && xfer.toAmountMinor === 10000, '换汇两端金额与币种应独立落库');
+      equal(st.txns.length, beforeTransfer.txns.length, '换汇不应新增现金流交易');
       assert((st.assets.liabilities || []).some(function (l) { return l.name === '布线信用卡' && l.balanceMinor === 50000; }),
         '负债应落库');
       assert((st.assets.entitlements || []).some(function (e) { return e.name === '布线医保' && e.balanceMinor === null; }),
@@ -410,10 +442,12 @@
         txns: raw.txns, settings: raw.settings, assets: raw.assets
       });
       var st2 = await apiState();
-      assert((st2.assets.assetAccounts || []).some(function (a) { return a.name === '布线储蓄卡'; }),
+      assert((st2.assets.assetAccounts || []).some(function (a) { return a.name === '布线汇丰多币种账户'; }),
         '全量写回后账户必须仍在（writeState 先清后写不可丢资源数据）');
       assert((st2.assets.assetUnits || []).some(function (u) { return u.balanceMinor === 300000; }),
         '全量写回后余额必须仍在');
+      assert((st2.assets.assetTransfers || []).some(function (t) { return t.id === xfer.id; }),
+        '全量写回后换汇记录必须仍在');
     });
 
     // S3.3 月度结账页布线：上月核对清单 → 余额未在上月核对 → 只能估算结账；
@@ -452,6 +486,174 @@
       equal(closes.items[0].status, 'estimate', '上月余额未核对时应为估算');
       assert(closes.items[0].snapshot && closes.items[0].snapshot.payloadHash, '应附快照哈希');
       assert((closes.items[0].blockers || []).length >= 1, '应记录阻塞码清单');
+    });
+
+    // S3.2 福利预设布线：四类分流都必须能从产品路径建出来（不靠备份 fixture）
+    await check('福利预设四类分流：明确余额计一次、无余额资格不计入、社保卡独立', async function () {
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:assets"]'); }, 5000, '决策台资产入口');
+      clickAction('[data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="asset:preset"][data-id="pf"]'); }, 5000, '福利预设入口');
+
+      // 1) 公积金明确余额 → 受限资产账户 + CNY 余额
+      clickAction('[data-action="asset:preset"][data-id="pf"]');
+      await waitFor(function () { return document.querySelector('#ap-bal'); }, 5000, '公积金预设表单');
+      document.querySelector('#ap-bal').value = '8000';
+      document.querySelector('#ap-src').value = '青岛公积金 App';
+      clickAction('[data-action="asset:savePreset"]');
+      await waitFor(function () { return document.querySelector('#view').textContent.indexOf('青岛住房公积金') >= 0; }, 6000, '公积金账户出现在列表');
+
+      // 2) 医保个人账户余额 → 受限资产
+      clickAction('[data-action="asset:preset"][data-id="mi"]');
+      await waitFor(function () { return document.querySelector('#ap-bal'); }, 5000, '医保预设表单');
+      document.querySelector('#ap-bal').value = '1200';
+      document.querySelector('#ap-src').value = '青岛医保 App';
+      clickAction('[data-action="asset:savePreset"]');
+      await waitFor(function () { return document.querySelector('#view').textContent.indexOf('医保个人账户') >= 0; }, 6000, '医保账户出现在列表');
+
+      // 3) 社保卡金融账户 → 普通储蓄卡，独立计入资产
+      clickAction('[data-action="asset:preset"][data-id="card"]');
+      await waitFor(function () { return document.querySelector('#ap-bal'); }, 5000, '社保卡预设表单');
+      document.querySelector('#ap-bal').value = '500';
+      clickAction('[data-action="asset:savePreset"]');
+      await waitFor(function () { return document.querySelector('#view').textContent.indexOf('社保卡金融账户') >= 0; }, 6000, '社保卡账户出现在列表');
+
+      // 4) 养老等无余额资格 → 权益，不写金额
+      clickAction('[data-action="asset:preset"][data-id="ent"]');
+      await waitFor(function () { return document.querySelector('#ap-status'); }, 5000, '参保状态表单');
+      document.querySelector('#ap-name').value = '职工基本养老保险';
+      document.querySelector('#ap-status').value = '在缴';
+      document.querySelector('#ap-src').value = '青岛人社 App';
+      clickAction('[data-action="asset:savePreset"]');
+      await waitFor(function () { return document.querySelector('#view').textContent.indexOf('职工基本养老保险') >= 0; }, 6000, '权益出现在列表');
+
+      // 落库校验：两个明确余额进入受限资产，社保卡独立，资格不计入
+      var st = await apiState();
+      var byName = {};
+      (st.assets.assetAccounts || []).forEach(function (a) { byName[a.name] = a; });
+      assert(byName['青岛住房公积金'] && byName['青岛住房公积金'].pool === 'restricted', '公积金应为受限资产账户');
+      assert(byName['医保个人账户'] && byName['医保个人账户'].pool === 'restricted', '医保应为受限资产账户');
+      assert(byName['社保卡金融账户'] && byName['社保卡金融账户'].pool === 'safety', '社保卡金融账户应独立为普通账户');
+
+      var unitOf = function (accountId, cur) {
+        return (st.assets.assetUnits || []).filter(function (u) {
+          return u.accountId === accountId && u.currency === (cur || 'CNY');
+        });
+      };
+      assert(unitOf(byName['青岛住房公积金'].id).length === 1, '公积金余额只计一次');
+      assert(unitOf(byName['医保个人账户'].id).length === 1, '医保余额只计一次');
+      var pension = (st.assets.entitlements || []).filter(function (e) { return e.name === '职工基本养老保险'; });
+      equal(pension.length, 1, '养老资格应作为权益落库');
+      equal(pension[0].balanceMinor, null, '无余额资格不得写成 0');
+      equal(pension[0].jurisdiction, '青岛', '权益地区应落库');
+      equal(pension[0].sourceRef, '青岛人社 App', '权益来源应落库');
+
+      // 权益不计入资产：总资产必须等于三个账户余额之和（此时美元/港币仍有汇率缺口，故只比 CNY 部分）
+      var ov = await fetch('/api/v1/overview').then(function (r) { return r.json(); });
+      assert(ov.pools.restrictedMinor >= 920000, '公积金 + 医保应进入受限资产池');
+    });
+
+    // P0-A + P1-B + P0-B：上月核对 → 手动汇率 → 正式结账 → 历史金额下钻
+    await check('上月核对日期 + 手动汇率可完成正式结账，历史金额可下钻到来源', async function () {
+      // 结账对象 = 上一个完整自然月；其最后一天是「已核对」的判定基准
+      var prevYmLastDay = (function () {
+        var d = new Date();
+        d.setDate(1);
+        d.setMonth(d.getMonth() - 1);
+        var y = d.getFullYear(), m = d.getMonth() + 1;
+        var last = new Date(y, m, 0).getDate();
+        return y + '-' + String(m).padStart(2, '0') + '-' + String(last).padStart(2, '0');
+      })();
+
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:assets"]'); }, 5000, '决策台资产入口');
+      clickAction('[data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="asset:fx"]'); }, 5000, '汇率入口');
+
+      // P1-B 手动汇率：HKD→CNY、USD→CNY，汇率日取结账月末（超 5 天会被判过期而阻塞正式结账）
+      var ratePairs = [['HKD', '0.9200'], ['USD', '7.2000']];
+      for (var i = 0; i < ratePairs.length; i++) {
+        clickAction('[data-action="asset:fx"]');
+        await waitFor(function () { return document.querySelector('#fx-rate'); }, 5000, '汇率表单');
+        document.querySelector('#fx-base').value = ratePairs[i][0];
+        document.querySelector('#fx-quote').value = 'CNY';
+        document.querySelector('#fx-rate').value = ratePairs[i][1];
+        document.querySelector('#fx-date').value = prevYmLastDay;
+        clickAction('[data-action="asset:saveFx"]');
+        await waitFor(function () {
+          return document.querySelector('#view').textContent.indexOf(ratePairs[i][0] + '→CNY') >= 0;
+        }, 6000, ratePairs[i][0] + ' 汇率出现在列表');
+      }
+
+      // 把两个外币余额的核对日期改到结账月份内（否则 balance_stale 会永久阻塞正式结账）
+      var st0 = await apiState();
+      var hkdUnit = (st0.assets.assetUnits || []).filter(function (u) { return u.balanceMinor === 300000; })[0];
+      var usdUnit = (st0.assets.assetUnits || []).filter(function (u) { return u.balanceMinor === 100000; })[0];
+      assert(hkdUnit && usdUnit, '前提：S3.1 建立的 HKD/USD 余额仍在');
+      var targets = [{ id: hkdUnit.accountId, cur: 'HKD', amount: '3000' }, { id: usdUnit.accountId, cur: 'USD', amount: '1000' }];
+      for (var j = 0; j < targets.length; j++) {
+        clickAction('[data-action="asset:unit"][data-id="' + targets[j].id + '"]');
+        await waitFor(function () { return document.querySelector('#au-bal'); }, 5000, targets[j].cur + ' 余额表单');
+        document.querySelector('#au-acc').value = targets[j].id;
+        document.querySelector('#au-cur').value = targets[j].cur;
+        document.querySelector('#au-bal').value = targets[j].amount;
+        document.querySelector('#au-date').value = prevYmLastDay;
+        clickAction('[data-action="asset:saveUnit"]');
+        await waitFor(function () {
+          return document.querySelector('#view').textContent.indexOf(prevYmLastDay) >= 0;
+        }, 6000, targets[j].cur + ' 核对日期已更新');
+      }
+
+      // 汇率与核对日期齐备后，正式结账按钮必须可用
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:close"]'); }, 6000, '决策台结账入口');
+      clickAction('[data-action="nav:close"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="close:save"]'); }, 6000, '结账页');
+      var formalBtn = document.querySelector('#view [data-action="close:save"][data-status="formal"]');
+      assert(formalBtn, '正式结账按钮应存在');
+      assert(!formalBtn.disabled, '余额与负债都在结账月内核对且汇率齐备时，正式结账必须可用 · 清单=' +
+        document.querySelector('#view').textContent.slice(0, 160));
+
+      clickAction('[data-action="close:save"][data-status="formal"]');
+      await waitFor(function () { return document.querySelector('#confirm-ok'); }, 5000, '正式结账确认弹层');
+      clickAction('#confirm-ok');
+      // 页面文案里始终有「保存为估算快照」按钮，不能用「估算」二字判断状态；
+      // 直接以事实源状态为准，等它变成 formal（谓词是异步的，waitFor 会 await）
+      await waitFor(async function () {
+        var c = await fetch('/api/v1/monthly-closes').then(function (r) { return r.json(); });
+        return (c.items || []).length === 1 && c.items[0].status === 'formal';
+      }, 10000, '结账状态变为正式');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('正式') >= 0;
+      }, 6000, '历史结账行显示正式');
+
+      // HTTP 直读：同月记录被更新为正式，且只有一个结账对象
+      var closes = await fetch('/api/v1/monthly-closes').then(function (r) { return r.json(); });
+      equal((closes.items || []).length, 1, '同月重复结账不应产生第二条记录');
+      equal(closes.items[0].status, 'formal', '记录状态应为正式');
+      equal(closes.items[0].month, prevYmLastDay.slice(0, 7), '结账月份应为上一个完整自然月');
+
+      // P1-B：总览不再有 fx_missing，外币按手动汇率折算成 CNY
+      var ov = await fetch('/api/v1/overview?asOf=' + prevYmLastDay).then(function (r) { return r.json(); });
+      assert(!(ov.blockers || []).some(function (b) { return b.code === 'fx_missing'; }), '登记汇率后不应再有 fx_missing');
+      // 3000 HKD × 0.92 = 2760 CNY；1000 USD × 7.2 = 7200 CNY
+      var units = (await apiState()).assets.assetUnits || [];
+      var allCny = units.every(function (u) { return u.currency !== 'HKD' || u.balanceMinor === 300000; });
+      assert(allCny, '外币余额不得被折算结果覆盖，原币金额必须保持独立');
+      // 分：3000 HKD × 0.92 = 276000；1000 USD × 7.2 = 720000
+      assert(ov.totalAssetsMinor >= 276000 + 720000, '总览应含外币折算金额（≥ 9960 元）· 实际 ' + ov.totalAssetsMinor);
+
+      // P0-B 金额下钻：历史结账的「查看明细」必须能看到单元级事实
+      clickAction('[data-action="close:detail"]');
+      await waitFor(function () { return document.querySelector('#sheet').textContent.indexOf('结账明细') >= 0; }, 8000, '结账明细弹层');
+      var sheetText = document.querySelector('#sheet').textContent;
+      assert(sheetText.indexOf('布线汇丰多币种账户') >= 0, '明细应列出账户余额来源 · ' + sheetText.slice(0, 200));
+      assert(sheetText.indexOf('布线信用卡') >= 0, '明细应列出负债来源');
+      assert(sheetText.indexOf(prevYmLastDay) >= 0, '明细应显示各项核对日');
+      assert(sheetText.indexOf('2,760.00') >= 0, 'HKD 余额应显示折算金额 2,760.00');
+      assert(sheetText.indexOf('7,200.00') >= 0, 'USD 余额应显示折算金额 7,200.00');
+      assert(sheetText.indexOf('应急覆盖') >= 0, '明细应说明应急覆盖的口径与依据');
+      clickAction('[data-action="sheet:close"]');
     });
 
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）

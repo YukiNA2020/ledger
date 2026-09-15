@@ -22,6 +22,7 @@ const backupLib = require('./backup');
 const keychain = require('./keychain');
 const migrations = require('./migrations');
 const Domain = require('../js/domain.js');
+const Core = require('../js/core.js');
 
 const API_PREFIX = '/api/v1';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
@@ -45,7 +46,7 @@ const MIME = {
 };
 
 // 后续阶段拥有的写接口：URL 资源边界保持稳定，但实现留给对应阶段。
-// Phase 3 已实现：institutions / accounts / account-units / liabilities / entitlements
+// Phase 3 已实现：institutions / accounts / account-units / asset-transfers / liabilities / entitlements
 // 与 monthly-closes（ROADMAP Phase 3 工作项 1–6）。
 const DEFERRED_WRITES = {
   'POST /api/v1/portfolio-openings': 'Phase 4',
@@ -79,6 +80,55 @@ function lastDayOfMonth(ym) {
   return localDateStr(new Date(y, m, 0));
 }
 
+// 应急金覆盖的交易依据（D-034）：结账月份及其前两个完整自然月的必要支出（分）。
+// 复用浏览器同一份 js/core.js（D-025）——服务端不另写一套聚合，否则覆盖月数会与
+// 决策台显示的口径分叉。交易为密文（应用锁）时 available=false，绝不虚构金额。
+function necessaryBasisFromState(state, month) {
+  const months = [];
+  const y = Number(month.slice(0, 4));
+  const m = Number(month.slice(5, 7));
+  for (let i = 2; i >= 0; i -= 1) {
+    const d = new Date(y, m - 1 - i, 1);
+    months.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+  }
+  const txns = Array.isArray(state.txns) ? state.txns : null;
+  if (!txns) {
+    return {
+      available: false,
+      reason: 'txns_encrypted',
+      months: months,
+      monthlyMinor: {},
+      counted: 0,
+      avgNecessaryMinor: null
+    };
+  }
+  const categories = Array.isArray(state.categories) ? state.categories : [];
+  const monthlyMinor = {};
+  let total = 0;
+  let counted = 0;
+  months.forEach((ym) => {
+    const agg = Core.aggregate(txns, {
+      year: Number(ym.slice(0, 4)),
+      month: Number(ym.slice(5, 7)),
+      categories: categories
+    });
+    const need = agg && Number.isFinite(agg.need) && agg.need > 0 ? agg.need : 0;
+    monthlyMinor[ym] = need;
+    if (need > 0) {
+      total += need;
+      counted += 1;
+    }
+  });
+  return {
+    available: true,
+    reason: counted ? null : 'no_necessary_expense',
+    months: months,
+    monthlyMinor: monthlyMinor,
+    counted: counted,
+    avgNecessaryMinor: counted ? Math.round(total / counted) : null
+  };
+}
+
 function validateResourcePayload(body, spec) {
   // spec: [{key, required, kind: 'name'|'currency'|'pool'|'minor'|'date'|'kind', code}]
   const out = {};
@@ -104,6 +154,13 @@ function validateResourcePayload(body, spec) {
     } else if (rule.kind === 'institutionKind') {
       if (raw != null && INSTITUTION_KINDS.indexOf(raw) === -1) return { error: rule.code || 'invalid_kind' };
       out[rule.key] = raw == null ? 'other' : raw;
+    } else if (rule.kind === 'decimal') {
+      // 定点十进制（如汇率）：必须是正数的十进制字符串，不接受浮点或科学计数法。
+      // 注意 Domain.parseDecimal 返回定点对象 {v, s}，判正要看 v。
+      const s = raw == null ? '' : String(raw).trim();
+      const v = Domain.parseDecimal(s);
+      if (!v || !(v.v > 0)) return { error: rule.code || 'invalid_decimal' };
+      out[rule.key] = s;
     } else if (rule.kind === 'text') {
       // 可选的有界文本：空串与缺省都归一为 null，超长直接拒绝
       const s = raw == null ? '' : String(raw).trim();
@@ -296,6 +353,9 @@ function createHandler(ctx) {
   api['GET /api/v1/account-units'] = (req, res) => {
     sendJson(res, 200, { items: R.readAssetUnits(ctx.db) });
   };
+  api['GET /api/v1/asset-transfers'] = (req, res) => {
+    sendJson(res, 200, { items: R.readAssetTransfers(ctx.db) });
+  };
   api['GET /api/v1/liabilities'] = (req, res) => {
     sendJson(res, 200, { items: R.readLiabilities(ctx.db) });
   };
@@ -309,7 +369,7 @@ function createHandler(ctx) {
 
   function upsertFail(res, err) {
     const code = (err && err.code) || 'internal_error';
-    const status = code === 'unknown_account' ? 422 : 400;
+    const status = code === 'unknown_account' || code === 'unknown_unit' ? 422 : 400;
     return fail(res, status, code, err && err.message ? err.message : '写入失败', false);
   }
 
@@ -393,6 +453,34 @@ function createHandler(ctx) {
     return sendJson(res, 201, { ok: true, item: item });
   };
 
+  api['POST /api/v1/asset-transfers'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = newResourcePayload(
+      body,
+      [
+        { key: 'fromUnitId', kind: 'name', code: 'invalid_from_unit' },
+        { key: 'toUnitId', kind: 'name', code: 'invalid_to_unit' },
+        { key: 'fromAmountMinor', kind: 'minor' },
+        { key: 'toAmountMinor', kind: 'minor' },
+        { key: 'occurredOn', kind: 'date' },
+        { key: 'sourceType', kind: 'text' },
+        { key: 'note', kind: 'text' }
+      ],
+      'xfer'
+    );
+    if (checked.error || !checked.value.occurredOn || checked.value.fromAmountMinor <= 0 || checked.value.toAmountMinor <= 0) {
+      return fail(res, 400, checked.error || 'invalid_transfer', '换汇字段不合法：' + (checked.error || '金额和日期必填'), false);
+    }
+    try {
+      const item = dbm.transaction(ctx.db, () =>
+        R.upsertAssetTransfer(ctx.db, checked.value, { now: new Date().toISOString() })
+      );
+      return sendJson(res, 201, { ok: true, item: item });
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
   api['POST /api/v1/liabilities'] = async (req, res) => {
     const body = await readBody(req);
     const checked = newResourcePayload(
@@ -474,18 +562,26 @@ function createHandler(ctx) {
     const status = body && body.status === 'formal' ? 'formal' : checklist.canComplete ? 'formal' : 'estimate';
 
     const overview = Domain.computeOverview(state.assets, { now: asOf, settings: settings });
-    // 月均必要支出：优先取前端按现金流算出的值（最近 3 个完整月），回落到 settings；
-    // 覆盖月数由服务端用该值重算，不直接采信任何覆盖率结果（§5.6 服务端是唯一写入者）
+    // 月均必要支出由服务端从现金流事实重算（D-034）；前端传值与 settings 只作为
+    // 交易为密文等无法重算时的回落，且回落来源会记进快照，便于追溯口径。
+    const basis = necessaryBasisFromState(state, month);
     const clientAvg = body && Number.isSafeInteger(body.avgNecessaryMinor) && body.avgNecessaryMinor > 0
       ? body.avgNecessaryMinor
       : null;
     const settingsAvg = typeof settings.avgNecessaryMinor === 'number' && settings.avgNecessaryMinor > 0
       ? settings.avgNecessaryMinor
       : null;
-    const avgNecessary = clientAvg || settingsAvg;
+    const avgNecessary = basis.avgNecessaryMinor != null ? basis.avgNecessaryMinor : clientAvg || settingsAvg;
+    const emergencySource = basis.avgNecessaryMinor != null ? 'txns' : clientAvg ? 'client' : settingsAvg ? 'settings' : null;
     const emergencyMonths = avgNecessary
       ? Domain.emergencyCoverageMonths(overview.pools.safetyMinor, avgNecessary)
       : null;
+    const emergency = {
+      avgNecessaryMinor: avgNecessary,
+      coverageMonths: emergencyMonths,
+      source: emergencySource,
+      basis: basis
+    };
 
     const nowIso = new Date().toISOString();
     const closeId = R.getMonthlyCloseByMonth(ctx.db, month) || newResourceId('close');
@@ -496,7 +592,8 @@ function createHandler(ctx) {
       status: status,
       overview: overview,
       checklist: checklist,
-      emergencyCoverageMonths: emergencyMonths
+      emergencyCoverageMonths: emergencyMonths,
+      emergency: emergency
     });
     const payloadHash = crypto.createHash('sha256').update(payloadJson).digest('hex');
 
@@ -512,7 +609,8 @@ function createHandler(ctx) {
             totalLiabilitiesMinor: overview.totalLiabilitiesMinor,
             netWorthMinor: overview.netWorthMinor,
             valuationStatus: checklist.valuationStatus,
-            emergencyCoverageMonths: emergencyMonths
+            emergencyCoverageMonths: emergencyMonths,
+            avgNecessaryMinor: avgNecessary
           },
           completedAt: nowIso,
           dataCutoff: asOf
@@ -557,6 +655,28 @@ function createHandler(ctx) {
   };
   api['GET /api/v1/fx-rates'] = (req, res) => {
     sendJson(res, 200, { items: R.readFxRates(ctx.db) });
+  };
+
+  // 手动汇率录入（Phase 3 补充，D-034）：Phase 3 的页面必须能独立把外币余额折算成 CNY，
+  // 自动行情 provider 属于 Phase 4；这里只维护「币对 + 汇率 + 汇率日」这一条事实。
+  api['POST /api/v1/fx-rates'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = validateResourcePayload(body, [
+      { key: 'base', kind: 'currency', code: 'invalid_base' },
+      { key: 'quote', kind: 'currency', code: 'invalid_quote' },
+      { key: 'rateDecimal', kind: 'decimal', code: 'invalid_rate' },
+      { key: 'rateDate', kind: 'date', code: 'invalid_rate_date' },
+      { key: 'provider', kind: 'text' },
+      { key: 'status', kind: 'text' }
+    ]);
+    if (checked.error) return fail(res, 400, checked.error, '汇率字段不合法：' + checked.error, false);
+    if (!checked.value.rateDate) return fail(res, 400, 'invalid_rate_date', '汇率日期不能为空', false);
+    try {
+      const item = dbm.transaction(ctx.db, () => R.upsertFxRate(ctx.db, checked.value, { now: new Date().toISOString() }));
+      return sendJson(res, 201, { ok: true, item: item });
+    } catch (err) {
+      return upsertFail(res, err);
+    }
   };
 
   api['GET /api/v1/backups'] = (req, res) => {
@@ -675,6 +795,40 @@ function serveStatic(req, res, ctx) {
 
 /* ------------------------------ 请求入口 ------------------------------ */
 
+// 结账快照明细（Phase 3 补充，D-034）：ACCEPTANCE 要求「每个金额都能下钻到余额、估值或交易来源」，
+// 因此历史结账必须能取回封存时的单元级事实，而不是只给一个哈希。
+// 只读接口：路径含参数，走下面的正则路由，不进入精确匹配表。
+function readCloseSnapshotHandler(ctx, rawId, res) {
+  let id = '';
+  try {
+    id = decodeURIComponent(String(rawId));
+  } catch (_) {
+    return fail(res, 400, 'invalid_id', '快照 id 不合法', false);
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return fail(res, 400, 'invalid_id', '快照 id 不合法', false);
+  const row = R.getCloseSnapshot(ctx.db, id);
+  if (!row) return fail(res, 404, 'snapshot_not_found', '快照不存在：' + id, false);
+  let payload = null;
+  try {
+    payload = JSON.parse(row.payloadJson);
+  } catch (_) {
+    payload = null;
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    snapshot: {
+      id: row.id,
+      closeId: row.closeId,
+      month: row.month,
+      capturedAt: row.capturedAt,
+      snapshotType: row.snapshotType,
+      payloadHash: row.payloadHash,
+      payloadJson: row.payloadJson,
+      payload: payload
+    }
+  });
+}
+
 function isAllowedOrigin(origin, port) {
   if (!origin) return true; // 非浏览器客户端（如 curl）不带 Origin，由 token 把关
   const allowed = ['http://127.0.0.1:' + port, 'http://localhost:' + port, 'http://[::1]:' + port];
@@ -755,6 +909,12 @@ function createHandlerEntry(ctx) {
         });
       }
       return undefined;
+    }
+
+    // 带路径参数的只读接口：结账快照明细（金额下钻）
+    const snapshotMatch = /^GET \/api\/v1\/close-snapshots\/([^/]+)$/.exec(key);
+    if (snapshotMatch) {
+      return readCloseSnapshotHandler(ctx, snapshotMatch[1], res);
     }
 
     // 后端冻结但尚未实现的写接口：保持资源边界可见，明确告知所属阶段

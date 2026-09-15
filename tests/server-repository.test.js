@@ -280,6 +280,7 @@ test('资产集合键名与领域模型保持一致（holdings ↔ portfolio_ope
     assert.deepStrictEqual(R.ASSET_KEYS, [
       'assetAccounts',
       'assetUnits',
+      'assetTransfers',
       'liabilities',
       'entitlements',
       'instruments',
@@ -303,6 +304,76 @@ test('资产集合键名与领域模型保持一致（holdings ↔ portfolio_ope
     );
     assert.strictEqual(out.assets.schemaVersion, empty.schemaVersion, '必须带上 schemaVersion');
     assert.deepStrictEqual(Domain.normalizeAssets(out.assets), out.assets, '读回结果应已是规范化形状');
+  } finally {
+    ctx.close();
+  }
+});
+
+/* ---------------- Phase 3 补口（P1-C）：全量写入不信任载荷中的重复币种字段 ---------------- */
+
+test('P1-C writeState 拒绝换汇两端币种与关联余额单元不一致的数据', () => {
+  const ctx = setup('ledger-repo-');
+  try {
+    const state = loadFixtureState();
+    R.writeState(ctx.db, state);
+
+    const units = R.readAssetUnits(ctx.db);
+    const from = units[0];
+    const to = units.find((u) => u.currency !== from.currency);
+    assert.ok(from && to, '前提：标准虚构数据含两个不同币种子账户');
+
+    // 载荷把历史币种写反（转出单元实际是 from.currency，却声称 USD→HKD 之类）
+    const tampered = loadFixtureState();
+    tampered.assets.assetTransfers = [{
+      id: 'xfer-tampered',
+      fromUnitId: from.id,
+      toUnitId: to.id,
+      fromCurrency: to.currency,
+      toCurrency: from.currency,
+      fromAmountMinor: 10000,
+      toAmountMinor: 9000,
+      occurredOn: '2026-08-20',
+      sourceType: 'manual'
+    }];
+
+    R.writeState(ctx.db, tampered);
+    const stored = R.readAssetTransfers(ctx.db);
+    assert.strictEqual(stored.length, 1);
+    assert.strictEqual(stored[0].fromCurrency, from.currency, '币种必须由关联单元推导，而不是采信载荷');
+    assert.strictEqual(stored[0].toCurrency, to.currency);
+
+    // 关联到不存在的单元 → 整次写入必须失败，不能落一条矛盾的历史
+    const orphan = loadFixtureState();
+    orphan.assets.assetTransfers = [{
+      id: 'xfer-orphan',
+      fromUnitId: 'unit-not-exist',
+      toUnitId: to.id,
+      fromCurrency: 'USD',
+      toCurrency: to.currency,
+      fromAmountMinor: 100,
+      toAmountMinor: 100,
+      occurredOn: '2026-08-20'
+    }];
+    assert.throws(() => R.writeState(ctx.db, orphan), /不存在|unknown_unit/);
+
+    // 失败不得留下半条数据
+    const after = R.readAssetTransfers(ctx.db);
+    assert.strictEqual(after.length, 1, '失败的整库写入必须整体回滚');
+    assert.strictEqual(after[0].id, 'xfer-tampered');
+
+    // 同币种两端 → 拒绝
+    const same = loadFixtureState();
+    same.assets.assetTransfers = [{
+      id: 'xfer-same',
+      fromUnitId: from.id,
+      toUnitId: from.id,
+      fromCurrency: from.currency,
+      toCurrency: from.currency,
+      fromAmountMinor: 100,
+      toAmountMinor: 100,
+      occurredOn: '2026-08-20'
+    }];
+    assert.throws(() => R.writeState(ctx.db, same), /相同/);
   } finally {
     ctx.close();
   }
