@@ -86,27 +86,31 @@
 
 ## Phase 3｜账户、负债与月度结账
 
-状态：已完成（2026-09-15）；依赖 Phase 2 退出条件全部通过。
+状态：已完成（2026-09-15，含验收补口 v2.3.2）；依赖 Phase 2 退出条件全部通过。
 
 目标：形成可信个人资产负债表。
 
 工作项：
 
-1. 机构—账户—币种子账户管理。✅ 资产录入页（机构→账户→子账户逐层维护）+ `POST /api/v1/institutions|accounts|account-units` 单条 upsert（机构按名称归一合并，其余按 id 幂等更新，D-031）
-2. 安全储备、可投资、受限资产和保障权益分类。✅ 账户 `pool` 字段（safety/investable/restricted/entitlement）+ 决策台资金池卡片复用 `Domain.computeOverview`
-3. 青岛公积金、医保、养老及社保卡预设与来源说明。✅ 保障权益表单（kind/jurisdiction/status/sourceRef）+ 无余额权益 `balanceMinor=null` 不冒充 0
-4. 负债、近期应付款和净资产计算。✅ `POST /api/v1/liabilities` + 净资产扣减负债（`computeOverview` 既有口径）
-5. 月度核对清单、结账状态和历史快照。✅ `Domain.computeCloseChecklist` + `GET/POST /api/v1/monthly-closes`（formal/estimate、sha256 快照、同月重复结账更新记录并追加快照）+ 月结页与历史列表
-6. 根据必要支出估算应急金覆盖月数。✅ 决策台应急金覆盖卡片 + 服务端按最近 3 个完整月必要支出重算，不采信前端覆盖率
+1. 机构—账户—币种子账户管理。✅ 资产录入页（机构→账户→子账户逐层维护）+ `POST /api/v1/institutions|accounts|account-units` 单条 upsert（机构按名称归一合并，其余按 id 幂等更新，D-031）；`GET/POST /api/v1/asset-transfers` 记录换汇两端事实，独立于现金流收支（D-033）
+2. 安全储备、可投资、受限资产和保障权益分类。✅ 账户 `pool` 字段（safety/investable/restricted）+ 决策台资金池卡片复用 `Domain.computeOverview`；权益只展示状态与来源，不进入任何金额合计（D-011）
+3. 青岛公积金、医保、养老及社保卡预设与来源说明。✅ 资产页四个预设入口按「有无明确余额」分流（D-034）：公积金余额 / 医保个人账户余额 → 受限资产账户 + CNY 余额（计入资产且只计一次）；养老等无余额资格 → `entitlement(balanceMinor=null)`；社保卡金融账户 → 普通储蓄卡独立管理。权益表单与列表支持地区、来源说明、核对日期
+4. 负债、近期应付款和净资产计算。✅ `POST /api/v1/liabilities`（含核对日期 `asOf`）+ 净资产扣减负债（`computeOverview` 既有口径）
+5. 月度核对清单、结账状态和历史快照。✅ `Domain.computeCloseChecklist` + `GET/POST /api/v1/monthly-closes`（formal/estimate、sha256 快照、同月重复结账更新记录并追加快照）+ 月结页与历史列表；历史结账可经 `GET /api/v1/close-snapshots/:id` 下钻到封存时的余额/负债/持仓单元级事实（D-034）
+6. 根据必要支出估算应急金覆盖月数。✅ 决策台应急金卡片 + 服务端按最近 3 个完整月必要支出重算（`necessaryBasisFromState`），口径来源与检索月份一并写入快照，不采信前端覆盖率
+7. 外币余额在 Phase 3 内可折算。✅ 资产页手动汇率维护 + `GET/POST /api/v1/fx-rates`（币对 + 汇率 + 汇率日）；自动行情 provider 仍属 Phase 4（D-034）
 
 退出条件：一个完整月结账可在 15 分钟内完成；所有金额可追溯到余额、估值或交易。
 
 退出证据（2026-09-15）：
 
-- `node --test` **220/220 通过**（202 基线零回归 + 新增 18 项：`tests/domain-close.test.js` 7 项月结清单/应急金、`tests/server-phase3.test.js` 9 项资源写入与月结 API、迁移 v2 相关 2 项更新）；
-- 浏览器 wiring 验收 **13/13 通过**（新增 S3.1 资产录入不被全量写回抹掉、S3.3 月结门槛与估算快照，连续两轮全绿）；
-- 迁移 v2 `phase3-close-schema`（`monthly_closes` + `close_snapshots`）只加表不改旧表，v1 库前向迁移与备份恢复测试通过；
-- 正式结账门槛由服务端强制：存在阻塞项时 `POST status=formal` 返回 409 `close_blocked`，只能保存估算（S3.3）。
+- `node --test` **230/230 通过**（202 基线零回归；含 2 项 macOS Keychain 写读）；`tests/domain-close.test.js` 7 项、`tests/server-phase3.test.js` 14 项、迁移 v2/v3 14 项、备份与 repository 的 Phase 3 补口全绿；
+- 浏览器 wiring 验收 **15/15 通过**（连续两轮全绿），含 S3.1 资产录入不被全量写回抹掉、S3.3 月结门槛与估算快照、S3.2 福利预设四类分流、P0-A 正式结账闭环、P1-B 手动汇率、P0-B 历史金额下钻；
+- 迁移 v2 `phase3-close-schema`（`monthly_closes` + `close_snapshots`）与 v3 `phase3-asset-transfers` 只加表不改旧表，v1/v2 库前向迁移与备份恢复测试通过；备份结构校验按候选库 schema 版本条件化（D-035）；
+- 正式结账门槛由服务端强制：存在阻塞项时 `POST status=formal` 返回 409 `close_blocked`，只能保存估算（S3.3）；负债核对日落在结账月份内时正式结账可完成（P0-A）；
+- 金额下钻：`GET /api/v1/close-snapshots/:id` 返回封存时的 `checklist.facts`（账户、原币金额、折 CNY、核对日、来源类型），payloadJson 重算 sha256 与列表哈希一致（P0-B）；
+- S3.1 补充验收：香港汇丰同一账户的 HKD/USD 余额分别落库；HKD→USD 换汇写入 `asset_transfers`，`txns` 条数保持不变；全量写回后换汇记录仍保留，且币种由关联余额单元推导而非采信载荷（D-033/D-034）。
+- 保留项：「15 分钟完成一次月结」的真实耗时按计划留待 Phase 7 用两个月真实使用验证。
 
 ## Phase 4｜持仓与日终行情
 
