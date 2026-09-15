@@ -316,6 +316,15 @@ function createHandler(ctx) {
   function newResourcePayload(body, spec, idPrefix) {
     const checked = validateResourcePayload(body, spec);
     if (checked.error) return checked;
+    // 客户端可携带 id 做「编辑已有资源」；格式受限（资源 id 全部由前缀+hex 构成），
+    // 缺省或未提供时由服务端生成 —— 同 id 重复提交即幂等更新（§5.6 upsert 语义）
+    const clientId = body && typeof body.id === 'string' ? body.id.trim() : '';
+    if (clientId) {
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId)) {
+        return { error: 'invalid_id' };
+      }
+      checked.value.id = clientId;
+    }
     if (!checked.value.id) checked.value.id = newResourceId(idPrefix);
     return checked;
   }
@@ -465,9 +474,15 @@ function createHandler(ctx) {
     const status = body && body.status === 'formal' ? 'formal' : checklist.canComplete ? 'formal' : 'estimate';
 
     const overview = Domain.computeOverview(state.assets, { now: asOf, settings: settings });
-    const avgNecessary = typeof settings.avgNecessaryMinor === 'number' && settings.avgNecessaryMinor > 0
+    // 月均必要支出：优先取前端按现金流算出的值（最近 3 个完整月），回落到 settings；
+    // 覆盖月数由服务端用该值重算，不直接采信任何覆盖率结果（§5.6 服务端是唯一写入者）
+    const clientAvg = body && Number.isSafeInteger(body.avgNecessaryMinor) && body.avgNecessaryMinor > 0
+      ? body.avgNecessaryMinor
+      : null;
+    const settingsAvg = typeof settings.avgNecessaryMinor === 'number' && settings.avgNecessaryMinor > 0
       ? settings.avgNecessaryMinor
       : null;
+    const avgNecessary = clientAvg || settingsAvg;
     const emergencyMonths = avgNecessary
       ? Domain.emergencyCoverageMonths(overview.pools.safetyMinor, avgNecessary)
       : null;
