@@ -8,6 +8,7 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 - **v3 Phase 1「资产领域基础」已完成并验收（2026-09-14，`v2.1.0-phase1`）**：资产领域模型与 CNY/HKD/USD 折算聚合（`js/domain.js`）、首页资产决策台（空状态/估算口径/正式口径）、原首页下沉为现金流页、备份 Schema v2（旧 v1 备份仍可恢复）。
 - **v3 Phase 2「本地服务与 SQLite」已完成并验收（2026-09-14，`v2.2.1-phase2`）**：只监听 `127.0.0.1` 的本地服务与 `/api/v1`、SQLite 事实源（迁移器 + repository）、本地版本备份与恢复（每日 ≥1 份、保留 30 份、覆盖前强制备份）、macOS 登录启动脚本、Keychain 适配器、前端存储门面 `js/store.js`。补充验收发现的三个阻塞缺陷（SW 旧令牌、保存失败误报成功、恢复前无备份）已修复。
 - **v3 Phase 3「账户、负债与月度结账」已完成并验收（2026-09-15，`v2.3.2-phase3`）**：机构—账户—币种子账户、换汇资产转移、负债与保障权益、青岛福利预设、手动汇率、月结快照与历史金额下钻、应急金覆盖均已落地。测试基线 `node --test` 230/230、浏览器 wiring 15/15。
+- **v3 Phase 4A「数据源决策与适配器契约」已完成并验收（2026-09-15，`v2.3.4-phase4a`）**：provider adapter 契约（请求白名单 + 严格结果校验 + 五类错误与可重试映射）、固定时钟、离线 fixture adapter、数据源证据档 `server/providers/SOURCES.md` 均已落地；汇率源冻结为 Frankfurter 的 ECB provider 端点，行情源改为「启用门禁」（`DECISIONS.md` D-036/D-037/D-038）。测试基线 `node --test` 272/272、浏览器 wiring 15/15。
 - SQLite 已是唯一事实源；IndexedDB 不再承担 v3 事实源，服务不可达时前端进入只读降级，不做双写。
 - 本轮不从零重写：复用 `js/core.js` 中已经验证的解析、统计和账务口径。
 - 本仓库中的 v3 文档是交给后续执行 Agent 的唯一实施依据；下一阶段入口见 [NEXT_AGENT.md](./NEXT_AGENT.md)。
@@ -30,7 +31,7 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 
 - 永久单用户、Mac 单机使用，不做注册、多用户或手机同步。
 - 私人财务数据只存本机；只联网获取公开行情、汇率和官方制度信息。
-- 第一版使用日终行情和免费数据源，缺失价格允许手动覆盖并明确标记。
+- 第一版使用日终行情：汇率用免费无 key 的 Frankfurter（固定 ECB provider 端点）；行情源必须先用证据通过 `DECISIONS.md` D-038 的启用门禁（官方条款/限额/自动化授权/市场覆盖/失败语义）。门禁通过前自动抓取默认关闭，价格以手动补价为准并明确标记。
 - 不做个股推荐、行情预测、自动下单或持仓自动抓取。
 - 决策由确定性规则产生；本地知识卡负责解释，不把财务数据交给云端 AI。
 - 保留原始记账能力，但现金流成为资产决策的数据底座，不再是首页唯一中心。
@@ -80,7 +81,7 @@ node server/main.js --no-open           # 不自动打开浏览器
 
 ```bash
 cd ledger
-node --test          # 245 项（2026-09-15 基线）
+node --test          # 272 项（2026-09-15 基线）
 
 # 浏览器接线验收必须先由本地服务托管，并使用临时数据目录：
 node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
@@ -91,4 +92,4 @@ node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
 
 ## 下一步
 
-Phase 4A 已完成。Phase 4 已拆成 4A–4E；下一位执行 Agent 只实施 Phase 4B「标的目录与分类确认」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)，完整顺序见 [ROADMAP.md](./ROADMAP.md)。开始前必须阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)；每次只领取一个子阶段，不得把 4B–4E 合并成一次重写。
+Phase 4A 已完成（含独立复核补口，P0/P1 全部闭合；原始结论与修复状态见 [PHASE4A_ACCEPTANCE_GAPS.md](./PHASE4A_ACCEPTANCE_GAPS.md)）。Phase 4 已拆成 4A–4E；下一位执行 Agent 只实施 Phase 4B「标的目录与分类确认」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)，完整顺序见 [ROADMAP.md](./ROADMAP.md)。开始前必须阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)；每次只领取一个子阶段，不得把 4B–4E 合并成一次重写。

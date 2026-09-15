@@ -8,6 +8,27 @@
 
 - Phase 4B「标的目录与分类确认」：标的检索、候选与元数据缓存、资产类别/市场/币种预分类、用户确认与本地锁定、稳定标的 id（供多证券账户共同引用）。
 
+## [2.3.4-phase4a] - 2026-09-15
+
+闭合 Phase 4A 独立复核发现的 P0/P1 缺口。原始结论清单与逐条修复状态见 `PHASE4A_ACCEPTANCE_GAPS.md`（保留原始记录作证据）。
+
+### 修复
+
+- **请求边界不再放行非法输入**（P0）：`serializeQuotesRequest` / `serializeFxRequest` 在序列化**之前**校验数组、symbol、pair，非法输入整体返回稳定的 `invalid_payload`（不再流进 adapter 被当成 `not_found`）；拒绝原因只含"第 N 项 + 形状说明"，**不回显输入原文**（输入可能是误传的账户名等私有文本）。
+- **结果校验不再放过不可入账数据**（P0）：`quoteResult` / `fxResult` / `errorResult` 改为严格构造，不合格即抛 `ContractError`；`priceMinor` 必须为正的安全整数、`rateDecimal` 必须大于零、`priceDate`/`rateDate` 必须是**真实存在**的 `YYYY-MM-DD`（拒绝 `2026-02-30`）、`fetchedAt` 必须是**带时区**的 ISO 时间戳；`retryable` 改由错误码推导，调用方无法伪造不一致值；`errorResult.subject` 只允许公开代码/币对形状，其他字符串一律置空。新增 `assertValidResult` 供 4D 落库前调用。
+- **节假日 fixture 不再是静态假通过**（P1）：行情与汇率 fixture 改为按日期升序的时间序列，adapter 只取 `date <= asOf` 的最近一条；`asOf` 早于数据起始日返回 `not_found`，**绝不返回未来数据**；`asOf` 非法时整体返回 `invalid_payload`，不用"今天"兜底。
+- **数据源决策重做**（P0/P1）：D-036 改为「汇率 = Frankfurter 且固定 `/v2/providers/ecb/…`」（实测同日默认端点 USD/CNY 6.708 vs ECB 6.7115，默认端点是多源混合值），并删除不可复核的固定货币数量；新增 **D-038**「行情源不冻结端点，冻结启用门禁」—— Stooq（`/q/l/` 404、`/q/d/l/` JS 验证挑战）与 Yahoo chart（403）实测失效，不存在同时满足「免费 + 无 key + 官方条款/限额/授权 + 覆盖 A/H/US ETF 日终」的行情源，门禁未通过前自动抓取默认关闭、行情以手动补价为准；D-037 补全为明确 provider（Twelve Data 参考数据 `/symbol_search`）、字段映射与 provenance 记录。
+
+### 新增
+
+- **数据源证据档**（`server/providers/SOURCES.md`）：六个候选源的**可复现探测命令与原始结果**、官方条款与限额链接、认证方式、市场覆盖与失败语义。
+- **契约测试扩到 42 项**（`tests/providers-contract.test.js`）：新增形状边界（假日期、无时区时间戳、小写币种）、请求校验反例（非数组/空数组/超限/非法项）、私有文本不回显、结果构造与校验反例（负价/小数价/零汇率/坏日期/坏时间/`retryable` 不一致）、`asOf` 取数反例与不变量、不可入账数据端到端拦截。
+
+### 备注
+
+- fixture 的 `provider` 标识不再冒充真实数据源（原为 `stooq`），统一为 `fixture`。
+- 零数据库迁移、零 API 改动、零 UI 改动、零真实网络请求；测试基线 `node --test` 245 → **272**，浏览器 wiring 15/15。
+
 ## [2.3.3-phase4a] - 2026-09-15
 
 Phase 4A 数据源决策与适配器契约（`ACCEPTANCE.md` S4A.1）。
@@ -17,7 +38,7 @@ Phase 4A 数据源决策与适配器契约（`ACCEPTANCE.md` S4A.1）。
 - **provider adapter 契约**（`server/providers/contract.js`）：统一结果形状（原始代码 / 价格 / 汇率 / 数据日 / 抓取时间 / provider）+ 五类错误 `timeout/rate_limit/not_found/invalid_payload/auth` + 可重试映射 + 白名单请求序列化（结构上只接受公开代码/币对）。
 - **固定时钟**（`server/providers/clock.js`）：时间经 `ctx.now` 注入，adapter 零时钟副作用、可复现。
 - **fixture adapter**（`server/providers/fixture.js`）：离线假 provider，覆盖成功 / 超时 / 限额 / 缺标的 / 无效载荷 / 鉴权 / 节假日回退。
-- **数据源决策冻结**：D-036（汇率 Frankfurter + 行情 Stooq，含覆盖/限额/授权/条款/失败语义与付费评估门槛）、D-037（provider 候选 + 用户确认锁定），见 `DECISIONS.md`。
+- **数据源决策冻结**：D-036（汇率 Frankfurter + 行情 Stooq，含覆盖/限额/授权/条款/失败语义与付费评估门槛）、D-037（provider 候选 + 用户确认锁定），见 `DECISIONS.md`。**（注意：本版本对行情源 Stooq 的冻结已被上方的 `2.3.4-phase4a` 复核补口取代 —— Stooq 接口实测失效，D-036 重做并新增 D-038 行情启用门禁。）**
 - **隐私边界测试**（`tests/providers-contract.test.js`，15 项）：证明请求与结果只含公开证券代码 / 币对，不含账户名、数量、成本、余额或完整持仓；全部离线运行。
 
 ### 修复

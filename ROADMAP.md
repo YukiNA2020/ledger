@@ -120,7 +120,7 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4A｜数据源决策与适配器契约
 
-状态：已完成（2026-09-15）。
+状态：已完成（2026-09-15，含独立复核补口）。
 
 范围：
 
@@ -129,15 +129,17 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 3. 建立固定时钟和本地 fixtures；请求构造测试必须证明只发送公开证券代码/币对，不发送账户名、数量、成本或余额。
 4. 只完成适配器契约与测试骨架，不接 API、不迁移数据库、不做 UI。
 
-退出条件：T-002/T-003 已决定；fixture adapter 能覆盖成功、超时、限额、缺标的、节假日；全部测试离线运行。
+退出条件：T-002/T-003 已决定；fixture adapter 能覆盖成功、超时、限额、缺标的、节假日；**非法输入与不可入账数据均被契约拒绝（不是"看起来对就放行"）**；全部测试离线运行。
 
 退出证据（2026-09-15）：
 
-- `DECISIONS.md` 新增 **D-036**（汇率 Frankfurter + 行情 Stooq，覆盖/限额/授权/条款/失败语义与付费评估门槛）与 **D-037**（provider 候选 + 用户确认锁定），T-002/T-003 从「待定」转为「已定」；
-- 新增 `server/providers/contract.js`（统一结果形状 + 五类错误 `timeout/rate_limit/not_found/invalid_payload/auth` + 可重试映射 + 白名单请求序列化）、`server/providers/clock.js`（固定时钟，`ctx.now` 注入）、`server/providers/fixture.js`（离线 fixture adapter）；
-- 新增 `tests/providers-contract.test.js` **15/15**：成功、超时、限额、缺标的、无效载荷、鉴权、节假日回退、固定时钟确定性，以及隐私边界证明（夹带账户名/数量/成本/余额的输入，断言请求与结果只含公开代码/币对）；
-- 全量 `node --test` **245/245**（230 旧零回归 + 15 新）；浏览器 wiring **15/15**（连续两轮全绿）；
-- 零数据库迁移、零 API 改动、零 UI 改动、零真实网络请求。
+- `DECISIONS.md` **D-036**（汇率 = Frankfurter 且固定 `/v2/providers/ecb/…`，实测默认端点与 ECB 端点值不同）、**D-037**（元数据候选来源 = Twelve Data 参考数据 `/symbol_search` + 字段映射 + provenance + 用户确认锁定）、**D-038**（行情源不冻结端点，冻结启用门禁）三条件齐备；T-002/T-003 保持「已定」；
+- 新增 `server/providers/contract.js`（严格契约：请求序列化**前**校验数组/symbol/pair，非法输入整体返回稳定 `invalid_payload` 且不回显输入原文；结果构造严格 —— `priceMinor` 正安全整数、`rateDecimal > 0`、真实 `YYYY-MM-DD`、带时区 ISO 时间戳、`retryable` 由错误码推导不可伪造；错误 `subject` 只允许公开代码/币对形状）、`server/providers/clock.js`（固定时钟 `ctx.now`，非法时间戳直接抛错）、`server/providers/fixture.js`（离线 fixture adapter，按 `asOf` 从时间序列取 `date <= asOf` 的最近有效日）；
+- 新增 `server/providers/SOURCES.md` 数据源证据档：Stooq（`/q/l/` 404、`/q/d/l/` JS 验证挑战）、Yahoo chart（403）、Twelve Data（覆盖/限额/条款/认证/失败语义）、Alpha Vantage、腾讯/东方财富端点的**可复现探测命令与原始结果**，以及官方条款与限额链接；
+- 新增 `tests/providers-contract.test.js` **42/42**：错误分类与可重试映射、形状边界（含 `2026-02-30` 等假日期、无时区时间戳、小写币种）、请求校验反例（非数组/空数组/超限/非法项）、私有文本不回显、结果构造与校验反例（负价/小数价/零汇率/坏日期/坏时间/`retryable` 不一致）、`asOf` 取数与"请求日早于数据日不得返回未来行情"反例、不可入账数据被拦成 `invalid_payload`、隐私边界、固定时钟确定性，以及跨全部 fixture 的不变量（任一 `asOf` 下每个结果都通过契约校验）；
+- 全量 `node --test` **272/272**（230 旧零回归 + 42 新）；浏览器 wiring **15/15**（连续两轮全绿）；
+- 零数据库迁移、零 API 改动、零 UI 改动、零真实网络请求；
+- 独立复核缺口记录与逐条修复状态见 `PHASE4A_ACCEPTANCE_GAPS.md`（保留原始结论作证据）。
 
 ### Phase 4B｜标的目录与分类确认
 
@@ -163,11 +165,13 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4D｜日终行情、汇率与失败兜底
 
+**前置门禁（D-038，未通过不得开启自动抓取）：** 4D 在接入任何自动行情源之前，必须逐条补齐并写入 `server/providers/SOURCES.md`：官方条款链接（含自动化使用授权）、可复核的 API 版本与文档、调用限额（日/分钟）、认证方式、市场覆盖的明确声明、失败语义到五类错误码的映射；门禁未通过时保持自动抓取默认关闭，行情以手动补价 + 本地缓存为唯一事实来源。
+
 范围：
 
-1. 接入 4A 契约的免费 provider 与 `market-data/refresh`。
+1. 接入 4A 契约的行情 provider 与 `market-data/refresh`（**汇率可直接接 Frankfurter 固定 ECB 端点，D-036；行情源先过门禁，见上**）。
 2. 从 Keychain 读取所需 Key；Key 不进入 argv、数据库、前端或日志。
-3. 保存价格日、抓取时间、provider 和原始代码；增加有限重试、限额/超时错误与缓存。
+3. 保存价格日、抓取时间、provider 和原始代码；增加有限重试、限额/超时错误与缓存；**落库前必须经 `contract.assertValidResult` 校验，不可入账数据一律拒绝写入**。
 4. 保留 Phase 3 手动汇率，并增加手动价格兜底；失败保留最后有效值并标记 stale。
 
 退出条件：成功、断网、超时、限额、缺标的、节假日和手动覆盖全部由 fixture 测试覆盖；错误响应不能覆盖最后有效值；自动测试不访问公网。
