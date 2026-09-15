@@ -80,7 +80,7 @@ node server/main.js --no-open           # 不自动打开浏览器
 
 ```bash
 cd ledger
-node --test          # 202 项（2026-09-14 基线）
+node --test          # 245 项（2026-09-15 基线）
 
 # 浏览器接线验收必须先由本地服务托管，并使用临时数据目录：
 node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
@@ -91,4 +91,4 @@ node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
 
 ## 下一步
 
-Phase 3 已完成。Phase 4 已拆成 4A–4E；下一位执行 Agent 只实施 Phase 4A「数据源决策与适配器契约」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)，完整顺序见 [ROADMAP.md](./ROADMAP.md)。开始前必须阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)；每次只领取一个子阶段，不得把 4A–4E 合并成一次重写。
+Phase 4A 已完成。Phase 4 已拆成 4A–4E；下一位执行 Agent 只实施 Phase 4B「标的目录与分类确认」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)，完整顺序见 [ROADMAP.md](./ROADMAP.md)。开始前必须阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)；每次只领取一个子阶段，不得把 4B–4E 合并成一次重写。

@@ -120,6 +120,8 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4A｜数据源决策与适配器契约
 
+状态：已完成（2026-09-15）。
+
 范围：
 
 1. 冻结 `DECISIONS.md` T-002（免费行情/汇率源）与 T-003（ETF 元数据来源）。
@@ -128,6 +130,14 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 4. 只完成适配器契约与测试骨架，不接 API、不迁移数据库、不做 UI。
 
 退出条件：T-002/T-003 已决定；fixture adapter 能覆盖成功、超时、限额、缺标的、节假日；全部测试离线运行。
+
+退出证据（2026-09-15）：
+
+- `DECISIONS.md` 新增 **D-036**（汇率 Frankfurter + 行情 Stooq，覆盖/限额/授权/条款/失败语义与付费评估门槛）与 **D-037**（provider 候选 + 用户确认锁定），T-002/T-003 从「待定」转为「已定」；
+- 新增 `server/providers/contract.js`（统一结果形状 + 五类错误 `timeout/rate_limit/not_found/invalid_payload/auth` + 可重试映射 + 白名单请求序列化）、`server/providers/clock.js`（固定时钟，`ctx.now` 注入）、`server/providers/fixture.js`（离线 fixture adapter）；
+- 新增 `tests/providers-contract.test.js` **15/15**：成功、超时、限额、缺标的、无效载荷、鉴权、节假日回退、固定时钟确定性，以及隐私边界证明（夹带账户名/数量/成本/余额的输入，断言请求与结果只含公开代码/币对）；
+- 全量 `node --test` **245/245**（230 旧零回归 + 15 新）；浏览器 wiring **15/15**（连续两轮全绿）；
+- 零数据库迁移、零 API 改动、零 UI 改动、零真实网络请求。
 
 ### Phase 4B｜标的目录与分类确认
 

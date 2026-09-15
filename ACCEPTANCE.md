@@ -149,6 +149,19 @@ Phase 4 按 4A–4E 独立验收。任一子阶段未通过时，只回滚该子
 
 Phase 4A 退出证据：T-002/T-003 已决定；契约、固定时钟与全部 fixture 用例通过；无数据库迁移、API 或 UI 改动。
 
+**验收结论（2026-09-15，`2.3.3-phase4a`）：**
+
+| 场景 | 结论 | 证据 |
+|---|---|---|
+| T-002/T-003 数据源决策 | ✅ 已定 | `DECISIONS.md` 新增 D-036（汇率 Frankfurter + 行情 Stooq，覆盖/限额/授权/条款/失败语义/付费评估门槛）、D-037（provider 候选 + 用户确认锁定）；T-002/T-003 由「待定」转「已定」 |
+| 统一 adapter 契约 | ✅ 通过 | `server/providers/contract.js`：成功结果带原始代码/价格/汇率/数据日/抓取时间/provider；错误分类恰为 `timeout/rate_limit/not_found/invalid_payload/auth` 五类 + 可重试映射；结果形状校验 `isValidResult` |
+| 固定时钟 | ✅ 通过 | `server/providers/clock.js` 经 `ctx.now` 注入；`fixedClock` 恒定，测试断言 `fetchedAt` 两次一致、不读真实 `Date.now` |
+| fixture 覆盖成功/超时/限额/缺标的/节假日 | ✅ 通过 | `tests/providers-contract.test.js` 15/15：成功（VOO/0700.HK/510300.SS 三市场）、timeout、rate_limit、not_found（未命中）、invalid_payload、auth、节假日回退（数据日早于请求日且不报错） |
+| 隐私边界 | ✅ 通过 | 序列化白名单（`serializeFxRequest` 剥离 amount/accountName 等字段；产物键集合固定）；adapter 在塞满账户名/数量/成本/余额/持仓的 `ctx` 下，结果对象仍只含契约白名单键 |
+| 离线运行 / 零越界改动 | ✅ 通过 | 全部测试无真实网络请求；`git` 确认未改动 `migrations.js`/`repository.js`/`api.js`/`keychain.js`/前端文件 |
+
+全量 `node --test` **245/245**（230 旧零回归 + 15 新）；浏览器 wiring **15/15**（连续两轮全绿）。
+
 ### S4B.1 标的分类确认与锁定
 
 **Given** provider 为一个 ETF 返回可追溯的类别、市场和币种候选。

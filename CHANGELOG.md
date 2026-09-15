@@ -6,7 +6,23 @@
 
 ### 计划
 
-- Phase 4「持仓与日终行情」：初始持仓快照与证券事件、免费日终行情与汇率 provider adapter、手动补价兜底、多维度下钻。数据源决策（T-002/T-003）见 `DECISIONS.md`。
+- Phase 4B「标的目录与分类确认」：标的检索、候选与元数据缓存、资产类别/市场/币种预分类、用户确认与本地锁定、稳定标的 id（供多证券账户共同引用）。
+
+## [2.3.3-phase4a] - 2026-09-15
+
+Phase 4A 数据源决策与适配器契约（`ACCEPTANCE.md` S4A.1）。
+
+### 新增
+
+- **provider adapter 契约**（`server/providers/contract.js`）：统一结果形状（原始代码 / 价格 / 汇率 / 数据日 / 抓取时间 / provider）+ 五类错误 `timeout/rate_limit/not_found/invalid_payload/auth` + 可重试映射 + 白名单请求序列化（结构上只接受公开代码/币对）。
+- **固定时钟**（`server/providers/clock.js`）：时间经 `ctx.now` 注入，adapter 零时钟副作用、可复现。
+- **fixture adapter**（`server/providers/fixture.js`）：离线假 provider，覆盖成功 / 超时 / 限额 / 缺标的 / 无效载荷 / 鉴权 / 节假日回退。
+- **数据源决策冻结**：D-036（汇率 Frankfurter + 行情 Stooq，含覆盖/限额/授权/条款/失败语义与付费评估门槛）、D-037（provider 候选 + 用户确认锁定），见 `DECISIONS.md`。
+- **隐私边界测试**（`tests/providers-contract.test.js`，15 项）：证明请求与结果只含公开证券代码 / 币对，不含账户名、数量、成本、余额或完整持仓；全部离线运行。
+
+### 修复
+
+- 无（本轮为纯新增契约与测试骨架，未修改既有代码路径）。
 
 ## [2.3.2-phase3] - 2026-09-15
 
