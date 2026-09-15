@@ -10,25 +10,23 @@
   - 运维：`start.command`、`scripts/install-login-item.sh` / `uninstall-login-item.sh`。
 - **事实源：** SQLite（默认 `~/Library/Application Support/Ledger/ledger.db`）。API 模式下前端**完全不触碰 IndexedDB**；服务不可达时只读降级，绝不双写。资源 upsert 语义见 D-031，估值/追溯口径见 D-034，备份校验见 D-035。
 - **尚无** Phase 4+ 能力：没有持仓/标的/报价写入接口（`POST /api/v1/portfolio-openings|security-events|market-data/refresh` 仍返回 `501`）、没有行情 provider（汇率目前只能手工登记）、没有风险问卷或决策状态机（`risk-assessments`、`recommendations` 仍 `501`）。Keychain 读取路径已就绪但**尚未真正接入行情 Key**。
+- Phase 4 已在 `ROADMAP.md` 拆成 **4A 数据源与契约 → 4B 标的目录 → 4C 持仓账本 → 4D 日终行情 → 4E 下钻归因**。每个任务只领取一个子阶段，禁止一次实现完整 Phase 4。
 - 测试基线：`node --test` **230/230 通过**（2026-09-15，含 2 项 macOS Keychain 写读），其中 Phase 3 `server-phase3` **14/14**；浏览器 wiring **15/15**（连续两轮全绿）。
 - 遗留：登录项端到端（重启 Mac 自动打开）与 Keychain 真实读取留待用户在本机手动执行，见 `TEST.md` "未完成的 P1 发布检查"；「15 分钟完成一次月结」的真实耗时按计划留到 Phase 7 验证。
 
 ## 你的任务
 
-只实施 Phase 4「持仓与日终行情」，不要顺带实现风险问卷或建议功能。
+**只实施 Phase 4A「数据源决策与适配器契约」**。不要开始数据库迁移、持仓 API、真实行情接入或 UI；这些分别属于 4B–4E。
 
 开始前按 `AGENTS.md` 的顺序完整阅读全部 v3 文档，然后：
 
 1. 检查 git 状态与未提交修改，运行并记录 **230 项**基线测试（`node --test`）与浏览器 wiring 15 项；
-2. 给出 Phase 4 的文件级计划和回滚边界；
-3. 先决定 `DECISIONS.md` T-002 / T-003（免费行情与汇率 provider、ETF 元数据来源），**在自动测试中只用固定 fixture，绝不访问真实行情网络**；
-4. 在 `migrations.js` 中**新增一个版本**（不要修改已发布的 v1/v2/v3）承载 instruments/holdings/quotes 的表结构变化（v1 已建八集合基础表，其中 `fx_rates` 已可用，确认缺口后再加），并补向前迁移测试与备份恢复测试；**注意 `server/backup.js` 的 `REQUIRED_TABLES_BY_VERSION` 需要同步登记新版本新增的表**（D-035）；
-5. 把 `server/api.js` 的 `DEFERRED_WRITES` 中属于 Phase 4 的条目逐个替换为真实实现（`portfolio-openings`、`security-events`、`market-data/refresh`），未实现的继续留在 `DEFERRED_WRITES`；
-6. Keychain 读取（`server/keychain.js`）在本阶段接入行情 API Key：只走 stdin 不进 argv、Key 不入库不进前端不进日志；
-7. 前端沿用 `js/store.js` 门面扩展，不要在页面代码里直接 `fetch('/api/v1/...')`，也不要重新引入 IndexedDB 写入；
-8. 实现资产类别/机构/币种/市场下钻与证券收益、汇率影响分离；行情失败保留最后有效值并标记 stale，手动补价可用；
-9. 汇率改为 provider 供给后，仍要保留手动登记路径（Phase 3 页面已依赖它，见 D-034），不得因为接入自动行情而删掉人工兜底；
-10. 完成 `ACCEPTANCE.md` 的 S4.1–S4.x；逐条满足后才能更新 ROADMAP 状态。
+2. 给出 Phase 4A 的文件级计划和回滚边界；
+3. 研究并决定 `DECISIONS.md` T-002 / T-003（免费行情与汇率 provider、ETF 元数据来源），记录覆盖市场、限额、授权方式、使用条款、稳定性和失败语义；
+4. 定义统一 adapter 契约：输入只能是公开证券代码/币对；输出包含原始代码、价格/汇率、数据日、抓取时间和 provider；错误至少区分 timeout、rate_limit、not_found、invalid_payload、auth；
+5. 新增固定时钟和本地 fixtures，覆盖成功、超时、限额、缺标的、节假日；测试必须证明请求构造不含账户名、数量、成本、余额或完整持仓；
+6. 可以建立 adapter 接口与 fixture adapter 的代码骨架，但**不得发真实网络请求**，不得修改迁移、repository、`DEFERRED_WRITES`、Keychain 接线或前端；
+7. 完成 `ACCEPTANCE.md` S4A.1 后，只把 ROADMAP 的 4A 标为完成，并把 `NEXT_AGENT.md` 改为仅领取 4B。
 
 ## 禁止事项
 
@@ -47,4 +45,4 @@
 
 ## 可直接复制给执行 Agent 的任务描述
 
-> 阅读项目根目录的 README.md、PRODUCT.md、ARCHITECTURE.md、ROADMAP.md、DECISIONS.md、ACCEPTANCE.md、AGENTS.md 和 NEXT_AGENT.md。只实施 ROADMAP Phase 4「持仓与日终行情」，不跨阶段。先检查 git 状态、运行 230 项基线测试与 15 项浏览器 wiring 并确认零回归，再给出文件级计划与回滚边界。先定 T-002/T-003 数据源决策，provider 用固定 fixture 测试；新增迁移版本承载持仓与行情表（并同步 `backup.js` 的按版本必需表清单）；逐条把 `DEFERRED_WRITES` 中属于 Phase 4 的接口替换为真实实现，接入 Keychain 行情 Key；前端扩展 `js/store.js` 门面，保留 Phase 3 的手动汇率与月结下钻能力，保持领域逻辑、旧记账能力与 SQLite 单一事实源不变。完成后报告改动、测试证据、未完成项、风险和回滚方式。
+> 阅读项目根目录的 README.md、PRODUCT.md、ARCHITECTURE.md、ROADMAP.md、DECISIONS.md、ACCEPTANCE.md、AGENTS.md 和 NEXT_AGENT.md。只实施 ROADMAP Phase 4A「数据源决策与适配器契约」，不开始 4B–4E。先检查 git 状态、运行 230 项基线测试与 15 项浏览器 wiring，再决定 T-002/T-003；定义只接收公开代码/币对的统一 adapter 契约，建立固定时钟、fixture adapter 和成功/超时/限额/缺标的/节假日测试，并证明请求不包含私人财务事实。不得访问真实行情网络，不得修改数据库迁移、repository、Phase 4 写 API、Keychain 接线或前端。完成 S4A.1 后更新证据，并把 NEXT_AGENT 入口切到只实施 4B。

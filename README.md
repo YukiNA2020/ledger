@@ -91,4 +91,4 @@ node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
 
 ## 下一步
 
-Phase 3 已完成。下一位执行 Agent 按 [ROADMAP.md](./ROADMAP.md) 实施 Phase 4「持仓与日终行情」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)。开始编码前必须先阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)，确认基线测试、改动边界与回滚点；不得把多个 Phase 合并成一次重写。
+Phase 3 已完成。Phase 4 已拆成 4A–4E；下一位执行 Agent 只实施 Phase 4A「数据源决策与适配器契约」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)，完整顺序见 [ROADMAP.md](./ROADMAP.md)。开始前必须阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)；每次只领取一个子阶段，不得把 4A–4E 合并成一次重写。
