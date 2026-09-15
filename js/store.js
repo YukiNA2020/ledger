@@ -303,6 +303,45 @@
     });
   }
 
+  /* ------------------------- Phase 3：资源写入与月度结账 ------------------------- */
+
+  function requireWriteMode() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        var err = new Error('本地服务未运行，当前为只读模式，已拒绝写入');
+        err.code = 'readonly';
+        throw err;
+      }
+      return current;
+    });
+  }
+
+  // 通用单条资源写入：institutions / accounts / account-units / liabilities / entitlements
+  function createResource(resource, payload) {
+    return requireWriteMode().then(function () {
+      return apiFetch('/' + resource, { method: 'POST', body: payload });
+    });
+  }
+
+  function listMonthlyCloses() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { items: [] };
+      return apiFetch('/monthly-closes', { token: false });
+    });
+  }
+
+  // month：'YYYY-MM'；opts：{ status: 'formal'|省略, avgNecessaryMinor: 分|省略 }
+  // status 缺省时由服务端按核对结果决定（可正式则 formal，否则 estimate）
+  function saveMonthlyClose(month, opts) {
+    return requireWriteMode().then(function () {
+      var o = opts || {};
+      var body = month ? { month: month } : {};
+      if (o.status) body.status = o.status;
+      if (o.avgNecessaryMinor != null) body.avgNecessaryMinor = o.avgNecessaryMinor;
+      return apiFetch('/monthly-closes', { method: 'POST', body: body });
+    });
+  }
+
   return {
     MODE_UNKNOWN: MODE_UNKNOWN,
     MODE_API: MODE_API,
@@ -318,6 +357,9 @@
     clearAll: clearAll,
     info: info,
     listBackups: listBackups,
-    overview: overview
+    overview: overview,
+    createResource: createResource,
+    listMonthlyCloses: listMonthlyCloses,
+    saveMonthlyClose: saveMonthlyClose
   };
 });

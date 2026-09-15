@@ -343,6 +343,117 @@
       assert(fresh.length >= 1, '本次恢复应产生新的 pre-import 备份');
     });
 
+    // S3.1 资产录入页布线：决策台入口 → 新增账户 → 登记余额 → 落库可直读，
+    // 且全量写回（记账路径 writeState 先清后写）不会抹掉资源接口写入的数据。
+    await check('资产录入页可建账户并登记余额，且不被全量写回抹掉', async function () {
+      // C9 的恢复把资产清掉了：决策台应显示空状态与「录入资产」入口
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view .dash-empty'); }, 8000, '决策台空状态');
+      assert(document.querySelector('#view [data-action="nav:assets"]'), '空状态应提供资产录入入口');
+      clickAction('[data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="asset:acc"]'); }, 5000, '新增账户入口');
+
+      // 新增账户（安全储备池）
+      clickAction('[data-action="asset:acc"]');
+      await waitFor(function () { return document.querySelector('#aa-name'); }, 5000, '账户表单');
+      document.querySelector('#aa-name').value = '布线储蓄卡';
+      document.querySelector('#aa-inst').value = '布线银行';
+      document.querySelector('#aa-pool').value = 'safety';
+      clickAction('[data-action="asset:saveAcc"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('布线储蓄卡') >= 0;
+      }, 5000, '账户出现在列表');
+
+      // 登记余额 3000 CNY，核对日为今天
+      clickAction('[data-action="asset:unit"]');
+      await waitFor(function () { return document.querySelector('#au-bal'); }, 5000, '余额表单');
+      document.querySelector('#au-bal').value = '3000';
+      clickAction('[data-action="asset:saveUnit"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('3,000.00') >= 0;
+      }, 5000, '余额出现在列表');
+
+      // 新增负债与保障权益
+      clickAction('[data-action="asset:liab"]');
+      await waitFor(function () { return document.querySelector('#al-name'); }, 5000, '负债表单');
+      document.querySelector('#al-name').value = '布线信用卡';
+      document.querySelector('#al-bal').value = '500';
+      clickAction('[data-action="asset:saveLiab"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('布线信用卡') >= 0;
+      }, 5000, '负债出现在列表');
+
+      clickAction('[data-action="asset:ent"]');
+      await waitFor(function () { return document.querySelector('#ae-name'); }, 5000, '权益表单');
+      document.querySelector('#ae-name').value = '布线医保';
+      document.querySelector('#ae-status').value = '在缴';
+      clickAction('[data-action="asset:saveEnt"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('布线医保') >= 0;
+      }, 5000, '权益出现在列表');
+
+      // SQLite 直读：四类资源都已落库
+      var st = await apiState();
+      assert((st.assets.assetAccounts || []).some(function (a) { return a.name === '布线储蓄卡' && a.pool === 'safety'; }),
+        '账户应落库');
+      var unit = (st.assets.assetUnits || []).filter(function (u) { return u.balanceMinor === 300000; });
+      assert(unit.length === 1 && unit[0].sourceType === 'manual', '余额应以最小货币单位落库');
+      assert((st.assets.liabilities || []).some(function (l) { return l.name === '布线信用卡' && l.balanceMinor === 50000; }),
+        '负债应落库');
+      assert((st.assets.entitlements || []).some(function (e) { return e.name === '布线医保' && e.balanceMinor === null; }),
+        '权益应落库且无金额');
+
+      // 关键反证：走一次全量写回（记账路径），资源接口写入的数据不得被抹掉
+      var raw = await Store.loadRaw();
+      await Store.saveAll({
+        accounts: raw.accounts, categories: raw.categories,
+        txns: raw.txns, settings: raw.settings, assets: raw.assets
+      });
+      var st2 = await apiState();
+      assert((st2.assets.assetAccounts || []).some(function (a) { return a.name === '布线储蓄卡'; }),
+        '全量写回后账户必须仍在（writeState 先清后写不可丢资源数据）');
+      assert((st2.assets.assetUnits || []).some(function (u) { return u.balanceMinor === 300000; }),
+        '全量写回后余额必须仍在');
+    });
+
+    // S3.3 月度结账页布线：上月核对清单 → 余额未在上月核对 → 只能估算结账；
+    // 保存后历史出现记录，HTTP 直读 monthly_closes 与快照哈希。
+    await check('月度结账按上月口径生成清单并可保存估算快照', async function () {
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:close"]'); }, 5000, '决策台结账入口');
+      clickAction('[data-action="nav:close"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-action="close:save"]');
+      }, 5000, '结账页清单');
+
+      // 余额核对日是本月，结账月份是上月 → 必有 balance_stale 类阻塞 → 正式结账按钮必须禁用
+      var formalBtn = document.querySelector('#view [data-action="close:save"][data-status="formal"]');
+      assert(formalBtn, '正式结账按钮应存在 · view=' + document.querySelector('#view').textContent.slice(0, 120));
+      assert(formalBtn.disabled, '上月未核对余额时正式结账必须禁用');
+
+      // 保存为估算快照
+      clickAction('[data-action="close:save"][data-status="estimate"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('历史结账') >= 0 &&
+          document.querySelector('#view').textContent.indexOf('估算') >= 0 &&
+          document.querySelector('#view').textContent.indexOf('还没有结账记录') < 0;
+      }, 8000, '历史结账记录');
+
+      // HTTP 直读：monthly_closes 一条，月份为上一个完整自然月，快照哈希存在
+      var prev = Core.todayStr().slice(0, 7);
+      var prevYm = (function (ym) {
+        var d = new Date(+ym.slice(0, 4), +ym.slice(5, 7) - 1, 1);
+        d.setMonth(d.getMonth() - 1); // 退回上一个完整自然月（1 号日期下 setMonth 不会跳月）
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+      })(prev);
+      var closes = await fetch('/api/v1/monthly-closes').then(function (r) { return r.json(); });
+      equal((closes.items || []).length, 1, '应有一条结账记录');
+      equal(closes.items[0].month, prevYm, '结账月份应为上一个完整自然月');
+      equal(closes.items[0].status, 'estimate', '上月余额未核对时应为估算');
+      assert(closes.items[0].snapshot && closes.items[0].snapshot.payloadHash, '应附快照哈希');
+      assert((closes.items[0].blockers || []).length >= 1, '应记录阻塞码清单');
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();
