@@ -44,20 +44,77 @@ const MIME = {
   '.md': 'text/plain; charset=utf-8'
 };
 
-// 后续阶段拥有的写接口：URL 资源边界保持稳定，但实现留给对应阶段
+// 后续阶段拥有的写接口：URL 资源边界保持稳定，但实现留给对应阶段。
+// Phase 3 已实现：institutions / accounts / account-units / liabilities / entitlements
+// 与 monthly-closes（ROADMAP Phase 3 工作项 1–6）。
 const DEFERRED_WRITES = {
-  'POST /api/v1/accounts': 'Phase 3',
-  'POST /api/v1/institutions': 'Phase 3',
-  'POST /api/v1/account-units': 'Phase 3',
-  'POST /api/v1/liabilities': 'Phase 3',
-  'POST /api/v1/entitlements': 'Phase 3',
   'POST /api/v1/portfolio-openings': 'Phase 4',
   'POST /api/v1/security-events': 'Phase 4',
   'POST /api/v1/market-data/refresh': 'Phase 4',
-  'POST /api/v1/monthly-closes': 'Phase 5',
   'POST /api/v1/risk-assessments': 'Phase 5',
   'POST /api/v1/recommendations': 'Phase 5'
 };
+
+/* ------------------------------ 校验 ------------------------------ */
+
+const POOLS = ['safety', 'investable', 'restricted', 'entitlement'];
+const INSTITUTION_KINDS = ['bank', 'broker', 'government', 'other'];
+
+function newResourceId(prefix) {
+  return prefix + '-' + crypto.randomBytes(8).toString('hex');
+}
+
+function isYm(s) {
+  return typeof s === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(s);
+}
+
+// 金额：null（无明确余额）或非负安全整数（最小货币单位）
+function validMinor(v) {
+  return v == null || (Number.isSafeInteger(v) && v >= 0);
+}
+
+function lastDayOfMonth(ym) {
+  const y = Number(ym.slice(0, 4));
+  const m = Number(ym.slice(5, 7));
+  return localDateStr(new Date(y, m, 0));
+}
+
+function validateResourcePayload(body, spec) {
+  // spec: [{key, required, kind: 'name'|'currency'|'pool'|'minor'|'date'|'kind', code}]
+  const out = {};
+  for (const rule of spec) {
+    const raw = body ? body[rule.key] : undefined;
+    if (rule.kind === 'name') {
+      const s = typeof raw === 'string' ? raw.trim() : '';
+      if (!s) return { error: rule.code || 'invalid_name' };
+      if (s.length > 120) return { error: 'invalid_name' };
+      out[rule.key] = s;
+    } else if (rule.kind === 'currency') {
+      if (raw != null && Domain.CURRENCIES.indexOf(raw) === -1) return { error: rule.code || 'invalid_currency' };
+      out[rule.key] = raw == null ? 'CNY' : raw;
+    } else if (rule.kind === 'pool') {
+      if (raw != null && POOLS.indexOf(raw) === -1) return { error: rule.code || 'invalid_pool' };
+      out[rule.key] = raw == null ? 'safety' : raw;
+    } else if (rule.kind === 'minor') {
+      if (!validMinor(raw)) return { error: rule.code || 'invalid_amount' };
+      out[rule.key] = raw == null ? null : raw;
+    } else if (rule.kind === 'date') {
+      if (raw != null && !isDateStr(raw)) return { error: rule.code || 'invalid_date' };
+      out[rule.key] = raw == null ? null : raw;
+    } else if (rule.kind === 'institutionKind') {
+      if (raw != null && INSTITUTION_KINDS.indexOf(raw) === -1) return { error: rule.code || 'invalid_kind' };
+      out[rule.key] = raw == null ? 'other' : raw;
+    } else if (rule.kind === 'text') {
+      // 可选的有界文本：空串与缺省都归一为 null，超长直接拒绝
+      const s = raw == null ? '' : String(raw).trim();
+      if (s.length > 120) return { error: rule.code || 'invalid_text' };
+      out[rule.key] = s || null;
+    } else {
+      out[rule.key] = raw == null ? null : raw;
+    }
+  }
+  return { value: out };
+}
 
 /* ------------------------------ 基础工具 ------------------------------ */
 
@@ -245,6 +302,235 @@ function createHandler(ctx) {
   api['GET /api/v1/entitlements'] = (req, res) => {
     sendJson(res, 200, { items: R.readEntitlements(ctx.db) });
   };
+
+  /* ------------------------- Phase 3：资产资源写入 ------------------------- */
+  // 单条 upsert：资源录入页逐条编辑用；id 缺省时服务端生成。
+  // 校验（api 层）+ 领域校验（repository 层）都在 transaction 内完成（§5.6）。
+
+  function upsertFail(res, err) {
+    const code = (err && err.code) || 'internal_error';
+    const status = code === 'unknown_account' ? 422 : 400;
+    return fail(res, status, code, err && err.message ? err.message : '写入失败', false);
+  }
+
+  function newResourcePayload(body, spec, idPrefix) {
+    const checked = validateResourcePayload(body, spec);
+    if (checked.error) return checked;
+    if (!checked.value.id) checked.value.id = newResourceId(idPrefix);
+    return checked;
+  }
+
+  api['POST /api/v1/institutions'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = validateResourcePayload(body, [
+      { key: 'name', kind: 'name', code: 'invalid_name' },
+      { key: 'kind', kind: 'institutionKind' }
+    ]);
+    if (checked.error) return fail(res, 400, checked.error, '机构字段不合法：' + checked.error, false);
+    try {
+      const row = dbm.transaction(ctx.db, () =>
+        R.upsertInstitution(ctx.db, checked.value, { now: new Date().toISOString() })
+      );
+      return sendJson(res, 201, { ok: true, item: row });
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  api['POST /api/v1/accounts'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = newResourcePayload(
+      body,
+      [
+        { key: 'name', kind: 'name', code: 'invalid_name' },
+        { key: 'kind', kind: 'text' },
+        { key: 'pool', kind: 'pool' },
+        { key: 'status', kind: 'text' },
+        { key: 'institution', kind: 'text' },
+        { key: 'institutionKind', kind: 'institutionKind' }
+      ],
+      'acct'
+    );
+    if (checked.error) return fail(res, 400, checked.error, '账户字段不合法：' + checked.error, false);
+    try {
+      dbm.transaction(ctx.db, () => R.upsertAssetAccount(ctx.db, checked.value, { now: new Date().toISOString() }));
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+    const item = R.readAssetAccounts(ctx.db).find((a) => a.id === checked.value.id) || null;
+    return sendJson(res, 201, { ok: true, item: item });
+  };
+
+  api['POST /api/v1/account-units'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = newResourcePayload(
+      body,
+      [
+        { key: 'accountId', kind: 'name', code: 'invalid_account' },
+        { key: 'currency', kind: 'currency' },
+        { key: 'balanceMinor', kind: 'minor' },
+        { key: 'asOf', kind: 'date' },
+        { key: 'sourceType', kind: 'text' }
+      ],
+      'unit'
+    );
+    if (checked.error) return fail(res, 400, checked.error, '余额单元字段不合法：' + checked.error, false);
+    try {
+      dbm.transaction(ctx.db, () => R.upsertAssetUnit(ctx.db, checked.value, { now: new Date().toISOString() }));
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+    const item = R.readAssetUnits(ctx.db).find((u) => u.id === checked.value.id) || null;
+    return sendJson(res, 201, { ok: true, item: item });
+  };
+
+  api['POST /api/v1/liabilities'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = newResourcePayload(
+      body,
+      [
+        { key: 'name', kind: 'name', code: 'invalid_name' },
+        { key: 'accountId', kind: 'text' },
+        { key: 'currency', kind: 'currency' },
+        { key: 'balanceMinor', kind: 'minor' },
+        { key: 'dueDate', kind: 'date' },
+        { key: 'termType', kind: 'text' },
+        { key: 'asOf', kind: 'date' }
+      ],
+      'liab'
+    );
+    if (checked.error) return fail(res, 400, checked.error, '负债字段不合法：' + checked.error, false);
+    try {
+      dbm.transaction(ctx.db, () => R.upsertLiability(ctx.db, checked.value, { now: new Date().toISOString() }));
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+    const item = R.readLiabilities(ctx.db).find((l) => l.id === checked.value.id) || null;
+    return sendJson(res, 201, { ok: true, item: item });
+  };
+
+  api['POST /api/v1/entitlements'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = newResourcePayload(
+      body,
+      [
+        { key: 'name', kind: 'name', code: 'invalid_name' },
+        { key: 'kind', kind: 'text' },
+        { key: 'jurisdiction', kind: 'text' },
+        { key: 'status', kind: 'text' },
+        { key: 'balanceMinor', kind: 'minor' },
+        { key: 'valuationType', kind: 'text' },
+        { key: 'asOf', kind: 'date' },
+        { key: 'sourceRef', kind: 'text' }
+      ],
+      'ent'
+    );
+    if (checked.error) return fail(res, 400, checked.error, '权益字段不合法：' + checked.error, false);
+    try {
+      dbm.transaction(ctx.db, () => R.upsertEntitlement(ctx.db, checked.value, { now: new Date().toISOString() }));
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+    const item = R.readEntitlements(ctx.db).find((e) => e.id === checked.value.id) || null;
+    return sendJson(res, 201, { ok: true, item: item });
+  };
+
+  /* ------------------------- Phase 3：月度结账 ------------------------- */
+
+  api['GET /api/v1/monthly-closes'] = (req, res) => {
+    sendJson(res, 200, { items: R.listMonthlyCloses(ctx.db) });
+  };
+
+  api['POST /api/v1/monthly-closes'] = async (req, res) => {
+    const body = await readBody(req);
+    const month = body && isYm(body.month) ? body.month : localDateStr().slice(0, 7);
+    if (!isYm(month)) return fail(res, 400, 'invalid_month', 'month 必须是 YYYY-MM', false);
+
+    // 结账数据截止到该月最后一天；核对口径完全复用 domain.computeCloseChecklist
+    //（内含 computeOverview），保证决策台与月结页的「估算/正式」永远一致（D-001）
+    const asOf = lastDayOfMonth(month);
+    const state = R.readState(ctx.db);
+    const settings = state.settings || {};
+    let checklist;
+    try {
+      checklist = Domain.computeCloseChecklist(state.assets, { now: asOf, settings: settings });
+    } catch (err) {
+      return fail(res, 400, 'invalid_assets', '存量数据无法生成核对清单：' + (err && err.message ? err.message : String(err)), false);
+    }
+
+    // 正式结账必须有明确估值（无任何缺项）；否则只能保存为估算（§5.3）
+    if (body && body.status === 'formal' && !checklist.canComplete) {
+      return fail(res, 409, 'close_blocked', '存在未核对项，不能正式结账；可先保存为估算', false);
+    }
+    const status = body && body.status === 'formal' ? 'formal' : checklist.canComplete ? 'formal' : 'estimate';
+
+    const overview = Domain.computeOverview(state.assets, { now: asOf, settings: settings });
+    const avgNecessary = typeof settings.avgNecessaryMinor === 'number' && settings.avgNecessaryMinor > 0
+      ? settings.avgNecessaryMinor
+      : null;
+    const emergencyMonths = avgNecessary
+      ? Domain.emergencyCoverageMonths(overview.pools.safetyMinor, avgNecessary)
+      : null;
+
+    const nowIso = new Date().toISOString();
+    const closeId = R.getMonthlyCloseByMonth(ctx.db, month) || newResourceId('close');
+    const snapshotId = newResourceId('snap');
+    const payloadJson = JSON.stringify({
+      month: month,
+      asOf: asOf,
+      status: status,
+      overview: overview,
+      checklist: checklist,
+      emergencyCoverageMonths: emergencyMonths
+    });
+    const payloadHash = crypto.createHash('sha256').update(payloadJson).digest('hex');
+
+    try {
+      dbm.transaction(ctx.db, () => {
+        R.upsertMonthlyClose(ctx.db, {
+          id: closeId,
+          month: month,
+          status: status,
+          blockers: checklist.items,
+          summary: {
+            totalAssetsMinor: overview.totalAssetsMinor,
+            totalLiabilitiesMinor: overview.totalLiabilitiesMinor,
+            netWorthMinor: overview.netWorthMinor,
+            valuationStatus: checklist.valuationStatus,
+            emergencyCoverageMonths: emergencyMonths
+          },
+          completedAt: nowIso,
+          dataCutoff: asOf
+        });
+        R.insertCloseSnapshot(ctx.db, {
+          id: snapshotId,
+          closeId: closeId,
+          month: month,
+          capturedAt: nowIso,
+          snapshotType: 'monthly_close',
+          payloadJson: payloadJson,
+          payloadHash: payloadHash
+        });
+      });
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+
+    return sendJson(res, 201, {
+      ok: true,
+      close: {
+        id: closeId,
+        month: month,
+        status: status,
+        completedAt: nowIso,
+        dataCutoff: asOf,
+        canComplete: checklist.canComplete,
+        blockers: checklist.items
+      },
+      snapshot: { id: snapshotId, payloadHash: payloadHash, capturedAt: nowIso }
+    });
+  };
+
   api['GET /api/v1/instruments'] = (req, res) => {
     sendJson(res, 200, { items: R.readInstruments(ctx.db) });
   };

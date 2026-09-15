@@ -590,6 +590,8 @@ function writeTxnsBlob(db, blob) {
 /* ------------------------------ 全量读写 ------------------------------ */
 
 const CLEAR_ORDER = [
+  'close_snapshots',
+  'monthly_closes',
   'dedup_candidates',
   'dedup_fingerprints',
   'security_events',
@@ -774,6 +776,262 @@ function setMeta(db, key, value) {
   );
 }
 
+/* ------------------------------ Phase 3：单条资源写入 ------------------------------ */
+
+// 说明：writeState 是"全量替换"，资源级 POST 是"单条 upsert"。两者互为补充：
+//   - 资源级写入用于资产录入页的逐条编辑（POST /api/v1/accounts 等）；
+//   - 都必须在 transaction 内执行（调用方负责），保持"服务端是唯一写入者"。
+// upsert 一律用 ON CONFLICT DO UPDATE，绝不用 INSERT OR REPLACE——
+// REPLACE 是"删了再插"，会触发 account_units 等子表的 ON DELETE CASCADE，静默清掉余额。
+
+function upsertInstitution(db, item, options) {
+  const opts = options || {};
+  const name = STR(item.name || '').trim();
+  if (!name) throw Object.assign(new Error('机构名称不能为空'), { code: 'invalid_name' });
+  const kind = STR(item.kind) || 'other';
+  const id = item.id ? String(item.id) : institutionIdFor(name);
+  run(
+    db,
+    `INSERT INTO institutions (id, name, kind, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(name) DO UPDATE SET kind = excluded.kind`,
+    [id, name, kind, opts.now || new Date().toISOString()]
+  );
+  return get(db, 'SELECT id, name, kind FROM institutions WHERE name = ?', [name]);
+}
+
+function upsertAssetAccount(db, a, options) {
+  const opts = options || {};
+  if (!a || !a.id) throw Object.assign(new Error('缺少账户 id'), { code: 'invalid_id' });
+  const name = STR(a.name || '').trim();
+  if (!name) throw Object.assign(new Error('账户名称不能为空'), { code: 'invalid_name' });
+  let institutionId = null;
+  const instName = typeof a.institution === 'string' ? a.institution.trim() : '';
+  if (instName) {
+    const inst = upsertInstitution(db, { name: instName, kind: a.institutionKind }, opts);
+    institutionId = inst ? inst.id : null;
+  }
+  run(
+    db,
+    `INSERT INTO asset_accounts (id, institution_id, name, kind, pool, status, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       institution_id = excluded.institution_id,
+       name = excluded.name,
+       kind = excluded.kind,
+       pool = excluded.pool,
+       status = excluded.status,
+       extra_json = excluded.extra_json`,
+    [
+      String(a.id),
+      institutionId,
+      name,
+      STR(a.kind) || 'other',
+      STR(a.pool) || 'safety',
+      STR(a.status) || 'active',
+      extraJson(a, KNOWN.assetAccounts)
+    ]
+  );
+  return get(db, 'SELECT * FROM asset_accounts WHERE id = ?', [String(a.id)]);
+}
+
+function upsertAssetUnit(db, u, options) {
+  const opts = options || {};
+  if (!u || !u.id) throw Object.assign(new Error('缺少余额单元 id'), { code: 'invalid_id' });
+  const exists = get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [String(u.accountId)]);
+  if (!exists) throw Object.assign(new Error('余额单元所属账户不存在'), { code: 'unknown_account' });
+  if (u.balanceMinor != null && (!Number.isSafeInteger(u.balanceMinor) || u.balanceMinor < 0)) {
+    throw Object.assign(new Error('余额必须是非负整数（最小货币单位）'), { code: 'invalid_amount' });
+  }
+  run(
+    db,
+    `INSERT INTO account_units (id, account_id, currency, balance_minor, as_of, source_type, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       account_id = excluded.account_id,
+       currency = excluded.currency,
+       balance_minor = excluded.balance_minor,
+       as_of = excluded.as_of,
+       source_type = excluded.source_type,
+       extra_json = excluded.extra_json`,
+    [
+      String(u.id),
+      String(u.accountId),
+      STR(u.currency) || 'CNY',
+      u.balanceMinor == null ? null : u.balanceMinor,
+      STR(u.asOf),
+      STR(u.sourceType) || 'manual',
+      extraJson(u, KNOWN.assetUnits)
+    ]
+  );
+  return get(db, 'SELECT * FROM account_units WHERE id = ?', [String(u.id)]);
+}
+
+function upsertLiability(db, l, options) {
+  const opts = options || {};
+  if (!l || !l.id) throw Object.assign(new Error('缺少负债 id'), { code: 'invalid_id' });
+  const name = STR(l.name || '').trim();
+  if (!name) throw Object.assign(new Error('负债名称不能为空'), { code: 'invalid_name' });
+  if (l.balanceMinor != null && (!Number.isSafeInteger(l.balanceMinor) || l.balanceMinor < 0)) {
+    throw Object.assign(new Error('负债金额必须是非负整数（最小货币单位）'), { code: 'invalid_amount' });
+  }
+  if (l.accountId && !get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [String(l.accountId)])) {
+    throw Object.assign(new Error('负债关联账户不存在'), { code: 'unknown_account' });
+  }
+  run(
+    db,
+    `INSERT INTO liabilities (id, account_id, name, currency, balance_minor, due_date, term_type, as_of, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       account_id = excluded.account_id,
+       name = excluded.name,
+       currency = excluded.currency,
+       balance_minor = excluded.balance_minor,
+       due_date = excluded.due_date,
+       term_type = excluded.term_type,
+       as_of = excluded.as_of,
+       extra_json = excluded.extra_json`,
+    [
+      String(l.id),
+      l.accountId ? String(l.accountId) : null,
+      name,
+      STR(l.currency) || 'CNY',
+      l.balanceMinor == null ? null : l.balanceMinor,
+      STR(l.dueDate),
+      STR(l.termType),
+      STR(l.asOf),
+      extraJson(l, KNOWN.liabilities)
+    ]
+  );
+  return get(db, 'SELECT * FROM liabilities WHERE id = ?', [String(l.id)]);
+}
+
+function upsertEntitlement(db, e, options) {
+  const opts = options || {};
+  if (!e || !e.id) throw Object.assign(new Error('缺少保障权益 id'), { code: 'invalid_id' });
+  const name = STR(e.name || '').trim();
+  if (!name) throw Object.assign(new Error('权益名称不能为空'), { code: 'invalid_name' });
+  // 无明确金额的权益必须留空（null），不允许 0 冒充已核实余额（ARCHITECTURE §5.5）
+  if (e.balanceMinor != null && (!Number.isSafeInteger(e.balanceMinor) || e.balanceMinor < 0)) {
+    throw Object.assign(new Error('权益金额必须是非负整数或留空'), { code: 'invalid_amount' });
+  }
+  run(
+    db,
+    `INSERT INTO entitlements (id, name, kind, jurisdiction, status, balance_minor, valuation_type, as_of, source_ref, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       kind = excluded.kind,
+       jurisdiction = excluded.jurisdiction,
+       status = excluded.status,
+       balance_minor = excluded.balance_minor,
+       valuation_type = excluded.valuation_type,
+       as_of = excluded.as_of,
+       source_ref = excluded.source_ref,
+       extra_json = excluded.extra_json`,
+    [
+      String(e.id),
+      name,
+      STR(e.kind) || 'other',
+      STR(e.jurisdiction),
+      STR(e.status),
+      e.balanceMinor == null ? null : e.balanceMinor,
+      STR(e.valuationType),
+      STR(e.asOf),
+      STR(e.sourceRef),
+      extraJson(e, KNOWN.entitlements)
+    ]
+  );
+  return get(db, 'SELECT * FROM entitlements WHERE id = ?', [String(e.id)]);
+}
+
+/* ------------------------------ Phase 3：月度结账与快照 ------------------------------ */
+
+function listMonthlyCloses(db) {
+  return all(db, 'SELECT * FROM monthly_closes ORDER BY month DESC').map((row) => {
+    let blockers = [];
+    let summary = null;
+    try { blockers = row.blockers_json ? JSON.parse(row.blockers_json) : []; } catch (_) { blockers = []; }
+    try { summary = row.summary_json ? JSON.parse(row.summary_json) : null; } catch (_) { summary = null; }
+    const snap = get(
+      db,
+      'SELECT id, payload_hash, captured_at FROM close_snapshots WHERE close_id = ? ORDER BY captured_at DESC LIMIT 1',
+      [row.id]
+    );
+    return {
+      id: row.id,
+      month: row.month,
+      status: row.status,
+      completedAt: row.completed_at,
+      dataCutoff: row.data_cutoff,
+      blockerCount: blockers.length,
+      blockers: blockers,
+      summary: summary,
+      snapshot: snap ? { id: snap.id, payloadHash: snap.payload_hash, capturedAt: snap.captured_at } : null
+    };
+  });
+}
+
+function getMonthlyCloseByMonth(db, month) {
+  const row = get(db, 'SELECT id FROM monthly_closes WHERE month = ?', [month]);
+  return row ? row.id : null;
+}
+
+function upsertMonthlyClose(db, c) {
+  if (!c || !c.month || !/^\d{4}-\d{2}$/.test(String(c.month))) {
+    throw Object.assign(new Error('month 必须是 YYYY-MM'), { code: 'invalid_month' });
+  }
+  run(
+    db,
+    `INSERT INTO monthly_closes (id, month, status, blockers_json, summary_json, completed_at, data_cutoff)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(month) DO UPDATE SET
+       id = excluded.id,
+       status = excluded.status,
+       blockers_json = excluded.blockers_json,
+       summary_json = excluded.summary_json,
+       completed_at = excluded.completed_at,
+       data_cutoff = excluded.data_cutoff`,
+    [
+      String(c.id),
+      String(c.month),
+      c.status === 'formal' ? 'formal' : 'estimate',
+      JSON.stringify(c.blockers || []),
+      c.summary == null ? null : JSON.stringify(c.summary),
+      String(c.completedAt),
+      String(c.dataCutoff)
+    ]
+  );
+  return get(db, 'SELECT * FROM monthly_closes WHERE month = ?', [String(c.month)]);
+}
+
+function insertCloseSnapshot(db, snap) {
+  run(
+    db,
+    `INSERT INTO close_snapshots (id, close_id, month, captured_at, snapshot_type, payload_json, payload_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(snap.id),
+      snap.closeId ? String(snap.closeId) : null,
+      String(snap.month),
+      String(snap.capturedAt),
+      STR(snap.snapshotType) || 'monthly_close',
+      String(snap.payloadJson),
+      String(snap.payloadHash)
+    ]
+  );
+  return get(db, 'SELECT id, payload_hash FROM close_snapshots WHERE id = ?', [String(snap.id)]);
+}
+
+function getCloseSnapshotPayload(db, id) {
+  const row = get(db, 'SELECT payload_json FROM close_snapshots WHERE id = ?', [String(id)]);
+  if (!row) return null;
+  try {
+    return JSON.parse(row.payload_json);
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = {
   ASSET_KEYS,
   LEGACY_KEYS,
@@ -799,5 +1057,15 @@ module.exports = {
   rememberIdempotent,
   getMeta,
   setMeta,
-  institutionIdFor
+  institutionIdFor,
+  upsertInstitution,
+  upsertAssetAccount,
+  upsertAssetUnit,
+  upsertLiability,
+  upsertEntitlement,
+  listMonthlyCloses,
+  getMonthlyCloseByMonth,
+  upsertMonthlyClose,
+  insertCloseSnapshot,
+  getCloseSnapshotPayload
 };

@@ -28,7 +28,7 @@ test('createBackup 生成通过校验的文件，且不留下临时/同伴文件
     assert.match(result.name, /^ledger-\d{8}-\d{6}-manual\.db$/);
     const check = B.validateBackupFile(result.file);
     assert.strictEqual(check.ok, true, check.reason);
-    assert.strictEqual(check.schemaVersion, 1);
+    assert.strictEqual(check.schemaVersion, 2);
 
     const leftovers = fs.readdirSync(ctx.paths.backupDir).filter((n) => !n.endsWith('.db'));
     assert.deepStrictEqual(leftovers, [], '不应留下 .tmp / -wal / -shm 等文件');

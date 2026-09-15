@@ -114,7 +114,7 @@ test('S2.2 health 只暴露 loopback 策略：绑定 127.0.0.1、禁 CORS、写�
     assert.strictEqual(res.json.policy.writesRequireToken, true);
     assert.strictEqual(res.json.policy.cors, 'disabled');
     assert.strictEqual(res.json.policy.cloudAi, false);
-    assert.strictEqual(res.json.latestSchemaVersion, 1);
+    assert.strictEqual(res.json.latestSchemaVersion, 2);
   } finally {
     await srv.close();
     ctx.close();
@@ -219,7 +219,7 @@ test('S2.1 写回的数据可被 HTTP 直读，且与写入内容逐字段一致
     });
     assert.strictEqual(put.status, 200);
     assert.strictEqual(put.json.ok, true);
-    assert.strictEqual(put.json.schemaVersion, 1);
+    assert.strictEqual(put.json.schemaVersion, 2);
 
     const get = await request(srv.port, 'GET', '/api/v1/state');
     assert.strictEqual(get.status, 200);
@@ -371,9 +371,18 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
   const ctx = setup('ledger-api-');
   const srv = await startServer(ctx);
   try {
+    // Phase 3 的写接口已落地：不再是 501，而是进入真实校验（空缺名称 → 400）
+    const phase3 = await request(srv.port, 'POST', '/api/v1/accounts', {
+      headers: writeHeaders(ctx),
+      body: '{}'
+    });
+    assert.strictEqual(phase3.status, 400);
+    assert.strictEqual(phase3.json.error.code, 'invalid_name');
+
     const cases = [
-      ['POST', '/api/v1/accounts', 'Phase 3'],
       ['POST', '/api/v1/portfolio-openings', 'Phase 4'],
+      ['POST', '/api/v1/security-events', 'Phase 4'],
+      ['POST', '/api/v1/market-data/refresh', 'Phase 4'],
       ['POST', '/api/v1/risk-assessments', 'Phase 5'],
       ['POST', '/api/v1/recommendations', 'Phase 5']
     ];
@@ -470,7 +479,7 @@ test('恢复接口：非法文件名 400，合法但校验失败 409，成功则
     assert.strictEqual(ok.status, 200);
     assert.strictEqual(ok.json.restoredFrom, good.name);
     assert.match(ok.json.preRestoreBackup, /-pre-restore\.db$/, '恢复前必须先备份当前库');
-    assert.strictEqual(ok.json.schemaVersion, 1);
+    assert.strictEqual(ok.json.schemaVersion, 2);
 
     // api.js 会用切换后的新连接继续服务
     ctx.db = R.readState ? ctx.db : ctx.db;

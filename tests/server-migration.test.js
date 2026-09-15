@@ -11,15 +11,17 @@ const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1+v2：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(rows.length, 2);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
+    assert.strictEqual(rows[1].version, 2);
+    assert.strictEqual(rows[1].name, 'phase3-close-schema');
 
     const missing = REQUIRED_TABLES.filter((t) => !tableExists(ctx.db, t));
     assert.deepStrictEqual(missing, [], '缺少表：' + missing.join(', '));
@@ -61,8 +63,9 @@ test('迁移失败时整体回滚：不留下半个 schema，也不写入版本�
   try {
     const brokenList = [
       { version: 1, name: 'phase2-initial-schema', up: M.MIGRATIONS[0].up },
+      { version: 2, name: 'phase3-close-schema', up: M.MIGRATIONS[1].up },
       {
-        version: 2,
+        version: 3,
         name: 'broken-migration',
         up(db) {
           db.exec('CREATE TABLE probe_ok (id TEXT PRIMARY KEY)');
@@ -75,8 +78,8 @@ test('迁移失败时整体回滚：不留下半个 schema，也不写入版本�
       /incomplete input|syntax error|near/i,
       '坏迁移必须抛出'
     );
-    // 回滚后：版本仍是 1，且坏迁移创建的表不存在
-    assert.strictEqual(M.currentVersion(ctx.db), 1);
+    // 回滚后：版本停在最新已发布版本，且坏迁移创建的表不存在
+    assert.strictEqual(M.currentVersion(ctx.db), M.LATEST_VERSION);
     assert.strictEqual(tableExists(ctx.db, 'probe_ok'), false);
   } finally {
     ctx.close();

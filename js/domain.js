@@ -308,6 +308,135 @@
     };
   }
 
+  /* ------------------------------ 月度结账（Phase 3） ------------------------------ */
+
+  // computeCloseChecklist(assets, { now }) → 本月结账核对清单与可追溯事实。
+  //   now：'YYYY-MM-DD'（结账数据截止日，必传）；复用 computeOverview 的全部口径，
+  //   不另写一套判断，保证"估算/正式"在决策台与月结页永远一致。
+  // 返回：
+  //   month / asOf / valuationStatus / canComplete（无任何缺项才可正式结账）
+  //   items：按阻塞码聚合的核对条目 [{code, detail, count}]（空数组 = 全部核对通过）
+  //   facts：单元级事实（余额/负债/持仓逐条带币种、日期与折算值），用于追溯每个金额
+  function computeCloseChecklist(assets, opts) {
+    if (!opts || !opts.now) throw new Error('computeCloseChecklist 需要 now 参数（YYYY-MM-DD）');
+    var now = opts.now;
+    var month = ymOf(now);
+    var a = normalizeAssets(assets);
+    var ov = computeOverview(a, opts);
+
+    var accountMap = {};
+    a.assetAccounts.forEach(function (x) { if (x && x.id) accountMap[x.id] = x; });
+    var instrumentMap = {};
+    a.instruments.forEach(function (x) { if (x && x.id) instrumentMap[x.id] = x; });
+
+    function acctName(id) { return (accountMap[id] && accountMap[id].name) || id || ''; }
+    function confirmed(asOf) { return ymOf(asOf) === month; }
+
+    /* 单元级事实：余额 */
+    var unitFacts = a.assetUnits.map(function (u) {
+      if (!u) return null;
+      var conv = convertMinor(u.balanceMinor, u.currency, 'CNY', a.fxRates, now);
+      return {
+        kind: 'unit',
+        id: u.id || null,
+        account: acctName(u.accountId),
+        currency: u.currency || null,
+        balanceMinor: u.balanceMinor == null ? null : u.balanceMinor,
+        asOf: u.asOf || null,
+        confirmed: u.balanceMinor != null && confirmed(u.asOf),
+        valueCnyMinor: conv.status === 'missing_fx' ? null : conv.valueMinor,
+        valueStatus: conv.status
+      };
+    }).filter(Boolean);
+
+    /* 单元级事实：负债 */
+    var liabilityFacts = a.liabilities.map(function (l) {
+      if (!l) return null;
+      var conv = convertMinor(l.balanceMinor, l.currency, 'CNY', a.fxRates, now);
+      return {
+        kind: 'liability',
+        id: l.id || null,
+        name: l.name || '',
+        currency: l.currency || null,
+        balanceMinor: l.balanceMinor == null ? null : l.balanceMinor,
+        asOf: l.asOf || null,
+        termType: l.termType || null,
+        confirmed: l.balanceMinor != null && confirmed(l.asOf),
+        valueCnyMinor: conv.status === 'missing_fx' ? null : conv.valueMinor,
+        valueStatus: conv.status
+      };
+    }).filter(Boolean);
+
+    /* 单元级事实：持仓估值 */
+    var holdingFacts = a.holdings.map(function (h) {
+      if (!h) return null;
+      var ins = instrumentMap[h.instrumentId];
+      var q = findQuote(a.quotes, h.instrumentId, now);
+      var minor = q ? mulMinor(h.quantity, q.priceMinor) : null;
+      var conv = minor == null ? { valueMinor: null, status: 'missing_quote' }
+        : convertMinor(minor, q.currency, 'CNY', a.fxRates, now);
+      return {
+        kind: 'holding',
+        id: h.id || null,
+        symbol: ins ? ins.symbol : null,
+        instrumentId: h.instrumentId || null,
+        accountId: h.accountId || null,
+        account: acctName(h.accountId),
+        quantity: h.quantity || null,
+        priceMinor: q ? q.priceMinor : null,
+        priceCurrency: q ? q.currency : null,
+        priceDate: q ? q.priceDate : null,
+        priceStatus: q ? q.status : 'missing_quote',
+        asOf: h.asOf || null,
+        valueMinor: minor,
+        valueCnyMinor: conv.status === 'missing_fx' ? null : conv.valueMinor,
+        valueStatus: conv.status
+      };
+    }).filter(Boolean);
+
+    /* 阻塞码聚合：每条 = 一类待核对项 */
+    var seen = {};
+    var items = [];
+    ov.blockers.forEach(function (b) {
+      var key = b.code + '|' + b.detail;
+      if (seen[key]) { seen[key].count += 1; return; }
+      seen[key] = { code: b.code, detail: b.detail || '', count: 1 };
+      items.push(seen[key]);
+    });
+
+    var counts = {
+      units: unitFacts.length,
+      unitsConfirmed: unitFacts.filter(function (u) { return u.confirmed; }).length,
+      liabilities: liabilityFacts.length,
+      liabilitiesConfirmed: liabilityFacts.filter(function (l) { return l.confirmed; }).length,
+      holdings: holdingFacts.length,
+      holdingsPriced: holdingFacts.filter(function (h) { return h.valueMinor != null; }).length
+    };
+
+    return {
+      month: month,
+      asOf: now,
+      valuationStatus: ov.valuationStatus,
+      canComplete: ov.valuationStatus === 'formal',
+      items: items,
+      counts: counts,
+      facts: {
+        units: unitFacts,
+        liabilities: liabilityFacts,
+        holdings: holdingFacts,
+        entitlements: ov.entitlements
+      }
+    };
+  }
+
+  // emergencyCoverageMonths(safetyMinor, avgNecessaryMinor) → 应急金覆盖月数。
+  //   安全储备 ÷ 月均必要支出，保留 1 位小数；无法估算（必要支出为 0/非法或储备未知）→ null。
+  function emergencyCoverageMonths(safetyMinor, avgNecessaryMinor) {
+    if (typeof safetyMinor !== 'number' || !isFinite(safetyMinor)) return null;
+    if (typeof avgNecessaryMinor !== 'number' || !isFinite(avgNecessaryMinor) || avgNecessaryMinor <= 0) return null;
+    return Math.round((safetyMinor / avgNecessaryMinor) * 10) / 10;
+  }
+
   return {
     CURRENCIES: CURRENCIES,
     POOLS: POOLS,
@@ -324,6 +453,8 @@
     findQuote: findQuote,
     emptyAssets: emptyAssets,
     normalizeAssets: normalizeAssets,
-    computeOverview: computeOverview
+    computeOverview: computeOverview,
+    computeCloseChecklist: computeCloseChecklist,
+    emergencyCoverageMonths: emergencyCoverageMonths
   };
 });

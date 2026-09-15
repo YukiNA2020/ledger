@@ -10,9 +10,11 @@
  *   - 每个迁移在单个事务内完成，失败整体回滚；
  *   - 表名沿用 ARCHITECTURE 的领域命名（portfolio_openings 对应前端领域集合 holdings）。
  *
- * 阶段边界：Phase 2 只建立「当前领域模型（§5.1/§5.2）+ 现金流（§5.4）」需要的表。
- * §5.3 的月结、快照、风险评估、目标配置与决策表由 Phase 5/6 通过新增迁移建立，
- * 不在本阶段预建空表（避免猜测后续阶段尚未冻结的语义）。
+ * 阶段边界：
+ *   - v1（Phase 2）建立「当前领域模型（§5.1/§5.2）+ 现金流（§5.4）」需要的表；
+ *   - v2（Phase 3）新增 §5.3 中月度结账需要的两张表（monthly_closes / close_snapshots）。
+ *     风险评估、目标配置与决策表仍留给 Phase 5/6，不预建空表（避免猜测未冻结的语义）。
+ *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
 'use strict';
 
@@ -242,6 +244,45 @@ const MIGRATIONS = [
         CREATE INDEX idx_txns_mapped            ON txns(mapped_to);
         CREATE INDEX idx_categories_parent      ON categories(parent_id);
         CREATE INDEX idx_dedup_candidates_state ON dedup_candidates(status);
+      `);
+    }
+  },
+  {
+    version: 2,
+    name: 'phase3-close-schema',
+    up(db) {
+      /* ---------------- §5.3 月度结账与快照（Phase 3） ---------------- */
+
+      /* 一次月度结账：month 唯一（重复结账为更新同月状态并追加新快照）；
+       * status 只有 formal/estimate 两种 —— 缺项未补齐时允许保存 estimate 快照，
+       * 但绝不允许标成 formal（ACCEPTANCE S3.3）。 */
+      db.exec(`
+        CREATE TABLE monthly_closes (
+          id           TEXT PRIMARY KEY,
+          month        TEXT NOT NULL UNIQUE
+                       CHECK (month GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'),
+          status       TEXT NOT NULL CHECK (status IN ('formal','estimate')),
+          blockers_json TEXT,
+          summary_json TEXT,
+          completed_at TEXT NOT NULL,
+          data_cutoff  TEXT NOT NULL
+        );
+
+        /* 结账历史快照：完整保存当时的资产事实与总览口径，payload_hash 用于完整性核对。
+         * §5.3 只要求存 hash；这里同时落 payload_json，使"每个金额可追溯到余额/估值"
+         * 不依赖后续阶段就能成立（快照自包含、离线可审计）。 */
+        CREATE TABLE close_snapshots (
+          id            TEXT PRIMARY KEY,
+          close_id      TEXT REFERENCES monthly_closes(id) ON DELETE CASCADE,
+          month         TEXT NOT NULL,
+          captured_at   TEXT NOT NULL,
+          snapshot_type TEXT NOT NULL DEFAULT 'monthly_close',
+          payload_json  TEXT NOT NULL,
+          payload_hash  TEXT NOT NULL
+        );
+
+        CREATE INDEX idx_close_snapshots_close ON close_snapshots(close_id);
+        CREATE INDEX idx_close_snapshots_month ON close_snapshots(month);
       `);
     }
   }
