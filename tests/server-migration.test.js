@@ -11,22 +11,42 @@ const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1+v2：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1+v2+v3：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 2);
+    assert.strictEqual(rows.length, 3);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
     assert.strictEqual(rows[1].version, 2);
     assert.strictEqual(rows[1].name, 'phase3-close-schema');
+    assert.strictEqual(rows[2].version, 3);
+    assert.strictEqual(rows[2].name, 'phase3-asset-transfers');
+    assert.strictEqual(tableExists(ctx.db, 'asset_transfers'), true, 'v3 应建立换汇事实表');
 
     const missing = REQUIRED_TABLES.filter((t) => !tableExists(ctx.db, t));
     assert.deepStrictEqual(missing, [], '缺少表：' + missing.join(', '));
   } finally {
     ctx.close();
+  }
+});
+
+test('已发布 v2 库前向迁移到 v3：保留账户与余额并新增换汇表', () => {
+  const db = openDatabase(':memory:');
+  try {
+    M.migrate(db, { list: M.MIGRATIONS.slice(0, 2) });
+    db.exec("INSERT INTO institutions (id,name,kind,created_at) VALUES ('i1','香港汇丰','bank','2026-09-15')");
+    db.exec("INSERT INTO asset_accounts (id,institution_id,name,kind,pool,status) VALUES ('a1','i1','多币种账户','deposit','safety','active')");
+    db.exec("INSERT INTO account_units (id,account_id,currency,balance_minor,as_of) VALUES ('u1','a1','HKD',123456,'2026-09-15')");
+
+    const migrated = M.migrate(db);
+    assert.deepStrictEqual(migrated.applied, [3]);
+    assert.strictEqual(tableExists(db, 'asset_transfers'), true);
+    assert.strictEqual(get(db, 'SELECT balance_minor FROM account_units WHERE id = ?', ['u1']).balance_minor, 123456);
+  } finally {
+    db.close();
   }
 });
 
@@ -64,8 +84,9 @@ test('迁移失败时整体回滚：不留下半个 schema，也不写入版本�
     const brokenList = [
       { version: 1, name: 'phase2-initial-schema', up: M.MIGRATIONS[0].up },
       { version: 2, name: 'phase3-close-schema', up: M.MIGRATIONS[1].up },
+      { version: 3, name: 'phase3-asset-transfers', up: M.MIGRATIONS[2].up },
       {
-        version: 3,
+        version: 4,
         name: 'broken-migration',
         up(db) {
           db.exec('CREATE TABLE probe_ok (id TEXT PRIMARY KEY)');

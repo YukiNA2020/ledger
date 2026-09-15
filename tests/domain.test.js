@@ -150,10 +150,10 @@ test('findQuote 取最近价格日并标记过期', () => {
 
 /* ---------------------- 空集合与归一化 ---------------------- */
 
-test('emptyAssets 提供 8 个 v3 空集合', () => {
+test('emptyAssets 提供 9 个 v3 空集合', () => {
   const a = Domain.emptyAssets();
   assert.strictEqual(a.schemaVersion, 1);
-  ['assetAccounts', 'assetUnits', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates']
+  ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates']
     .forEach(k => assert.deepStrictEqual(a[k], [], k));
 });
 

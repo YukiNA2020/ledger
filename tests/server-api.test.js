@@ -19,6 +19,7 @@ const api = require('../server/api');
 const config = require('../server/config');
 const B = require('../server/backup');
 const R = require('../server/repository');
+const M = require('../server/migrations');
 const Domain = require('../js/domain.js');
 const { setup, loadFixtureState } = require('./server-helpers');
 
@@ -114,7 +115,7 @@ test('S2.2 health 只暴露 loopback 策略：绑定 127.0.0.1、禁 CORS、写�
     assert.strictEqual(res.json.policy.writesRequireToken, true);
     assert.strictEqual(res.json.policy.cors, 'disabled');
     assert.strictEqual(res.json.policy.cloudAi, false);
-    assert.strictEqual(res.json.latestSchemaVersion, 2);
+    assert.strictEqual(res.json.latestSchemaVersion, M.LATEST_VERSION);
   } finally {
     await srv.close();
     ctx.close();
@@ -219,7 +220,7 @@ test('S2.1 写回的数据可被 HTTP 直读，且与写入内容逐字段一致
     });
     assert.strictEqual(put.status, 200);
     assert.strictEqual(put.json.ok, true);
-    assert.strictEqual(put.json.schemaVersion, 2);
+    assert.strictEqual(put.json.schemaVersion, M.LATEST_VERSION);
 
     const get = await request(srv.port, 'GET', '/api/v1/state');
     assert.strictEqual(get.status, 200);
@@ -479,7 +480,7 @@ test('恢复接口：非法文件名 400，合法但校验失败 409，成功则
     assert.strictEqual(ok.status, 200);
     assert.strictEqual(ok.json.restoredFrom, good.name);
     assert.match(ok.json.preRestoreBackup, /-pre-restore\.db$/, '恢复前必须先备份当前库');
-    assert.strictEqual(ok.json.schemaVersion, 2);
+    assert.strictEqual(ok.json.schemaVersion, M.LATEST_VERSION);
 
     // api.js 会用切换后的新连接继续服务
     ctx.db = R.readState ? ctx.db : ctx.db;

@@ -23,7 +23,7 @@
 
 - `server/main.js`：启动入口（配置解析、单实例锁、迁移、每日备份、随机 session token、仅 127.0.0.1 监听、优雅退出），并提供 `--self-check` / `--migrate-only` / `--print-config`；
 - `server/api.js`：`/api/v1` 与静态托管；HTML 注入 session token，写接口校验 token + Origin + Content-Type，无 CORS、无预检；
-- `server/migrations.js` / `server/db.js` / `server/repository.js`：SQLite Schema、连接与事务助手、八集合读写；
+- `server/migrations.js` / `server/db.js` / `server/repository.js`：SQLite Schema、连接与事务助手、九类资产事实集合读写；
 - `server/backup.js`：`VACUUM INTO` 快照、校验、原子替换、30 份保留、恢复与回滚（见 §13.2）；
 - `server/keychain.js` / `server/login-item.js`：Keychain 适配器（暂只用探测）与 LaunchAgent 渲染/安装/卸载；
 - `js/store.js`：前端存储门面。API 模式完全不触碰 IndexedDB；服务不可达时只读降级，绝不双写（见 §13.3）；
@@ -107,6 +107,7 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 - `institutions(id, name, kind)`：银行、券商、政府账户机构。
 - `accounts(id, institution_id, name, kind, pool, status)`。
 - `account_units(id, account_id, currency, balance_minor, as_of, source_type)`：币种子账户或明确余额单元。
+- `asset_transfers(id, from_unit_id, to_unit_id, from_currency, to_currency, from_amount_minor, to_amount_minor, occurred_on, source_type)`：换汇资产转移；两端事实独立保存，不进入现金流收支。
 - `liabilities(id, account_id, currency, balance_minor, due_date, term_type, as_of)`。
 - `entitlements(id, kind, jurisdiction, status, balance_minor?, valuation_type, as_of, source_ref)`。
 
@@ -155,6 +156,8 @@ GET    /api/v1/overview
 GET    /api/v1/institutions
 POST   /api/v1/accounts
 POST   /api/v1/account-units
+GET    /api/v1/asset-transfers
+POST   /api/v1/asset-transfers
 POST   /api/v1/liabilities
 POST   /api/v1/entitlements
 GET    /api/v1/holdings

@@ -13,6 +13,7 @@
  * 阶段边界：
  *   - v1（Phase 2）建立「当前领域模型（§5.1/§5.2）+ 现金流（§5.4）」需要的表；
  *   - v2（Phase 3）新增 §5.3 中月度结账需要的两张表（monthly_closes / close_snapshots）。
+ *   - v3（Phase 3 S3.1 补全）新增多币种子账户换汇记录；不修改已发布的 v1/v2。
  *     风险评估、目标配置与决策表仍留给 Phase 5/6，不预建空表（避免猜测未冻结的语义）。
  *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
@@ -283,6 +284,34 @@ const MIGRATIONS = [
 
         CREATE INDEX idx_close_snapshots_close ON close_snapshots(close_id);
         CREATE INDEX idx_close_snapshots_month ON close_snapshots(month);
+      `);
+    }
+  },
+  {
+    version: 3,
+    name: 'phase3-asset-transfers',
+    up(db) {
+      /* S3.1：换汇是两个币种子账户之间的资产转移，不属于现金流收入/支出。
+       * 两端金额和币种都固化在记录中，避免后来修改子账户币种时破坏历史审计。 */
+      db.exec(`
+        CREATE TABLE asset_transfers (
+          id                  TEXT PRIMARY KEY,
+          from_unit_id        TEXT NOT NULL REFERENCES account_units(id) ON DELETE RESTRICT,
+          to_unit_id          TEXT NOT NULL REFERENCES account_units(id) ON DELETE RESTRICT,
+          from_currency       TEXT NOT NULL CHECK (from_currency IN ('CNY','HKD','USD')),
+          to_currency         TEXT NOT NULL CHECK (to_currency IN ('CNY','HKD','USD')),
+          from_amount_minor   INTEGER NOT NULL CHECK (from_amount_minor > 0),
+          to_amount_minor     INTEGER NOT NULL CHECK (to_amount_minor > 0),
+          occurred_on         TEXT NOT NULL,
+          source_type         TEXT NOT NULL DEFAULT 'manual',
+          note                TEXT,
+          created_at          TEXT NOT NULL,
+          CHECK (from_unit_id <> to_unit_id),
+          CHECK (from_currency <> to_currency)
+        );
+
+        CREATE INDEX idx_asset_transfers_date ON asset_transfers(occurred_on);
+        CREATE INDEX idx_asset_transfers_units ON asset_transfers(from_unit_id, to_unit_id);
       `);
     }
   }

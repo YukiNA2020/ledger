@@ -20,7 +20,7 @@
   var RISK_CLASSES = ['cash', 'fixed_income', 'broad_equity', 'theme_equity', 'stock', 'other'];
   var MAX_STALE_DAYS = 5;                        // A-004：行情与汇率默认最多 5 个自然日陈旧
   var MAX_SCALE = 8;                             // 定点十进制最大小数位
-  var ASSET_KEYS = ['assetAccounts', 'assetUnits', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
+  var ASSET_KEYS = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
 
   /* ------------------------------ 定点十进制 ------------------------------ */
 
