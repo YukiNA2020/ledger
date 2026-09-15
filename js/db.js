@@ -175,6 +175,19 @@
   function hasMemoryKey() { return !!_key; }
   function dropMemoryKey() { _key = null; }
 
+  /* Phase 2 新增（纯增量，不改变既有行为）：本地服务接管存储后，
+   * 交易明细由前端加密后再提交给本地 API，保证磁盘上仍只有密文。
+   * 密钥依旧只存在于内存，不落盘、不外传。 */
+  function encryptTxns(obj) {
+    if (!_key) return Promise.reject(new Error('locked'));
+    return encryptJSON(_key, obj);
+  }
+
+  function decryptTxns(blob) {
+    if (!_key) return Promise.reject(new Error('locked'));
+    return decryptJSON(_key, blob);
+  }
+
   /* ---------------------- 状态读写 ---------------------- */
 
   // 读取全部原始存储（不做解密）：{accounts, categories, txns, settings, assets}
@@ -220,6 +233,8 @@
     decryptJSON: decryptJSON,
     hasMemoryKey: hasMemoryKey,
     dropMemoryKey: dropMemoryKey,
+    encryptTxns: encryptTxns,
+    decryptTxns: decryptTxns,
     usingFallback: function () { return useFallback; }
   };
 });

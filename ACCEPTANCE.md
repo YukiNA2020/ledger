@@ -95,6 +95,17 @@ Phase 1 退出证据：新增领域单测、旧 99 项全绿、浏览器 wiring 
 
 Phase 2 退出证据：临时数据库测试、迁移测试、事务回滚、重复启动、非法 Origin、备份恢复和重启持久化全部通过。
 
+**验收结论（2026-09-14，`v2.2.1-phase2`）：**
+
+| 场景 | 结论 | 证据 |
+|---|---|---|
+| S2.1 单一事实源 | ✅ 通过 | `tests/server-repository.test.js` 14/14、`tests/server-api.test.js`、wiring C6（HTTP 直读一致 + IndexedDB 读到 0 条） |
+| S2.2 loopback 安全 | ✅ 通过 | `tests/server-api.test.js`：只绑 127.0.0.1、无 CORS、预检 405、缺令牌 401、错 Origin 403、错 Content-Type 415、被拒写入零副作用、只读可用 |
+| S2.3 启动与单实例 | ⚠️ 部分验证 | 单实例锁、日志、`install/uninstall/status` 脚本已实现并脚本级验证；**"登录 macOS 后自动启动 + 浏览器打开产品"需用户在本人终端执行 `scripts/install-login-item.sh` 并重启 Mac 确认**（写 `~/Library/LaunchAgents` 与 `launchctl bootstrap` 属系统级操作，未代为执行） |
+| S2.4 备份恢复 | ✅ 通过 | `tests/server-backup.test.js` 12/12、`tests/server-restore.test.js` 8/8、清空先留 `pre-clear` 备份、恢复失败 409 且当前库不变 |
+
+S2.3 的手工确认步骤：`./scripts/install-login-item.sh` → 重启 Mac → 确认只有一个服务实例（`pgrep -fl server/main.js`）、浏览器已打开产品、日志在数据目录 `logs/server.log`；`./scripts/uninstall-login-item.sh` 可随时卸载。
+
 ## 5. Phase 3｜账户、负债与月结
 
 ### S3.1 机构—账户—币种子账户

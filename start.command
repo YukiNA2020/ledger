@@ -1,23 +1,29 @@
 #!/bin/bash
-# 小账本一键启动：本地静态服务 + 打开浏览器（macOS 双击运行）
-# 隐私说明：仅在本机启动 http 服务加载静态文件，应用本身零外联网络请求。
+# 小账本一键启动（Phase 2）：启动本地服务（仅 127.0.0.1）并打开浏览器
+#
+# 事实源：SQLite，位于 ~/Library/Application Support/Ledger/ledger.db
+# 长期使用请安装登录项（登录后自动启动）：scripts/install-login-item.sh
+# 本脚本把服务跑在前台，Ctrl+C 即停止；日志同时写入数据目录的 logs/server.log。
 
+set -u
 cd "$(dirname "$0")"
 
-PORT=8421
-# 端口被占用时（上次未正常退出）直接复用
-if ! lsof -i :$PORT -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "启动本地服务: http://localhost:$PORT"
-  python3 -m http.server $PORT >/dev/null 2>&1 &
-  SERVER_PID=$!
-  trap "kill $SERVER_PID 2>/dev/null" EXIT
-  sleep 1
-else
-  echo "复用已在运行的服务: http://localhost:$PORT"
-fi
+find_node() {
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /opt/homebrew/opt/node/bin/node "$(command -v node 2>/dev/null)"; do
+    if [ -n "${candidate:-}" ] && [ -x "$candidate" ] && "$candidate" -e "require('node:sqlite')" >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
-open "http://localhost:$PORT"
-echo ""
-echo "小账本已在浏览器打开。关闭此终端窗口即可停止本地服务。"
-echo "数据保存在浏览器 IndexedDB 中（与本终端无关）。"
-wait
+NODE_BIN="$(find_node)" || {
+  echo "未找到支持 node:sqlite 的 Node 运行时（需要 Node 22 以上）。"
+  echo "安装后重试，或直接指定：node server/main.js"
+  exit 1
+}
+
+echo "使用 Node：$NODE_BIN"
+echo "启动本地服务（仅监听 127.0.0.1）…"
+exec "$NODE_BIN" server/main.js "$@"

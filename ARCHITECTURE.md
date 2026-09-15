@@ -5,7 +5,9 @@
 
 ## 0. 文档性质与实现状态
 
-本文描述目标架构，不描述已经存在的能力。冻结时仓库仍是 v2 静态 PWA；尚无资产账户、持仓、SQLite、本地 API、自动行情、风险问卷或决策状态机实现。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
+本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
+
+截至 2026-09-14，Phase 1（资产领域基础）与 Phase 2（本地服务与 SQLite）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`。**尚无**行情 provider、风险问卷或决策状态机——这些属于 Phase 3 以后。
 
 ## 1. 架构原则
 
@@ -17,18 +19,20 @@
 
 ## 2. 当前系统
 
-当前 v2 是原生 HTML/CSS/JS 单页应用：
+当前是"本地服务 + 原生 HTML/CSS/JS 前端"的单机架构：
 
-- `js/core.js`：解析、去重、统计、预算、异常、退款、报销和周期账纯逻辑；
-- `js/db.js`：IndexedDB KV，整组保存 `accounts/categories/txns/settings`；
-- `js/app.js`：全量内存状态、页面渲染与交互；
-- `js/charts.js`：本地 SVG 图表；
-- `sw.js`：静态资源缓存；
-- `start.command`：启动静态服务器并打开浏览器。
+- `server/main.js`：启动入口（配置解析、单实例锁、迁移、每日备份、随机 session token、仅 127.0.0.1 监听、优雅退出），并提供 `--self-check` / `--migrate-only` / `--print-config`；
+- `server/api.js`：`/api/v1` 与静态托管；HTML 注入 session token，写接口校验 token + Origin + Content-Type，无 CORS、无预检；
+- `server/migrations.js` / `server/db.js` / `server/repository.js`：SQLite Schema、连接与事务助手、八集合读写；
+- `server/backup.js`：`VACUUM INTO` 快照、校验、原子替换、30 份保留、恢复与回滚（见 §13.2）；
+- `server/keychain.js` / `server/login-item.js`：Keychain 适配器（暂只用探测）与 LaunchAgent 渲染/安装/卸载；
+- `js/store.js`：前端存储门面。API 模式完全不触碰 IndexedDB；服务不可达时只读降级，绝不双写（见 §13.3）；
+- `js/core.js` / `js/domain.js` / `js/charts.js` / `js/app.js` / `js/db.js`：解析、去重、统计、领域模型、图表、界面；`js/db.js` 在 API 模式下只剩历史数据导出与只读降级用途；
+- `sw.js`：静态资源缓存（当前应用未注册 Service Worker，见 TEST.md 观察项）。
 
-可复用资产是已经由 Node 测试覆盖的纯逻辑和账单导入交互。限制包括：浏览器数据难以自动备份、API Key 无法安全保存、开机任务不稳定、KV Schema 不适合持仓与快照关系查询。
+可复用资产是已经由 Node 测试覆盖的纯逻辑和账单导入交互。已解决的限制：浏览器数据难以自动备份（现由服务端每日备份 + 30 份保留覆盖）、API Key 无法安全保存（现由 Keychain 适配器覆盖）、KV Schema 不适合持仓与快照关系查询（现由 SQLite 关系表覆盖）。
 
-当前已知差距还包括：v2 `start.command` 使用通用静态服务器，不等同于只监听 loopback、带写接口保护的目标本地服务；v2 应用锁属于历史能力，但用户已明确 v3 不需要二次登录。执行 Agent 不应把这两点误当成目标架构已经满足。
+仍未满足的目标架构能力：开机自动打开端到端、行情 provider、月度结账、规则引擎、决策状态机。
 
 ## 3. 目标系统
 
@@ -84,6 +88,8 @@ macOS 登录项
 - 统一执行超时、限流、缓存、重试和来源记录；
 - 不提供券商交易接口。
 
+Phase 2 已落地其中的接口版本前缀、事务/迁移/备份恢复与 Keychain 读取路径；限流、缓存、重试与行情调度属 Phase 4。未实现的写接口按资源边界返回 `501` 并说明所属阶段，而不是 `404`（见 `server/api.js` 的 `DEFERRED_WRITES`）。
+
 ### 4.3 Frontend
 
 - 首页资产决策台；
@@ -91,6 +97,8 @@ macOS 登录项
 - 所有异步请求显示 `loading/success/stale/error`；
 - 所有建议展示输入数据版本和计算版本；
 - 原记账和导入页面继续工作，逐步改为调用本地 API。
+
+Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止页面代码直接调用 `DB.loadRaw/saveAll`；这样"事实源在哪"只有一个判断点（见 §13.3）。
 
 ## 5. 核心数据模型
 
@@ -210,8 +218,9 @@ MVP 可配置一个免费主数据源和手动 provider。每次响应必须保�
 
 - SQLite 写事务完成后按节流策略创建版本备份，至少每日一份，保留最近 30 份。
 - 备份先写临时文件并校验，再原子替换目标文件。
+- 快照使用 SQLite 自身的 `VACUUM INTO`，产物自包含；不使用 `node:sqlite` 的在线 `backup()`（原因见 §13.2）。
 - JSON 导出包含 `schemaVersion/exportedAt/sourceVersion`。
-- 恢复前自动备份当前数据库；恢复在临时数据库校验完成后切换。
+- 恢复前自动备份当前数据库；恢复在临时数据库校验完成后切换；切换失败必须把原库放回原位。
 - 当前浏览器无真实数据，因此不开发 IndexedDB 历史迁移器；旧应用保留为代码回滚参考。
 
 迁移顺序必须是：建立新 Schema → 用虚构数据验证 → 创建空库备份 → 切换前端读取 → 切换单一写入 → 验证后才停止旧数据层。任何时刻不得长期保持 IndexedDB 与 SQLite 双向写入。Phase 2 开始前若发现真实旧数据，必须先补充一次性导出、校验、导入和回滚方案。
@@ -247,3 +256,28 @@ MVP 可配置一个免费主数据源和手动 provider。每次响应必须保�
 ## 13. 实施前技术门禁
 
 Phase 1 可以直接开始，前提是旧 99 项测试持续通过。Phase 2 在选定本地运行时前必须做一个只读技术验证，证明：SQLite 驱动可用、服务能只绑定 loopback、可创建单实例锁、可从 macOS Keychain 读取测试密钥、可安装和卸载登录启动项。验证不应写入真实财务数据或提交测试密钥。
+
+### 13.1 Phase 2 验证结论（2026-09-14，只读，未写入真实财务数据）
+
+运行时选定 **Node.js**（DECISIONS T-001），理由：`node:sqlite` 为内建模块、零外部依赖；`js/domain.js` 是 UMD 模块，服务端与浏览器可直接共用同一份领域代码（`server/api.js` 的 overview 即调用它），避免口径分叉。
+
+| 门禁项 | 验证方式 | 结论 |
+|---|---|---|
+| SQLite 驱动可用 | `node:sqlite` 的 `DatabaseSync` 建库、建表、读写、`integrity_check`、WAL/外键/`synchronous=FULL` | ✅ 可用 |
+| 只绑定 loopback | `server.listen(port, config.HOST)`，`config.HOST` 硬编码 `'127.0.0.1'`，不读环境变量、无改绑分支；实测非 loopback 不可达 | ✅ 通过 |
+| 单实例锁 | `wx` 独占创建锁文件并写入持有者 pid；启动时检测 pid 是否存活并清理陈锁；第二实例实测被拒 | ✅ 通过 |
+| Keychain 读取 | `server/keychain.js` 经 stdin（不进 argv）读取；`selfCheck()` 只探测可用性、不创建条目、不返回值 | ✅ 通过 |
+| 登录启动项 | `server/login-item.js` 渲染 plist → `plutil -lint` 校验 → 写文件；`install` 默认只写文件，`--activate` 才 `launchctl bootstrap`；`uninstall`/`status` 齐备 | ✅ 通过（未在验证中真正加载） |
+
+### 13.2 备份原语的实现约束（实测结论）
+
+- **不要用 `node:sqlite` 的在线 `backup()`**：实测在同一进程内第 1–2 次调用约 1ms，之后每次约 8 秒，且在本机测试运行器下会直接挂死。生产进程虽然每次写事务最多调用一次，但长期运行后每次保存都会出现秒级卡顿，不可接受。
+- **改用 SQLite 自身的 `VACUUM INTO`**：同步、结果确定、产物自包含（不带 `-wal/-shm`），实测稳定 0–1ms，且读的是含 WAL 未落盘内容的一致性视图。
+- **一致性前提**：单实例锁保证同一时刻只有一个写进程，且 `createBackup` 只在写事务之外调用（§9），因此快照期间不存在并发写入。若将来放开多写进程，必须重新评估该前提。
+- 校验（`integrity_check` + 必需表齐备 + schema 版本不高于已知版本）必须无副作用：只清理"本次打开新产生"的同伴文件，绝不删除调用前就存在的活跃库 `-wal`。
+
+### 13.3 事实源切换的落地方式（§9 的具体化）
+
+- 前端经 `js/store.js` 门面访问数据，**不做双向写入**；API 模式下完全不触碰 IndexedDB。
+- 服务不可达时进入**只读降级**：既有数据仍可查看与导出，但拒绝任何写入并显示显著横幅。宁可只读，也不允许两份数据分叉。
+- 判定依据：`GET /api/v1/health` 探活成功 **且** 页面能读到服务注入的 session token；缺任一条件即按只读处理。

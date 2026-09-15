@@ -1,12 +1,14 @@
 /* 小账本 app.js — 界面层：路由/渲染/交互 + 导入向导状态机
- * 依赖：core.js（纯逻辑）、db.js（存储+加密）、charts.js（SVG 图表）、domain.js（v3 资产领域）
- * 架构：内存数组是全量权威数据，每次变更全量写回 IndexedDB（个人量级 <2万条）。
+ * 依赖：core.js（纯逻辑）、store.js（存储门面：本地 API 优先 + 只读降级）、db.js（加密与旧存储）、
+ *       charts.js（SVG 图表）、domain.js（v3 资产领域）
+ * 架构：内存数组是全量权威数据，每次变更全量写回事实源（Phase 2 起为本地服务 SQLite）。
  * v3 Phase 1：home 为资产决策台（tplDashboard），原月度记账首页下沉为 cashflow 现金流页。
+ * v3 Phase 2：存储改由 store.js 统一分发；本地服务不可用时进入只读降级，不再写 IndexedDB。
  */
 (function () {
   'use strict';
-  var Core = window.Core, DB = window.DB, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.1.0-phase1';
+  var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
+  var APP_VERSION = '2.2.1-phase2';
 
   /* ================= 状态 ================= */
   var state = {
@@ -89,18 +91,35 @@
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
   }
   function ymLabel(ym) { return ym.slice(0, 4) + '年' + Number(ym.slice(5, 7)) + '月'; }
-  function save() {
+  function save(options) {
     // 锁开启但内存无密钥（不应发生）时拒绝明文降级落盘
     if (state.settings.lock && state.settings.lock.enabled && !DB.hasMemoryKey()) {
       toast('加密密钥不在内存，为防明文泄露已暂停保存，请刷新解锁', 'err');
       return Promise.reject(new Error('locked'));
     }
-    return DB.saveAll({
+    return Store.saveAll({
       accounts: state.accounts, categories: state.categories,
       txns: state.txns, settings: state.settings, assets: state.assets
+    }, options).then(function () {
+      return true; // 已确认落盘（S2：调用方据此决定是否提示成功/回滚乐观更新）
     }).catch(function (e) {
+      if (e && (e.code === 'readonly' || e.code === 'unreachable')) {
+        // 只读降级只提示一次，避免每次点击都刷屏
+        if (!readonlyAlerted) {
+          readonlyAlerted = true;
+          toast('本地服务未运行，当前为只读模式，本次改动未保存', 'err');
+        }
+        renderServiceBanner();
+        return false;
+      }
+      if (e && e.status === 401) {
+        // 服务重启后会话令牌轮换：页面里的旧令牌已失效，刷新拿新页面即可恢复
+        toast('会话令牌已失效（本地服务可能已重启），请刷新页面后重试', 'err');
+        return false;
+      }
       console.error(e);
       toast('数据保存失败：' + (e && e.message || e), 'err');
+      return false;
     });
   }
   function download(filename, content, mime) {
@@ -131,7 +150,7 @@
 
   /* ================= 启动 ================= */
   function init() {
-    DB.loadRaw().then(function (raw) {
+    Store.loadRaw().then(function (raw) {
       var firstRun = raw.accounts == null;
       state.accounts = raw.accounts || Core.defaultAccounts();
       state.categories = raw.categories || Core.defaultCategories();
@@ -151,6 +170,29 @@
       document.getElementById('view').innerHTML = '<div class="empty"><div class="e-icon">⚠️</div>数据加载失败：' +
         esc(e && e.message || e) + '<div class="small muted" style="margin-top:8px">请刷新重试</div></div>';
     });
+  }
+
+  /* Phase 2：事实源状态横幅。本地服务不可用时明确告知「只读」，不静默降级。 */
+  var readonlyAlerted = false;
+  function renderServiceBanner() {
+    var el = $('#service-banner');
+    if (!el) return;
+    var info = Store.info();
+    if (info.mode === Store.MODE_LOCAL) {
+      el.className = 'service-banner warn';
+      el.innerHTML = '<b>本地服务未运行 · 只读模式</b>' +
+        '<div class="small">浏览器里的既有数据仍可查看和导出，但不会再被保存。' +
+        '启动本地服务后刷新即可恢复记账：在终端执行 <code>node server/main.js</code>，或双击 <code>start.command</code>。</div>';
+    } else if (info.mode === Store.MODE_API) {
+      el.className = 'service-banner ok';
+      el.innerHTML = '<b>本地服务已连接</b>' +
+        '<div class="small">事实源：SQLite · Schema v' + esc(String(info.schemaVersion == null ? '?' : info.schemaVersion)) + '</div>';
+      setTimeout(function () { el.classList.add('hidden'); }, 12000);
+    } else {
+      el.className = 'service-banner hidden';
+      return;
+    }
+    el.classList.remove('hidden');
   }
 
   function renderLockScreen() {
@@ -188,6 +230,7 @@
       try { navigator.serviceWorker.register('sw.js').catch(function () {}); } catch (e) { /* 忽略 */ }
     }
     runRecurringOnBoot();
+    renderServiceBanner();
     renderTabbar();
     route(location.hash.replace('#', '') || 'home');
     window.addEventListener('hashchange', function () {
@@ -663,28 +706,48 @@
     if (d.type !== 'transfer' && !d.categoryId) {
       toast('已记为「未分类」，可稍后在明细页批量归类', 'warn');
     }
-    if (state.editId) {
+    var editing = !!state.editId;
+    var before = null;   // 编辑前的快照，保存失败时回滚
+    var txn = null;      // 本次新增/编辑的交易对象
+    if (editing) {
       var t = state.txns.find(function (x) { return x.id === state.editId; });
       if (t) {
+        before = JSON.stringify(t);
+        txn = t;
         t.type = d.type; t.amount = cents;
         t.account = d.accountId; t.accountTo = d.type === 'transfer' ? d.accountToId : null;
         t.category = d.type === 'transfer' ? null : d.categoryId;
         t.date = d.date; t.time = d.time; t.merchant = d.merchant; t.note = d.note;
       }
-      toast('已修改');
     } else {
-      state.txns.push({
+      txn = {
         id: Core.newId('t'), date: d.date, time: d.time,
         type: d.type, amount: cents,
         account: d.accountId, accountTo: d.type === 'transfer' ? d.accountToId : null,
         category: d.type === 'transfer' ? null : d.categoryId,
         merchant: d.merchant, note: d.note,
         source: 'manual', rawId: '', status: ''
-      });
-      toast('已记一笔 ' + Core.fmtMoney(cents) + ' 元');
+      };
+      state.txns.push(txn);
     }
     state.addDraft = null; state.editId = null;
-    save();
+    // S2：保存确认落盘后才提示入账；失败则回滚本地乐观更新并重渲染，
+    // 保证界面与事实源一致（此前会同时出现"已记一笔"和"保存失败"，
+    // 且未落盘的交易一直挂在界面上，刷新后凭空消失）。
+    var rollback = function () {
+      if (before != null && txn) {
+        var restored = JSON.parse(before);
+        for (var k in restored) txn[k] = restored[k];
+      } else if (txn) {
+        var i = state.txns.indexOf(txn);
+        if (i >= 0) state.txns.splice(i, 1);
+      }
+      render();
+    };
+    save().then(function (ok) {
+      if (ok) toast(editing ? '已修改' : '已记一笔 ' + Core.fmtMoney(cents) + ' 元');
+      else rollback();
+    }, rollback);
     nav('home');
   }
 
@@ -1941,14 +2004,31 @@
         (v3Count > 0 ? '、v3 资产数据 ' + v3Count + ' 条' : '') +
         '。<br><b>恢复将覆盖当前全部数据</b>，建议先导出当前数据备份。',
         '覆盖恢复', function () {
+          // S3：恢复是高风险覆盖写入，必须先在服务端强制留一份恢复前备份
+          // （不受 60 秒写后备份节流影响），确认成功后才覆盖；
+          // 保存失败则回滚到恢复前状态，界面与事实源保持一致。
+          var before = {
+            accounts: state.accounts, categories: state.categories, txns: state.txns,
+            settings: state.settings, assets: state.assets
+          };
           state.accounts = restored.accounts;
           state.categories = restored.categories;
           state.txns = restored.txns;
           state.settings = restored.settings;
           state.assets = Domain.normalizeAssets(restored.assets); // v1 备份 → 空集合（S1.1）
-          save().then(function () {
-            toast('恢复完成');
-            route('home');
+          save({ forceBackup: true }).then(function (ok) {
+            if (ok) {
+              toast('恢复完成');
+              route('home');
+            } else {
+              state.accounts = before.accounts;
+              state.categories = before.categories;
+              state.txns = before.txns;
+              state.settings = before.settings;
+              state.assets = before.assets;
+              toast('恢复未完成，当前数据保持不变', 'err');
+              render();
+            }
           });
         }, true);
     });
@@ -1963,17 +2043,25 @@
 
   function clearGo() {
     if (($('#clr-input') || {}).value !== '清空') { toast('请输入"清空"二字以确认', 'warn'); return; }
-    DB.clearAll().then(function () {
+    // 清空走服务端 DELETE /state：服务端会先强制留一份 pre-clear 备份再清空。
+    // 不再本地清 IndexedDB + 全量写空状态——那条路径绕过了 pre-clear 备份，
+    // 且在 API 模式下写空状态只受节流备份保护（S3 同类问题）。
+    Store.clearAll().then(function () {
       state.accounts = Core.defaultAccounts();
       state.categories = Core.defaultCategories();
       state.txns = [];
       state.settings = Core.defaultSettings();
       state.assets = Domain.emptyAssets();
-      return save();
-    }).then(function () {
       closeSheet();
       toast('数据已清空，已恢复初始状态');
       route('home');
+    }).catch(function (e) {
+      if (e && e.code === 'readonly') {
+        renderServiceBanner();
+        toast('本地服务未运行，当前为只读模式，已拒绝清空', 'err');
+      } else {
+        toast('清空未完成：' + (e && e.message || e), 'err');
+      }
     });
   }
 

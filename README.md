@@ -6,7 +6,8 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 
 - 已完成：原小账本 `v2.0.0-rc.3`，包含手动记账、多源账单导入、跨源核对、预算和消费体检等能力。
 - **v3 Phase 1「资产领域基础」已完成并验收（2026-09-14，`v2.1.0-phase1`）**：资产领域模型与 CNY/HKD/USD 折算聚合（`js/domain.js`）、首页资产决策台（空状态/估算口径/正式口径）、原首页下沉为现金流页、备份 Schema v2（旧 v1 备份仍可恢复）。
-- 当前实现仍是浏览器 IndexedDB；下一阶段 Phase 2 将引入 Mac 本地服务与 SQLite。
+- **v3 Phase 2「本地服务与 SQLite」已完成并验收（2026-09-14，`v2.2.1-phase2`）**：只监听 `127.0.0.1` 的本地服务与 `/api/v1`、SQLite 事实源（迁移器 + repository）、本地版本备份与恢复（每日 ≥1 份、保留 30 份、覆盖前强制备份）、macOS 登录启动脚本、Keychain 适配器、前端存储门面 `js/store.js`。补充验收发现的三个阻塞缺陷（SW 旧令牌、保存失败误报成功、恢复前无备份）已修复。
+- SQLite 已是唯一事实源；IndexedDB 不再承担 v3 事实源，服务不可达时前端进入只读降级，不做双写。
 - 本轮不从零重写：复用 `js/core.js` 中已经验证的解析、统计和账务口径。
 - 本仓库中的 v3 文档是交给后续执行 Agent 的唯一实施依据；下一阶段入口见 [NEXT_AGENT.md](./NEXT_AGENT.md)。
 
@@ -49,33 +50,44 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 
 ## 当前运行方式
 
-过渡阶段仍可运行原静态应用。`start.command` 是保留的 v2 启动方式，不代表 v3 的本地服务、安全或自动刷新已经实现：
+Phase 2 起由本地服务托管前端与数据，只监听 `127.0.0.1`，SQLite 为唯一事实源：
 
 ```bash
 cd ledger
-./start.command
+node server/main.js        # 或双击 start.command
 ```
 
-或：
+服务启动后会打开 `http://127.0.0.1:8421/`。常用选项：
 
 ```bash
-cd ledger
-python3 -m http.server 8421 --bind 127.0.0.1
+node server/main.js --help              # 全部选项
+node server/main.js --port 8421         # 改端口（仍只绑定 127.0.0.1）
+node server/main.js --data-dir DIR      # 改数据目录（默认 ~/Library/Application Support/Ledger）
+node server/main.js --self-check        # 实施前技术门禁自检，不写入财务数据
+node server/main.js --no-open           # 不自动打开浏览器
+./scripts/install-login-item.sh         # 需要开机自启时（请在终端手动执行）
+./scripts/uninstall-login-item.sh       # 卸载登录项
 ```
 
-打开 `http://localhost:8421`。手动预览优先使用带 `--bind 127.0.0.1` 的命令；目标本地服务落地后，启动方式将迁移为 macOS 登录项。
+数据目录外置于仓库（默认 `~/Library/Application Support/Ledger`），包含 `ledger.db`、`backups/`（保留最近 30 份）、`logs/`、`server.lock` 与 `session-token`（权限 0600）。个人财务数据不会进入 Git 工作区。
+
+若本地服务未运行，页面仍可打开但进入**只读降级**——既有数据可查看和导出，但不会保存新内容，页面顶部会显示横幅说明如何恢复。
+
+> `python3 -m http.server` 的旧静态预览方式已不再适用：离开本地服务就没有可写的事实源，且缺少写接口保护。
 
 ## 测试
 
 ```bash
 cd ledger
-node --test          # 133 项（2026-09-14 基线）
-python3 -m http.server 8421 --bind 127.0.0.1
-# 浏览器接线验收：http://127.0.0.1:8421/tests/app-wiring.html
+node --test          # 202 项（2026-09-14 基线）
+
+# 浏览器接线验收必须先由本地服务托管，并使用临时数据目录：
+node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
+# 打开 http://127.0.0.1:8499/tests/app-wiring.html
 ```
 
-开发要求与门禁见 [AGENTS.md](./AGENTS.md)，测试证据见 [TEST.md](./TEST.md)。
+开发要求与门禁见 [AGENTS.md](./AGENTS.md)，测试证据与已修复缺陷见 [TEST.md](./TEST.md)。
 
 ## 下一步
 
-Phase 1 已完成。由执行 Agent 按 [ROADMAP.md](./ROADMAP.md) 实施 Phase 2「本地服务与 SQLite」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)。开始编码前必须先完成架构只读技术验证、阅读 [DECISIONS.md](./DECISIONS.md) 和 [ACCEPTANCE.md](./ACCEPTANCE.md)，确认基线测试、改动边界与回滚点；不得把多个 Phase 合并成一次重写。
+Phase 2 已完成。由执行 Agent 按 [ROADMAP.md](./ROADMAP.md) 实施 Phase 3「账户、负债与月度结账」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)。开始编码前必须先阅读 [DECISIONS.md](./DECISIONS.md) 与 [ACCEPTANCE.md](./ACCEPTANCE.md)，确认基线测试、改动边界与回滚点；不得把多个 Phase 合并成一次重写。

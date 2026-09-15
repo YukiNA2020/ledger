@@ -1,6 +1,11 @@
 /* 小账本应用布线验收 — 验证 index.html/app.js 的文件入口与交互布线
  * 覆盖：应用启动、导入向导文件选择、JSON 备份恢复确认、重复提交保护。
- * 只使用本文件内联的虚构数据；运行会重置本 origin 的账本测试数据。
+ *
+ * Phase 2 起本页必须由本地服务托管（http://127.0.0.1:<port>/tests/app-wiring.html）：
+ * SQLite 是唯一事实源，页面离开服务就没有可写的数据源，脚本会先做服务前置检查。
+ * 只使用本文件内联的虚构数据；运行前请用临时数据目录启动服务，避免触碰真实账本：
+ *   node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
+ * 运行会重置该临时数据目录里的账本测试数据。
  */
 (function () {
   'use strict';
@@ -36,16 +41,23 @@
     document.body.dataset.result = failed ? 'fail' : 'pass';
   }
 
+  // 轮询直到谓词为真。谓词可以是异步的：必须 await 结果再判断，
+  // 否则 Promise 对象本身恒为真值，会让调用方在写入落盘前就继续执行。
   function waitFor(fn, ms, label) {
+    var limit = ms || 5000;
     return new Promise(function (resolve, reject) {
       var t0 = Date.now();
-      (function attempt() {
-        var v;
-        try { v = fn(); } catch (e) { v = null; }
-        if (v) return resolve(v);
-        if (Date.now() - t0 > (ms || 5000)) return reject(new Error('等待超时：' + (label || '条件')));
+      function retryOrFail() {
+        if (Date.now() - t0 > limit) return reject(new Error('等待超时：' + (label || '条件')));
         setTimeout(attempt, 80);
-      })();
+      }
+      function attempt() {
+        Promise.resolve()
+          .then(fn)
+          .then(function (v) { if (v) resolve(v); else retryOrFail(); },
+                function () { retryOrFail(); });
+      }
+      attempt();
     });
   }
 
@@ -89,11 +101,32 @@
   }
 
   async function rawTxnCount() {
-    var raw = await DB.loadRaw();
+    var raw = await Store.loadRaw();
     return (raw.txns || []).length;
   }
 
+  // 直接问服务要一份事实源内容，用来证明"页面读到的就是 SQLite 里存的"（S2.1）
+  async function apiState() {
+    var res = await fetch('/api/v1/state', { headers: { Accept: 'application/json' } });
+    assert(res.ok, 'GET /api/v1/state 应返回 200，实际 ' + res.status);
+    return res.json();
+  }
+
   async function run() {
+    // C0 前置：页面必须由本地服务托管，且 SQLite 已成为唯一事实源（S2.1/S2.2 前提）
+    await check('本地服务可达且事实源为 SQLite', async function () {
+      var mode = await Store.detect(true);
+      equal(mode, 'api', 'Store 模式必须是 api（本页需由本地服务托管，而非 file:// 直开）');
+      var health = await fetch('/api/v1/health').then(function (r) { return r.json(); });
+      equal(health.policy.factSource, 'sqlite', '事实源必须是 sqlite');
+      equal(health.policy.host, '127.0.0.1', '只允许绑定 loopback');
+      equal(health.policy.writesRequireToken, true, '写请求必须要求会话令牌');
+      equal(health.policy.cors, 'disabled', '不得开放 CORS');
+      equal(health.policy.cloudAi, false, '不得接云端 AI');
+      assert(Store.readSessionToken(), '页面应拿到服务注入的会话令牌');
+      assert(!document.querySelector('#service-banner').classList.contains('warn'), '服务可达时不应显示只读降级横幅');
+    });
+
     // C1 应用启动：资产决策台空状态 + 现金流页可达（v3 Phase 1 首页重构）
     await check('应用启动渲染资产决策台空状态并可进入现金流页', async function () {
       await waitFor(function () { return document.querySelector('#tabbar [data-action="nav:home"]'); }, 8000, '底部导航');
@@ -130,14 +163,14 @@
       assert(document.querySelector('#sheet').textContent.indexOf('3 笔交易') >= 0, '确认弹层应显示交易数');
       clickAction('#confirm-ok');
       await waitFor(async function () { return (await rawTxnCount()) === 3; }, 5000, '恢复后交易数');
-      var raw = await DB.loadRaw();
+      var raw = await Store.loadRaw();
       equal(raw.txns.filter(function (t) { return t.id === 'w-3'; }).length, 1, '转账记录存在');
       equal(raw.accounts.length, 2, '备份账户数');
     });
 
     // C4 S1.1 旧状态兼容：v1 备份恢复后 v3 资产集合为空，决策台空状态正常
     await check('v1 备份恢复后资产集合初始化为空且决策台空状态', async function () {
-      var raw = await DB.loadRaw();
+      var raw = await Store.loadRaw();
       assert(raw.assets && raw.assets.schemaVersion === 1, '恢复后应写入空 v3 资产集合');
       equal(raw.assets.assetUnits.length, 0, '余额单元为空');
       equal(raw.assets.holdings.length, 0, '持仓为空');
@@ -207,9 +240,167 @@
       assert(document.querySelector('#view [data-action="nav:cashflow"]'), '决策台应保留现金流入口');
     });
 
+    // C6 S2.1 单一事实源：经应用写入的数据只能落在 SQLite，且 IndexedDB 不再被写入
+    await check('SQLite 是唯一事实源且 IndexedDB 未被双写', async function () {
+      var before = await Store.loadRaw();
+      var probeTxn = {
+        id: 'w-s2-1-probe', date: '2026-09-10', time: '10:00', type: 'expense', amount: 4321,
+        account: 'acc-s2-1', category: null, merchant: 'S2.1 探针', note: '', source: 'manual'
+      };
+      await Store.saveAll({
+        accounts: (before.accounts || []).concat([
+          { id: 'acc-s2-1', name: 'S2.1 探针账户', type: 'wechat', initialBalance: 0, order: 99 }
+        ]),
+        categories: before.categories || [],
+        txns: (before.txns || []).concat([probeTxn]),
+        settings: before.settings || {},
+        assets: before.assets
+      });
+
+      // 绕开页面路由，直接 HTTP 读 SQLite：写入内容必须已经落库
+      var state = await apiState();
+      equal((state.txns || []).filter(function (t) { return t.id === 'w-s2-1-probe'; }).length, 1,
+        'HTTP 直读 SQLite 应看到经应用写入的交易');
+      assert((state.accounts || []).some(function (a) { return a.id === 'acc-s2-1'; }),
+        'HTTP 直读 SQLite 应看到经应用新增的账户');
+      equal(state.assets.schemaVersion, 1, 'assets 必须带 schemaVersion（与前端 DB.loadRaw 形状一致）');
+
+      // 服务端复用同一份 js/domain.js 计算总览，口径必须与领域定义一致（ACCEPTANCE §2）
+      var overviewJson = await fetch('/api/v1/overview').then(function (r) { return r.json(); });
+      equal(overviewJson.netWorthMinor, 4380000, '服务端净资产口径');
+      equal(overviewJson.pools.investableMinor, 1080000, '服务端可投资口径');
+      equal(overviewJson.newFundsAvailableMinor, 520000, '服务端可新增资金口径');
+      equal(overviewJson.valuationStatus, 'formal', '完整性足够时应为正式口径');
+
+      // 关键反证：API 模式下 IndexedDB 不应再承担 v3 事实源（ARCHITECTURE §9 禁止双写）
+      var legacy = await DB.loadRaw();
+      equal((legacy.txns || []).length, 0, 'IndexedDB 不应被写入交易（无双写）');
+      equal((legacy.accounts || []).length, 0, 'IndexedDB 不应被写入账户（无双写）');
+    });
+
+    // C7 S2.2 写入门禁：缺令牌 / 错 Content-Type 的写请求被拒，只读能力不受影响
+    await check('非法写请求被拒绝且当前只读可用', async function () {
+      var before = await apiState();
+      var probeCount = (before.txns || []).filter(function (t) { return t.id === 'w-s2-1-probe'; }).length;
+      equal(probeCount, 1, '前置：S2.1 探针交易应已存在');
+
+      var noToken = await fetch('/api/v1/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state: { accounts: [], categories: [], txns: [], settings: {} } })
+      });
+      equal(noToken.status, 401, '缺少会话令牌的写请求应 401');
+
+      var noTokenBackup = await fetch('/api/v1/backups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+      equal(noTokenBackup.status, 401, '缺少会话令牌的手动备份应 401');
+
+      var wrongType = await fetch('/api/v1/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/plain', 'x-ledger-token': Store.readSessionToken() },
+        body: JSON.stringify({ state: { accounts: [], categories: [], txns: [], settings: {} } })
+      });
+      equal(wrongType.status, 415, '非 JSON 写请求应 415');
+
+      var after = await apiState();
+      equal((after.txns || []).length, (before.txns || []).length, '被拒写入不得改动交易');
+      equal((after.accounts || []).length, (before.accounts || []).length, '被拒写入不得改动账户');
+
+      // 只读路径不受门禁影响：GET 与页面渲染都还能用
+      var health = await fetch('/api/v1/health');
+      equal(health.status, 200, '只读健康检查仍应 200');
+      await waitFor(function () { return document.querySelector('#view .dash-net'); }, 5000, '只读页面仍可用');
+    });
+
+    // C9 S3 恢复前强制备份：UI 恢复必须先留 pre-import 备份，不受 60 秒写后备份节流限制。
+    // 修复前：恢复走普通全量 PUT，若 60 秒内刚写过数据，被覆盖的版本无备份可回滚。
+    await check('JSON 恢复前强制留 pre-import 备份（节流窗口内也可回滚）', async function () {
+      // 先做一次普通写入，把写后备份的节流窗口起点拉到"刚刚"
+      var before = await Store.loadRaw();
+      await Store.saveAll({
+        accounts: before.accounts, categories: before.categories,
+        txns: before.txns, settings: before.settings, assets: before.assets
+      });
+      var namesBefore = (await Store.listBackups()).items.map(function (b) { return b.name; });
+
+      clickAction('[data-action="nav:settings"]');
+      await waitFor(function () { return document.querySelector('#file-restore'); }, 5000, '恢复文件输入');
+      injectFile('#file-restore', makeBackupFile());
+      await waitFor(function () {
+        return document.querySelector('#sheet').textContent.indexOf('恢复备份') >= 0;
+      }, 5000, '恢复确认弹层');
+      clickAction('#confirm-ok');
+      await waitFor(async function () { return (await rawTxnCount()) === 3; }, 5000, '恢复后交易数');
+
+      // 覆盖前必须新增一份 pre-import 备份（同秒重复备份会被加 -N 后缀，避免互相覆盖）
+      var namesAfter = (await Store.listBackups()).items.map(function (b) { return b.name; });
+      var preImports = namesAfter.filter(function (n) { return /-pre-import(-\d+)?\.db$/.test(n); });
+      assert(preImports.length >= 1, '恢复覆盖前应强制留 pre-import 备份，实际列表：' + namesAfter.join(', '));
+      var fresh = preImports.filter(function (n) { return namesBefore.indexOf(n) < 0; });
+      assert(fresh.length >= 1, '本次恢复应产生新的 pre-import 备份');
+    });
+
+    // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
+    await check('清空账本经本地服务生效', async function () {
+      await Store.clearAll();
+      var state = await apiState();
+      equal((state.txns || []).length, 0, '清空后交易应为 0');
+      equal((state.accounts || []).length, 0, '清空后账户应为 0');
+      equal((state.assets.assetUnits || []).length, 0, '清空后余额单元应为 0');
+      // 清空属于高风险操作：服务端应先留一份 pre-clear 备份
+      var backups = await Store.listBackups();
+      assert((backups.items || []).some(function (b) { return /-pre-clear\.db$/.test(b.name); }),
+        '清空前应留一份 pre-clear 备份');
+    });
+
+    // C10 S2 保存失败回滚与只读降级：模拟本地服务中途停止后记账。
+    // 修复前：同时出现"已记一笔"和"保存失败"，未落盘交易挂在明细里，刷新后凭空消失，也不进入只读模式。
+    await check('服务中断时记账：不报已入账、回滚界面、进入只读降级', async function () {
+      var origFetch = window.fetch;
+      // 所有 /api/ 请求在网络层失败 = 本地服务进程已停止
+      window.fetch = function (url, init) {
+        if (String(url).indexOf('/api/') === 0) {
+          return Promise.reject(new TypeError('Failed to fetch'));
+        }
+        return origFetch(url, init);
+      };
+      try {
+        clickAction('[data-action="nav:add"]');
+        await waitFor(function () { return document.querySelector('#view .keypad'); }, 5000, '记一笔页面');
+        // 输入金额 12 并保存（账户默认选中第一个有效账户）
+        clickAction('[data-action="add:key"][data-key="1"]');
+        clickAction('[data-action="add:key"][data-key="2"]');
+        clickAction('[data-action="add:save"]');
+
+        await waitFor(function () {
+          return document.querySelector('#toast').textContent.indexOf('只读模式') >= 0;
+        }, 5000, '只读降级提示');
+        assert(document.querySelector('#toast').textContent.indexOf('已记一笔') < 0,
+          '保存失败时不得提示已入账');
+        var banner = document.querySelector('#service-banner');
+        assert(banner && banner.className.indexOf('warn') >= 0 && banner.className.indexOf('hidden') < 0,
+          '应显示只读降级横幅，实际 class=' + (banner && banner.className));
+
+        // 乐观更新必须被回滚：明细页不应出现这笔未落盘的交易
+        clickAction('[data-action="nav:list"]');
+        await waitFor(function () {
+          return document.querySelector('#view .txn-list') || document.querySelector('#view .empty');
+        }, 5000, '明细页');
+        assert(document.querySelector('#view').textContent.indexOf('12.00') < 0,
+          '未落盘的交易不得留在界面上');
+      } finally {
+        window.fetch = origFetch;
+        Store.resetDetection();
+      }
+      // 恢复网络后重新探测：应回到 api 模式（刷新页面即可恢复记账）
+      var mode = await Store.detect(true);
+      equal(mode, 'api', '服务恢复后应重新探测为 api 模式');
+    });
+
     render();
-    // 清理：恢复测试数据不影响后续人工使用
-    DB.clearAll().then(function () {});
   }
 
   run().catch(function (error) {

@@ -1,0 +1,803 @@
+/* 小账本 server/repository.js — SQLite repository（Phase 2）
+ *
+ * 职责：把前端的全量内存状态（旧账本四键 + v3 资产八集合）与 SQLite 正规表互相转换。
+ *
+ * 设计要点：
+ *  1. 单一写入者：所有写操作都在 transaction() 内完成全量替换，因此重复写入天然幂等，不会出现半新半旧。
+ *  2. 零数据丢失：每个集合只把「已建模的字段」写成真列，其余未知字段原样存入 extra_json；
+ *     读取时先还原因定字段、再合并 extra_json，未知字段不会丢。
+ *  3. 机构归一：领域模型的 assetAccounts.institution 是自由文本（如"香港汇丰"），
+ *     落库时按名称确定性派生 institutions 行并建立 institution_id 关联，读取时还原文本。
+ *  4. 加密交易：txns 若为密文对象（{enc:1,...}）则整体存入 service_meta，txns 表清空；
+ *     明文数组才拆成 txns 行。锁定时磁盘上不存在明文交易（保持既有 P0 承诺）。
+ *  5. 领域逻辑不复制：overview 由调用方传入 Domain.computeOverview 计算，repository 只负责取事实。
+ */
+'use strict';
+
+const crypto = require('node:crypto');
+const { transaction, all, get, run, tableExists } = require('./db');
+const Domain = require('../js/domain.js');
+
+// 资产集合的形状以前端 js/domain.js 为唯一来源（DECISIONS T-001：服务与浏览器共用同一份领域代码）。
+// 这里不复制键名与版本号：一旦前端调整集合结构，服务端读回形状自动跟随，不会静默分叉。
+const EMPTY_ASSETS = Domain.emptyAssets();
+const ASSETS_SCHEMA_VERSION = EMPTY_ASSETS.schemaVersion;
+const ASSET_KEYS = Object.keys(EMPTY_ASSETS).filter((k) => k !== 'schemaVersion');
+const LEGACY_KEYS = ['accounts', 'categories', 'txns', 'settings'];
+const TXNS_BLOB_META_KEY = 'txns_encrypted_blob';
+
+/* ------------------------------ 通用助手 ------------------------------ */
+
+const N = (v) => (v === undefined ? null : v);
+const STR = (v) => (v === undefined || v === null ? null : String(v));
+const NUM = (v) => {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+const BOOL = (v) => (v ? 1 : 0);
+
+function extraJson(obj, known) {
+  const extra = {};
+  Object.keys(obj || {}).forEach((k) => {
+    if (known.indexOf(k) === -1) extra[k] = obj[k];
+  });
+  return Object.keys(extra).length ? JSON.stringify(extra) : null;
+}
+
+function mergeExtra(row, target) {
+  if (row && row.extra_json) {
+    try {
+      const extra = JSON.parse(row.extra_json);
+      Object.keys(extra).forEach((k) => {
+        target[k] = extra[k];
+      });
+    } catch (_) {
+      // extra_json 损坏时不静默丢弃：读回失败由调用方在完整性检查中暴露
+    }
+  }
+  return target;
+}
+
+const KNOWN = {
+  assetAccounts: ['id', 'name', 'kind', 'pool', 'status', 'institution'],
+  assetUnits: ['id', 'accountId', 'currency', 'balanceMinor', 'asOf', 'sourceType'],
+  liabilities: ['id', 'name', 'currency', 'balanceMinor', 'dueDate', 'termType', 'asOf', 'accountId'],
+  entitlements: [
+    'id',
+    'name',
+    'kind',
+    'jurisdiction',
+    'status',
+    'balanceMinor',
+    'valuationType',
+    'asOf',
+    'sourceRef'
+  ],
+  instruments: [
+    'id',
+    'symbol',
+    'exchange',
+    'currency',
+    'name',
+    'instrumentType',
+    'assetClass',
+    'exposureMarket',
+    'classificationStatus'
+  ],
+  holdings: ['id', 'accountId', 'instrumentId', 'quantity', 'costMinor', 'asOf'],
+  quotes: ['instrumentId', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status'],
+  fxRates: ['base', 'quote', 'rateDecimal', 'rateDate', 'fetchedAt', 'provider', 'status'],
+  accounts: ['id', 'name', 'type', 'color', 'initialBalance', 'order', 'aliases', 'deleted'],
+  categories: ['id', 'type', 'name', 'icon', 'parent', 'keywords'],
+  txns: [
+    'id',
+    'date',
+    'time',
+    'type',
+    'amount',
+    'account',
+    'accountTo',
+    'category',
+    'merchant',
+    'note',
+    'source',
+    'rawId',
+    'status',
+    'mappedTo',
+    'refundFlag',
+    'transferHalf'
+  ]
+};
+
+function institutionIdFor(name) {
+  return 'inst-' + crypto.createHash('sha256').update(String(name)).digest('hex').slice(0, 16);
+}
+
+/* ------------------------------ 写入：机构与资产账户 ------------------------------ */
+
+function writeInstitutionsAndAccounts(db, list, ctx) {
+  const insStmt = db.prepare(
+    'INSERT INTO institutions (id, name, kind, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO NOTHING'
+  );
+  const findIns = db.prepare('SELECT id FROM institutions WHERE name = ?');
+  const accStmt = db.prepare(
+    `INSERT INTO asset_accounts (id, institution_id, name, kind, pool, status, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  const now = ctx.now;
+  (list || []).forEach((a) => {
+    if (!a || !a.id) return;
+    let institutionId = null;
+    const text = typeof a.institution === 'string' ? a.institution.trim() : '';
+    if (text) {
+      insStmt.run(institutionIdFor(text), text, STR(a.kind) || 'other', now);
+      const row = findIns.get(text);
+      institutionId = row ? row.id : null;
+    }
+    accStmt.run(
+      String(a.id),
+      institutionId,
+      STR(a.name) || '',
+      STR(a.kind) || 'other',
+      STR(a.pool) || 'safety',
+      STR(a.status) || 'active',
+      extraJson(a, KNOWN.assetAccounts)
+    );
+  });
+}
+
+function readAssetAccounts(db) {
+  const ins = {};
+  all(db, 'SELECT id, name FROM institutions').forEach((r) => {
+    ins[r.id] = r.name;
+  });
+  return all(db, 'SELECT * FROM asset_accounts ORDER BY rowid').map((row) => {
+    const out = { id: row.id, name: row.name, kind: row.kind, pool: row.pool, status: row.status };
+    if (row.institution_id && ins[row.institution_id]) out.institution = ins[row.institution_id];
+    return mergeExtra(row, out);
+  });
+}
+
+/* ------------------------------ 写入：其余资产集合 ------------------------------ */
+
+function writeAssetUnits(db, list) {
+  const st = db.prepare(
+    `INSERT INTO account_units (id, account_id, currency, balance_minor, as_of, source_type, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((u) => {
+    if (!u || !u.id) return;
+    st.run(
+      String(u.id),
+      String(u.accountId),
+      STR(u.currency) || 'CNY',
+      NUM(u.balanceMinor),
+      STR(u.asOf),
+      STR(u.sourceType),
+      extraJson(u, KNOWN.assetUnits)
+    );
+  });
+}
+
+function readAssetUnits(db) {
+  return all(db, 'SELECT * FROM account_units ORDER BY rowid').map((row) => {
+    const out = {
+      id: row.id,
+      accountId: row.account_id,
+      currency: row.currency,
+      balanceMinor: row.balance_minor,
+      asOf: row.as_of,
+      sourceType: row.source_type
+    };
+    return mergeExtra(row, out);
+  });
+}
+
+function writeLiabilities(db, list) {
+  const st = db.prepare(
+    `INSERT INTO liabilities (id, account_id, name, currency, balance_minor, due_date, term_type, as_of, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((l) => {
+    if (!l || !l.id) return;
+    st.run(
+      String(l.id),
+      l.accountId ? String(l.accountId) : null,
+      STR(l.name) || '',
+      STR(l.currency) || 'CNY',
+      NUM(l.balanceMinor),
+      STR(l.dueDate),
+      STR(l.termType),
+      STR(l.asOf),
+      extraJson(l, KNOWN.liabilities)
+    );
+  });
+}
+
+function readLiabilities(db) {
+  return all(db, 'SELECT * FROM liabilities ORDER BY rowid').map((row) => {
+    const out = {
+      id: row.id,
+      name: row.name,
+      currency: row.currency,
+      balanceMinor: row.balance_minor,
+      termType: row.term_type,
+      asOf: row.as_of
+    };
+    if (row.account_id) out.accountId = row.account_id;
+    if (row.due_date) out.dueDate = row.due_date;
+    return mergeExtra(row, out);
+  });
+}
+
+function writeEntitlements(db, list) {
+  const st = db.prepare(
+    `INSERT INTO entitlements (id, name, kind, jurisdiction, status, balance_minor, valuation_type, as_of, source_ref, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((e) => {
+    if (!e || !e.id) return;
+    st.run(
+      String(e.id),
+      STR(e.name) || '',
+      STR(e.kind) || '',
+      STR(e.jurisdiction),
+      STR(e.status),
+      NUM(e.balanceMinor),
+      STR(e.valuationType),
+      STR(e.asOf),
+      STR(e.sourceRef),
+      extraJson(e, KNOWN.entitlements)
+    );
+  });
+}
+
+function readEntitlements(db) {
+  return all(db, 'SELECT * FROM entitlements ORDER BY rowid').map((row) => {
+    const out = {
+      id: row.id,
+      name: row.name,
+      kind: row.kind,
+      balanceMinor: row.balance_minor,
+      asOf: row.as_of
+    };
+    if (row.jurisdiction) out.jurisdiction = row.jurisdiction;
+    if (row.status) out.status = row.status;
+    if (row.valuation_type) out.valuationType = row.valuation_type;
+    if (row.source_ref) out.sourceRef = row.source_ref;
+    return mergeExtra(row, out);
+  });
+}
+
+function writeInstruments(db, list) {
+  const st = db.prepare(
+    `INSERT INTO instruments (id, symbol, exchange, currency, name, instrument_type, asset_class, exposure_market, classification_status, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((i) => {
+    if (!i || !i.id) return;
+    st.run(
+      String(i.id),
+      STR(i.symbol) || '',
+      STR(i.exchange),
+      STR(i.currency) || 'CNY',
+      STR(i.name),
+      STR(i.instrumentType),
+      STR(i.assetClass),
+      STR(i.exposureMarket),
+      i.classificationStatus === 'confirmed' ? 'confirmed' : 'suggested',
+      extraJson(i, KNOWN.instruments)
+    );
+  });
+}
+
+function readInstruments(db) {
+  return all(db, 'SELECT * FROM instruments ORDER BY rowid').map((row) => {
+    const out = {
+      id: row.id,
+      symbol: row.symbol,
+      currency: row.currency,
+      classificationStatus: row.classification_status
+    };
+    if (row.exchange) out.exchange = row.exchange;
+    if (row.name) out.name = row.name;
+    if (row.instrument_type) out.instrumentType = row.instrument_type;
+    if (row.asset_class) out.assetClass = row.asset_class;
+    if (row.exposure_market) out.exposureMarket = row.exposure_market;
+    return mergeExtra(row, out);
+  });
+}
+
+function writeOpenings(db, list) {
+  const st = db.prepare(
+    `INSERT INTO portfolio_openings (id, account_id, instrument_id, quantity, cost_minor, as_of, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((h) => {
+    if (!h || !h.id) return;
+    st.run(
+      String(h.id),
+      String(h.accountId),
+      String(h.instrumentId),
+      STR(h.quantity) || '0',
+      NUM(h.costMinor),
+      STR(h.asOf),
+      extraJson(h, KNOWN.holdings)
+    );
+  });
+}
+
+function readOpenings(db) {
+  return all(db, 'SELECT * FROM portfolio_openings ORDER BY rowid').map((row) => {
+    const out = {
+      id: row.id,
+      accountId: row.account_id,
+      instrumentId: row.instrument_id,
+      quantity: row.quantity,
+      costMinor: row.cost_minor,
+      asOf: row.as_of
+    };
+    return mergeExtra(row, out);
+  });
+}
+
+function writeQuotes(db, list) {
+  const st = db.prepare(
+    `INSERT INTO quotes (instrument_id, price_minor, currency, price_date, fetched_at, provider, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((q) => {
+    if (!q || !q.instrumentId) return;
+    st.run(
+      String(q.instrumentId),
+      NUM(q.priceMinor),
+      STR(q.currency) || 'CNY',
+      STR(q.priceDate),
+      STR(q.fetchedAt),
+      STR(q.provider),
+      STR(q.status)
+    );
+  });
+}
+
+function readQuotes(db) {
+  return all(db, 'SELECT * FROM quotes ORDER BY rowid').map((row) => {
+    const out = {
+      instrumentId: row.instrument_id,
+      priceMinor: row.price_minor,
+      currency: row.currency
+    };
+    if (row.price_date != null) out.priceDate = row.price_date;
+    if (row.fetched_at != null) out.fetchedAt = row.fetched_at;
+    if (row.provider != null) out.provider = row.provider;
+    if (row.status != null) out.status = row.status;
+    return out;
+  });
+}
+
+function writeFxRates(db, list) {
+  const st = db.prepare(
+    `INSERT INTO fx_rates (base, "quote", rate_decimal, rate_date, fetched_at, provider, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((r) => {
+    if (!r || !r.base || !r.quote) return;
+    st.run(
+      String(r.base),
+      String(r.quote),
+      STR(r.rateDecimal) || '0',
+      STR(r.rateDate),
+      STR(r.fetchedAt),
+      STR(r.provider),
+      STR(r.status)
+    );
+  });
+}
+
+function readFxRates(db) {
+  return all(db, 'SELECT * FROM fx_rates ORDER BY rowid').map((row) => {
+    const out = { base: row.base, quote: row.quote, rateDecimal: row.rate_decimal };
+    if (row.rate_date != null) out.rateDate = row.rate_date;
+    if (row.fetched_at != null) out.fetchedAt = row.fetched_at;
+    if (row.provider != null) out.provider = row.provider;
+    if (row.status != null) out.status = row.status;
+    return out;
+  });
+}
+
+/* ------------------------------ 写入：旧账本四键 ------------------------------ */
+
+function writeAccounts(db, list) {
+  const st = db.prepare(
+    `INSERT INTO ledger_accounts (id, name, type, color, initial_balance_minor, order_index, aliases_json, deleted, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((a) => {
+    if (!a || !a.id) return;
+    st.run(
+      String(a.id),
+      STR(a.name),
+      STR(a.type),
+      STR(a.color),
+      NUM(a.initialBalance),
+      NUM(a.order),
+      Array.isArray(a.aliases) ? JSON.stringify(a.aliases) : null,
+      BOOL(a.deleted),
+      extraJson(a, KNOWN.accounts)
+    );
+  });
+}
+
+function readAccounts(db) {
+  return all(db, 'SELECT * FROM ledger_accounts ORDER BY rowid').map((row) => {
+    const out = { id: row.id };
+    if (row.name != null) out.name = row.name;
+    if (row.type != null) out.type = row.type;
+    if (row.color != null) out.color = row.color;
+    if (row.initial_balance_minor != null) out.initialBalance = row.initial_balance_minor;
+    if (row.order_index != null) out.order = row.order_index;
+    if (row.aliases_json != null) {
+      try {
+        out.aliases = JSON.parse(row.aliases_json);
+      } catch (_) {
+        /* 损坏的 aliases 不静默改写为其他值 */
+      }
+    }
+    if (row.deleted) out.deleted = true;
+    return mergeExtra(row, out);
+  });
+}
+
+function writeCategories(db, list) {
+  const st = db.prepare(
+    `INSERT INTO categories (id, type, name, icon, parent_id, keywords_json, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  (list || []).forEach((c) => {
+    if (!c || !c.id) return;
+    st.run(
+      String(c.id),
+      STR(c.type),
+      STR(c.name),
+      STR(c.icon),
+      STR(c.parent),
+      Array.isArray(c.keywords) ? JSON.stringify(c.keywords) : null,
+      extraJson(c, KNOWN.categories)
+    );
+  });
+}
+
+function readCategories(db) {
+  return all(db, 'SELECT * FROM categories ORDER BY rowid').map((row) => {
+    const out = { id: row.id };
+    if (row.type != null) out.type = row.type;
+    if (row.name != null) out.name = row.name;
+    if (row.icon != null) out.icon = row.icon;
+    if (row.parent_id != null) out.parent = row.parent_id;
+    if (row.keywords_json != null) {
+      try {
+        out.keywords = JSON.parse(row.keywords_json);
+      } catch (_) {
+        /* 同上：损坏数据保留原样，不替换 */
+      }
+    }
+    return mergeExtra(row, out);
+  });
+}
+
+function writeTxns(db, list) {
+  const st = db.prepare(
+    `INSERT INTO txns (id, occurred_on, occurred_time, txn_type, amount_minor, account_id, account_to,
+                       category_id, merchant, note, source, raw_id, status, mapped_to,
+                       refund_flag, transfer_half, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const fp = db.prepare(
+    'INSERT INTO dedup_fingerprints (fingerprint, txn_id) VALUES (?, ?) ON CONFLICT(fingerprint) DO UPDATE SET txn_id = excluded.txn_id'
+  );
+  const seen = {};
+  (list || []).forEach((t) => {
+    if (!t || !t.id) return;
+    st.run(
+      String(t.id),
+      STR(t.date),
+      STR(t.time),
+      STR(t.type),
+      NUM(t.amount),
+      t.account ? String(t.account) : null,
+      t.accountTo ? String(t.accountTo) : null,
+      t.category ? String(t.category) : null,
+      STR(t.merchant),
+      STR(t.note),
+      STR(t.source),
+      STR(t.rawId),
+      STR(t.status),
+      t.mappedTo ? String(t.mappedTo) : null,
+      BOOL(t.refundFlag),
+      BOOL(t.transferHalf),
+      extraJson(t, KNOWN.txns)
+    );
+    // 确定性重复指纹：同来源同原始单号（§5.4 的"自动拦截"依据）
+    if (t.rawId && t.source && !seen[t.source + '|' + t.rawId]) {
+      seen[t.source + '|' + t.rawId] = true;
+      fp.run(t.source + '|' + t.rawId, String(t.id));
+    }
+  });
+}
+
+function readTxns(db) {
+  return all(db, 'SELECT * FROM txns ORDER BY rowid').map((row) => {
+    const out = { id: row.id };
+    if (row.occurred_on != null) out.date = row.occurred_on;
+    if (row.occurred_time) out.time = row.occurred_time;
+    if (row.txn_type != null) out.type = row.txn_type;
+    if (row.amount_minor != null) out.amount = row.amount_minor;
+    if (row.account_id != null) out.account = row.account_id;
+    if (row.account_to != null) out.accountTo = row.account_to;
+    if (row.category_id != null) out.category = row.category_id;
+    if (row.merchant != null) out.merchant = row.merchant;
+    if (row.note != null) out.note = row.note;
+    if (row.source != null) out.source = row.source;
+    if (row.raw_id != null) out.rawId = row.raw_id;
+    if (row.status) out.status = row.status;
+    if (row.mapped_to != null) out.mappedTo = row.mapped_to;
+    if (row.refund_flag) out.refundFlag = true;
+    if (row.transfer_half) out.transferHalf = true;
+    return mergeExtra(row, out);
+  });
+}
+
+function writeSettings(db, settings) {
+  const json = JSON.stringify(settings && typeof settings === 'object' ? settings : {});
+  run(
+    db,
+    `INSERT INTO app_settings (id, json, updated_at) VALUES (1, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
+    [json, new Date().toISOString()]
+  );
+}
+
+function readSettings(db) {
+  const row = get(db, 'SELECT json FROM app_settings WHERE id = 1');
+  if (!row) return undefined;
+  try {
+    return JSON.parse(row.json);
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function readTxnsBlob(db) {
+  const row = get(db, 'SELECT meta_value FROM service_meta WHERE meta_key = ?', [TXNS_BLOB_META_KEY]);
+  if (!row || !row.meta_value) return null;
+  try {
+    return JSON.parse(row.meta_value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeTxnsBlob(db, blob) {
+  run(
+    db,
+    `INSERT INTO service_meta (meta_key, meta_value) VALUES (?, ?)
+     ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value`,
+    [TXNS_BLOB_META_KEY, JSON.stringify(blob)]
+  );
+}
+
+/* ------------------------------ 全量读写 ------------------------------ */
+
+const CLEAR_ORDER = [
+  'dedup_candidates',
+  'dedup_fingerprints',
+  'security_events',
+  'portfolio_openings',
+  'quotes',
+  'fx_rates',
+  'account_units',
+  'liabilities',
+  'entitlements',
+  'instruments',
+  'asset_accounts',
+  'institutions',
+  'txns',
+  'categories',
+  'ledger_accounts',
+  'app_settings'
+];
+
+function clearState(db) {
+  CLEAR_ORDER.forEach((t) => {
+    run(db, 'DELETE FROM ' + t);
+  });
+  run(db, 'DELETE FROM service_meta WHERE meta_key = ?', [TXNS_BLOB_META_KEY]);
+  // sqlite_sequence 仅在有 AUTOINCREMENT 表时存在
+  if (tableExists(db, 'sqlite_sequence')) run(db, 'DELETE FROM sqlite_sequence');
+}
+
+function normalizeAssets(raw) {
+  const out = {};
+  ASSET_KEYS.forEach((k) => {
+    out[k] = raw && Array.isArray(raw[k]) ? raw[k] : [];
+  });
+  return out;
+}
+
+// 读取全量状态，形状与前端 DB.loadRaw() 完全一致
+function readState(db) {
+  const blob = readTxnsBlob(db);
+  return {
+    accounts: readAccounts(db),
+    categories: readCategories(db),
+    txns: blob == null ? readTxns(db) : blob,
+    settings: readSettings(db),
+    // 形状必须与前端 DB.loadRaw() 完全一致：assets 带 schemaVersion，
+    // 且键集与 js/domain.js 的 ASSET_KEYS 一一对应（前端 normalizeAssets 依赖 schemaVersion）。
+    assets: {
+      schemaVersion: ASSETS_SCHEMA_VERSION,
+      assetAccounts: readAssetAccounts(db),
+      assetUnits: readAssetUnits(db),
+      liabilities: readLiabilities(db),
+      entitlements: readEntitlements(db),
+      instruments: readInstruments(db),
+      holdings: readOpenings(db),
+      quotes: readQuotes(db),
+      fxRates: readFxRates(db)
+    }
+  };
+}
+
+// 全量写入：单事务、先清后写。相同输入重复写入结果一致（幂等）。
+function writeState(db, state, options) {
+  const opts = options || {};
+  const src = state || {};
+  const assets = normalizeAssets(src.assets);
+  const now = opts.now || new Date().toISOString();
+  return transaction(db, () => {
+    clearState(db);
+    writeSettings(db, src.settings);
+    writeAccounts(db, Array.isArray(src.accounts) ? src.accounts : []);
+    writeCategories(db, Array.isArray(src.categories) ? src.categories : []);
+    if (Array.isArray(src.txns)) {
+      writeTxns(db, src.txns);
+    } else if (src.txns && typeof src.txns === 'object') {
+      // 应用锁开启：只落密文，txns 表保持为空
+      writeTxnsBlob(db, src.txns);
+    }
+    const ctx = { now: now };
+    writeInstitutionsAndAccounts(db, assets.assetAccounts, ctx);
+    writeAssetUnits(db, assets.assetUnits);
+    writeLiabilities(db, assets.liabilities);
+    writeEntitlements(db, assets.entitlements);
+    writeInstruments(db, assets.instruments);
+    writeOpenings(db, assets.holdings);
+    writeQuotes(db, assets.quotes);
+    writeFxRates(db, assets.fxRates);
+    return { ok: true };
+  });
+}
+
+function clearAll(db, options) {
+  const opts = options || {};
+  return transaction(db, () => {
+    clearState(db);
+    run(db, 'DELETE FROM idempotency_keys');
+    return { ok: true, clearedAt: opts.now || new Date().toISOString() };
+  });
+}
+
+/* ------------------------------ 只读资源视图（§5.6） ------------------------------ */
+
+function readHoldings(db) {
+  const ins = {};
+  readInstruments(db).forEach((i) => {
+    ins[i.id] = i;
+  });
+  const accs = {};
+  readAssetAccounts(db).forEach((a) => {
+    accs[a.id] = a;
+  });
+  const quotes = readQuotes(db);
+  return readOpenings(db).map((h) => {
+    const instrument = ins[h.instrumentId] || null;
+    const quote = quotes
+      .filter((q) => q.instrumentId === h.instrumentId)
+      .sort((a, b) => String(b.priceDate || '').localeCompare(String(a.priceDate || '')))[0];
+    return {
+      id: h.id,
+      accountId: h.accountId,
+      accountName: accs[h.accountId] ? accs[h.accountId].name : null,
+      instrumentId: h.instrumentId,
+      symbol: instrument ? instrument.symbol : null,
+      assetClass: instrument ? instrument.assetClass || null : null,
+      classificationStatus: instrument ? instrument.classificationStatus : null,
+      quantity: h.quantity,
+      costMinor: h.costMinor,
+      asOf: h.asOf,
+      latestQuote: quote || null
+    };
+  });
+}
+
+function readInstitutionList(db) {
+  const rows = all(db, 'SELECT id, name, kind FROM institutions ORDER BY rowid');
+  const accounts = readAssetAccounts(db);
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    kind: r.kind,
+    accountCount: accounts.filter((a) => a.institution === r.name).length
+  }));
+}
+
+/* ------------------------------ 幂等键（§5.6） ------------------------------ */
+
+function findIdempotent(db, key, method, path) {
+  const row = get(
+    db,
+    'SELECT response_json, method, path FROM idempotency_keys WHERE idempotency_key = ?',
+    [key]
+  );
+  if (!row) return null;
+  if (row.method !== method || row.path !== path) return null;
+  if (row.response_json == null) return null;
+  try {
+    return JSON.parse(row.response_json);
+  } catch (_) {
+    return null;
+  }
+}
+
+function rememberIdempotent(db, key, method, path, response) {
+  run(
+    db,
+    'INSERT INTO idempotency_keys (idempotency_key, method, path, response_json, created_at) VALUES (?, ?, ?, ?, ?)',
+    [key, method, path, JSON.stringify(response == null ? null : response), new Date().toISOString()]
+  );
+}
+
+/* ------------------------------ 服务元数据 ------------------------------ */
+
+function getMeta(db, key) {
+  const row = get(db, 'SELECT meta_value FROM service_meta WHERE meta_key = ?', [key]);
+  return row ? row.meta_value : null;
+}
+
+function setMeta(db, key, value) {
+  run(
+    db,
+    `INSERT INTO service_meta (meta_key, meta_value) VALUES (?, ?)
+     ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value`,
+    [key, value == null ? null : String(value)]
+  );
+}
+
+module.exports = {
+  ASSET_KEYS,
+  LEGACY_KEYS,
+  TXNS_BLOB_META_KEY,
+  readState,
+  writeState,
+  clearAll,
+  readAssetAccounts,
+  readAssetUnits,
+  readLiabilities,
+  readEntitlements,
+  readInstruments,
+  readOpenings,
+  readQuotes,
+  readFxRates,
+  readTxns,
+  readAccounts,
+  readCategories,
+  readSettings,
+  readHoldings,
+  readInstitutionList,
+  findIdempotent,
+  rememberIdempotent,
+  getMeta,
+  setMeta,
+  institutionIdFor
+};

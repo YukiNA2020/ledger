@@ -12,11 +12,14 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="小账本">
   <link rel="stylesheet" href="styles.css">
-  <!-- 隐私硬约束：本应用零外联网络请求，全部资源本地加载，可断网使用 -->
+  <!-- 本地服务在响应 index.html 时注入随机会话令牌，写接口据此校验来源；静态打开时保持占位符，前端据此进入只读降级 -->
+  <meta name="ledger-session-token" content="__LEDGER_SESSION_TOKEN__">
+  <!-- 隐私硬约束：除本机 127.0.0.1 的本地服务外，本应用零外联网络请求 -->
 </head>
 <body>
   <div id="app">
     <div id="lock-screen" class="hidden"></div>
+    <div id="service-banner" class="hidden"></div>
     <main id="view"></main>
     <nav id="tabbar" class="hidden"></nav>
   </div>
@@ -25,6 +28,7 @@
 
   <script src="js/core.js"></script>
   <script src="js/db.js"></script>
+  <script src="js/store.js"></script>
   <script src="js/charts.js"></script>
   <script src="js/domain.js"></script>
   <script src="js/app.js"></script>

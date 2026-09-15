@@ -49,20 +49,40 @@
 
 ## Phase 2｜本地服务与 SQLite
 
-状态：未开始；依赖 Phase 1 退出条件全部通过。
+状态：已完成（2026-09-14，含补充验收修复）；依赖 Phase 1 退出条件全部通过。
 
 目标：建立目标事实源和可靠启动方式。
 
 工作项：
 
-1. 建立只监听 `127.0.0.1` 的本地服务和 `/api/v1`。
-2. 建立 SQLite Schema、迁移器和 repository。
-3. 将前端读写从 IndexedDB 迁到本地 API。
-4. 配置 macOS 登录启动并自动打开页面。
-5. 增加本地自动备份、恢复和 30 版本保留策略。
-6. 将 API Key 接入 macOS Keychain。
+1. 建立只监听 `127.0.0.1` 的本地服务和 `/api/v1`。✅ `server/api.js`（`/api/v1` 前缀、session token + Origin + Content-Type 三重写校验、无 CORS 无预检、HTML 注入令牌）
+2. 建立 SQLite Schema、迁移器和 repository。✅ `server/migrations.js`（v1 `phase2-initial-schema`，版本化、事务原子、失败回滚）、`server/repository.js`（八集合 + 旧四键、全量替换幂等、`extra_json` 零丢失、机构文本归一、加密交易只落密文）
+3. 将前端读写从 IndexedDB 迁到本地 API。✅ `js/store.js` 存储门面：API 模式完全不触碰 IndexedDB；服务不可达时只读降级并显示横幅，绝不双写
+4. 配置 macOS 登录启动并自动打开页面。✅ `server/login-item.js` + `scripts/install-login-item.sh` / `uninstall-login-item.sh`（默认只写 plist，加 `--activate` 才 `launchctl bootstrap`）
+5. 增加本地自动备份、恢复和 30 版本保留策略。✅ `server/backup.js`（快照→校验→原子替换→裁剪；恢复前先备份、临时库校验后切换、失败回滚原库）
+6. 将 API Key 接入 macOS Keychain。✅ `server/keychain.js` 只做可用性探测与读取路径（只走 stdin 不进 argv）；真正读取留给 Phase 4
 
 退出条件：重启 Mac 后可自动打开；数据库事务、备份恢复与 loopback 安全测试通过；IndexedDB 不再是事实源。
+
+退出证据（2026-09-14）：
+
+- `node --test` **202/202 通过**（Phase 1 的 133 项零回归 + 新增 69 项 Phase 2 测试：迁移 13、repository 14、备份 13、恢复 8、HTTP 层 16、前端请求头契约 6）；
+- 浏览器 wiring 验收 **11/11 通过**（`http://127.0.0.1:<port>/tests/app-wiring.html`，含 S2.1 单一事实源、S2.2 写入门禁、清空链路，以及补充验收新增的「恢复前强制备份」「服务中断记账回滚与只读降级」）；
+- §13 五项只读技术验证全部 OK（SQLite 驱动、loopback 绑定、单实例锁、Keychain 读取、LaunchAgent plist 渲染与 lint），结论见 `ARCHITECTURE.md` §13；运行时定为 Node（T-001）；
+- 实测端到端：health/state/overview/holdings/backups/restores/keychain 全部符合契约；缺令牌 401、错 Origin 403、错 Content-Type 415、预检 405；第二实例被单实例锁拒绝；清空先留 pre-clear 备份；恢复 v1 库成功、恢复失败 409 且当前库不变；备份保留 30 份生效；
+- 事实源切换为单一方向：API 模式下 `DB.loadRaw()` 读到 0 条（IndexedDB 未被写入），页面数据与 HTTP 直读 SQLite 完全一致。
+
+本轮发现并修复的真实缺陷（详见 `TEST.md`）：
+
+- **B1（备份原语）**：`node:sqlite` 在线备份 API 在长生命周期进程里会不可预测地停住（实测第 1–2 次约 1ms，之后每次约 8 秒甚至挂死）。改为 SQLite 自身的 `VACUUM INTO` 生成自包含快照，稳定 0–1ms；生产路径不再有 8 秒写后卡顿。
+- **B2（形状契约）**：`repository.readState()` 返回的 `assets` 漏了 `schemaVersion`，与前端 `DB.loadRaw()` 形状不一致，前端 `normalizeAssets` 无法直接消费。
+- **B3（清空链路）**：前端 `apiFetch` 只在有请求体时设置 `Content-Type`，导致无请求体的 `DELETE /api/v1/state` 被服务端判为非法写请求（415），「清空账本」静默失败并抛成未处理的 Promise 拒绝。
+- **B4（静态守卫）**：静态资源路径穿越判断原先放在 `path.normalize` 之后，对编码/特殊输入守卫过晚；改为先按未归一化路径段拒绝，并顺带清理备份目录的孤儿 `-wal/-shm`。
+- **B5（测试基建）**：wiring harness 的 `waitFor` 把 `async` 谓词返回的 Promise 当作真值，导致断言在写入落盘前就执行。
+- **B6（S1，Service Worker）**：SW 缓存优先会缓存带会话令牌的 `index.html`；服务重启轮换令牌后，刷新仍命中旧令牌，写请求全部 401。改为 HTML 网络优先、离线才回退到「脱敏后」的缓存壳（令牌替换回占位符），静态资源维持缓存优先。
+- **B7（S2，保存链路）**：记账乐观更新先报「已记一笔」再异步保存，且 `detect()` 缓存模式使服务中断后不降级只读，导致界面同时出现成功与失败提示、未落盘交易挂在明细里。改为保存确认落盘后才提示成功、失败回滚本地更新，并让网络层失败立即降级只读。
+- **B8（S3，恢复前备份）**：页面 JSON 恢复走普通全量 `PUT /state`，受 60 秒写后备份节流，恢复前 60 秒内刚写过数据时被覆盖版本无备份可回滚。改为 `PUT /state` 支持 `forceBackup`，高风险覆盖前先强制留 `pre-import` 备份（失败即中止），前端恢复走该路径。
+- **B9（备份命名）**：`stamp()` 只有秒级精度，同一秒内两次保护性备份（如连续两次恢复）同名互相覆盖。改为目标文件已存在时追加 `-1/-2` 后缀，保证覆盖前版本可找回。
 
 ## Phase 3｜账户、负债与月度结账
 
