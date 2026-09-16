@@ -286,7 +286,8 @@ test('资产集合键名与领域模型保持一致（holdings ↔ portfolio_ope
       'instruments',
       'holdings',
       'quotes',
-      'fxRates'
+      'fxRates',
+      'securityEvents'
     ]);
     assert.strictEqual(R.readAssetUnits, R.readAssetUnits);
     // 领域层的空集合形状与我们写出的形状一致

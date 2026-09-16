@@ -344,6 +344,25 @@ const MIGRATIONS = [
           ON instruments(upper(trim(symbol)), upper(trim(IFNULL(exchange, ''))));
       `);
     }
+  },
+  {
+    version: 5,
+    name: 'phase4c-security-event-amounts',
+    up(db) {
+      /* Phase 4C：分红/费用事件需要一个「事件总额」列。
+       * v1 的 security_events 只有每股口径（quantity/price_minor/fee_minor），
+       * 分红总额与费用总额没有落点；D-042 冻结的口径是
+       *   - price_minor 只存"每股价格"，不再借存总额（不做字段混用）；
+       *   - amount_minor 存分红/费用事件的总额（对应币种最小单位整数）；
+       *   - 买卖事件的 amount_minor 保持 NULL（数量 × 单价可推导，不冗余落库）。
+       * 同时补 (account_id, instrument_id, occurred_at) 索引：
+       * 推导持仓时要按 (账户, 标的) 拉全量事件按时间重放。 */
+      db.exec(`
+        ALTER TABLE security_events ADD COLUMN amount_minor INTEGER;
+        CREATE INDEX idx_events_account_instrument
+          ON security_events(account_id, instrument_id, occurred_at);
+      `);
+    }
   }
 ];
 

@@ -20,11 +20,15 @@
   var RISK_CLASSES = ['cash', 'fixed_income', 'broad_equity', 'theme_equity', 'stock', 'other'];
   var MAX_STALE_DAYS = 5;                        // A-004：行情与汇率默认最多 5 个自然日陈旧
   var MAX_SCALE = 8;                             // 定点十进制最大小数位
-  var ASSET_KEYS = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
+  var ASSET_KEYS = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates', 'securityEvents'];
 
   // Phase 4B：风险敞口市场词表。属于**用户判断**，provider 不提供（D-037）；
   // 与「交易币种（CNY/HKD/USD）」是两个不同字段，不得相互推断替代（AGENTS.md）。
   var EXPOSURE_MARKETS = ['CN', 'HK', 'US', 'global', 'other'];
+
+  // Phase 4C：证券事件类型（D-042）。
+  //   buy/sell 改变持有数量；dividend/fee 只产生金额事实、不改数量。
+  var SECURITY_EVENT_TYPES = ['buy', 'sell', 'dividend', 'fee'];
 
   /* ------------------------------ 定点十进制 ------------------------------ */
 
@@ -67,6 +71,182 @@
     var num = Math.round(minor) * r.v;
     if (num > Number.MAX_SAFE_INTEGER) return null;
     return r.s === 0 ? num : divRound(num, Math.pow(10, r.s));
+  }
+
+  /* ---------------------- 定点数量比较与累加（Phase 4C，D-042） ---------------------- */
+
+  // 规范化定点字符串：去掉小数尾随 0（"10.5000" → "10.5"，"11.0" → "11"）。
+  // 只处理非负整数部分的 {v, s}（持仓数量不可能为负：卖出超额在写入路径就被拒绝）。
+  function formatDecimal(v, s) {
+    var str = String(v);
+    if (s > 0) {
+      while (str.length <= s) str = '0' + str;
+      str = str.slice(0, str.length - s) + '.' + str.slice(str.length - s);
+      str = str.replace(/0+$/, '').replace(/\.$/, '');
+    }
+    return str;
+  }
+
+  // 两个定点数（字符串或 {v,s}）精确比较：a<b → -1，a>b → 1，相等 → 0，任一非法 → null。
+  // 对齐到较大小数位后按整数比较，绝不经过浮点。
+  function compareDecimals(a, b) {
+    var da = a && typeof a === 'object' ? a : parseDecimal(a);
+    var db = b && typeof b === 'object' ? b : parseDecimal(b);
+    if (!da || !db) return null;
+    var s = Math.max(da.s, db.s);
+    var av = da.v * Math.pow(10, s - da.s);
+    var bv = db.v * Math.pow(10, s - db.s);
+    if (av > Number.MAX_SAFE_INTEGER || bv > Number.MAX_SAFE_INTEGER) return null;
+    return av === bv ? 0 : av < bv ? -1 : 1;
+  }
+
+  // 定点数量求和：返回规范化十进制字符串；任一项非法 → null；空列表 → "0"。
+  function sumQuantities(list) {
+    var scale = 0;
+    var parsed = [];
+    (Array.isArray(list) ? list : []).forEach(function (q) {
+      var d = q && typeof q === 'object' ? q : parseDecimal(q);
+      if (!d) { parsed = null; return; }
+      if (d.s > scale) scale = d.s;
+      parsed.push(d);
+    });
+    if (!parsed) return null;
+    var total = 0;
+    for (var i = 0; i < parsed.length; i++) {
+      total += parsed[i].v * Math.pow(10, scale - parsed[i].s);
+    }
+    if (total > Number.MAX_SAFE_INTEGER) return null;
+    return formatDecimal(total, scale);
+  }
+
+  // 定点数量相减（a − b，两者都必须是非负定点字符串）：返回规范化字符串，任一非法 → null。
+  function subtractQuantities(aStr, bStr) {
+    var da = parseDecimal(aStr);
+    var db = parseDecimal(bStr);
+    if (!da || !db) return null;
+    var s = Math.max(da.s, db.s);
+    var av = da.v * Math.pow(10, s - da.s);
+    var bv = db.v * Math.pow(10, s - db.s);
+    if (av > Number.MAX_SAFE_INTEGER || bv > Number.MAX_SAFE_INTEGER) return null;
+    return formatDecimal(av - bv, s);
+  }
+
+  /* ------------------------------ 持仓推导（Phase 4C，D-042/D-025） ------------------------------ */
+
+  // deriveHoldings(openings, events, options) — 持有数量的**唯一推导实现**：
+  //   数量 = 期初快照数量 + Σ买入 − Σ卖出（分红/费用不改数量；买入可以没有期初快照，从 0 起算）。
+  //   事件按 occurred_at 升序重放（同日按传入顺序，保证确定性）；
+  //   任一 (accountId, instrumentId) 至多一行期初：同键多行时取 asOf 最新一行（接口路径不允许出现，
+  //   这里只对历史/手工数据的形状做确定性防御）。
+  // options.strict = true：卖出超过当时推导数量 → 抛 {code:'insufficient_holdings'}（服务端写前校验用）；
+  // 默认宽松模式：跳过该笔卖出并把它记入 holding.oversellEvents，供总览防御性展示。
+  // 返回 { holdings: [...], invalidEvents: [eventId...] }：
+  //   holding = { accountId, instrumentId, quantity(规范化十进制字符串),
+  //               openingId, openingQuantity, openingCostMinor, openingAsOf,
+  //               firstActivityAt, lastEventAt, counts:{buy,sell,dividend,fee},
+  //               oversellEvents }
+  function deriveHoldings(openings, events, options) {
+    var opts = options || {};
+    var strict = opts.strict === true;
+    var openList = Array.isArray(openings) ? openings : [];
+    var evList = Array.isArray(events) ? events : [];
+
+    var map = {};
+    var order = [];
+    function keyOf(accountId, instrumentId) {
+      return String(accountId) + '|' + String(instrumentId);
+    }
+    function holdingFor(accountId, instrumentId) {
+      var key = keyOf(accountId, instrumentId);
+      if (!map[key]) {
+        map[key] = {
+          accountId: accountId,
+          instrumentId: instrumentId,
+          quantity: '0',
+          openingId: null,
+          openingQuantity: null,
+          openingCostMinor: null,
+          openingAsOf: null,
+          firstActivityAt: null,
+          lastEventAt: null,
+          counts: { buy: 0, sell: 0, dividend: 0, fee: 0 },
+          oversellEvents: []
+        };
+        order.push(key);
+      }
+      return map[key];
+    }
+
+    openList.forEach(function (o) {
+      if (!o || !o.accountId || !o.instrumentId) return;
+      var d = parseDecimal(o.quantity);
+      if (!d) return; // 非法期初数量：写入路径已拒绝，这里防御性忽略
+      var h = holdingFor(o.accountId, o.instrumentId);
+      var newer = h.openingAsOf == null || String(o.asOf || '') >= String(h.openingAsOf);
+      if (newer) {
+        h.quantity = formatDecimal(d.v, d.s);
+        h.openingId = o.id || null;
+        h.openingQuantity = formatDecimal(d.v, d.s);
+        h.openingCostMinor = typeof o.costMinor === 'number' ? o.costMinor : null;
+        h.openingAsOf = o.asOf || null;
+      }
+    });
+
+    var invalidEvents = [];
+    var indexed = [];
+    evList.forEach(function (e, idx) {
+      indexed.push({ e: e, idx: idx });
+    });
+    // 按 occurred_at 升序、同日保持传入顺序（稳定排序）
+    indexed.sort(function (a, b) {
+      var da = String((a.e && a.e.occurredAt) || '');
+      var db = String((b.e && b.e.occurredAt) || '');
+      if (da !== db) return da < db ? -1 : 1;
+      return a.idx - b.idx;
+    });
+
+    indexed.forEach(function (slot) {
+      var e = slot.e;
+      if (!e || !e.accountId || !e.instrumentId) { invalidEvents.push(e && e.id ? e.id : null); return; }
+      var type = e.eventType;
+      if (SECURITY_EVENT_TYPES.indexOf(type) === -1) { invalidEvents.push(e.id || null); return; }
+      // 先验证后建条目：非法事件绝不留下空的持仓对象
+      var qty = null;
+      if (type === 'buy' || type === 'sell') {
+        qty = parseDecimal(e.quantity);
+        if (!qty || !(qty.v > 0)) { invalidEvents.push(e.id || null); return; }
+      }
+      var h = holdingFor(e.accountId, e.instrumentId);
+      if (type === 'buy') {
+        h.quantity = sumQuantities([h.quantity, e.quantity]);
+        h.counts.buy += 1;
+      } else if (type === 'sell') {
+        var cmp = compareDecimals(h.quantity, e.quantity);
+        if (cmp == null) { invalidEvents.push(e.id || null); return; }
+        if (cmp < 0) {
+          if (strict) {
+            throw Object.assign(
+              new Error('卖出数量超过当时持有数量（事件 ' + (e.id || '') + '，账户 ' + e.accountId + '，标的 ' + e.instrumentId + '）'),
+              { code: 'insufficient_holdings', detail: { eventId: e.id || null, accountId: e.accountId, instrumentId: e.instrumentId } }
+            );
+          }
+          h.oversellEvents.push(e.id || null);
+          return; // 宽松模式：跳过该笔卖出，数量不穿零
+        }
+        h.quantity = subtractQuantities(h.quantity, e.quantity); // parseDecimal 不收负数，减法走整数运算
+        h.counts.sell += 1;
+        if (h.quantity == null) { invalidEvents.push(e.id || null); return; }
+      } else {
+        h.counts[type] += 1; // dividend / fee：只记账，不改数量
+      }
+      if (e.occurredAt) {
+        if (h.firstActivityAt == null || String(e.occurredAt) < String(h.firstActivityAt)) h.firstActivityAt = e.occurredAt;
+        if (h.lastEventAt == null || String(e.occurredAt) > String(h.lastEventAt)) h.lastEventAt = e.occurredAt;
+      }
+    });
+
+    var holdings = order.map(function (key) { return map[key]; });
+    return { holdings: holdings, invalidEvents: invalidEvents };
   }
 
   /* ------------------------------ 日期与新鲜度 ------------------------------ */
@@ -250,7 +430,8 @@
     RISK_CLASSES.forEach(function (c) { riskValue[c] = 0; });
     var totalAssets = 0, totalLiabilities = 0, investableCash = 0, duePayables = 0;
     var entitlementView = [];
-    var hasAnyData = a.assetUnits.length > 0 || a.holdings.length > 0 || a.liabilities.length > 0;
+    var hasAnyData = a.assetUnits.length > 0 || a.holdings.length > 0 || a.liabilities.length > 0 ||
+      a.securityEvents.length > 0;
 
     function convertFor(minor, currency, label) {
       var conv = convertMinor(minor, currency, 'CNY', a.fxRates, now);
@@ -280,8 +461,14 @@
       }
     });
 
-    /* 持仓估值 */
-    a.holdings.forEach(function (h) {
+    /* 持仓估值：数量口径只有一份（D-025/D-042）。
+     * 有证券事件时，估值数量来自 deriveHoldings 的推导结果（期初 + Σ买入 − Σ卖出）；
+     * 无事件时直接用期初快照，两者数值一致、零回归。 */
+    var holdingRows = a.holdings;
+    if (a.securityEvents && a.securityEvents.length > 0) {
+      holdingRows = deriveHoldings(a.holdings, a.securityEvents).holdings;
+    }
+    holdingRows.forEach(function (h) {
       if (!h) return;
       var ins = instrumentMap[h.instrumentId];
       if (!ins) { addBlocker('instrument_missing', h.instrumentId || ''); return; }
@@ -435,8 +622,12 @@
       };
     }).filter(Boolean);
 
-    /* 单元级事实：持仓估值 */
-    var holdingFacts = a.holdings.map(function (h) {
+    /* 单元级事实：持仓估值（有证券事件时数量来自推导，与总览同口径） */
+    var holdingRows = a.holdings;
+    if (a.securityEvents && a.securityEvents.length > 0) {
+      holdingRows = deriveHoldings(a.holdings, a.securityEvents).holdings;
+    }
+    var holdingFacts = holdingRows.map(function (h) {
       if (!h) return null;
       var ins = instrumentMap[h.instrumentId];
       var q = findQuote(a.quotes, h.instrumentId, now);
@@ -445,7 +636,7 @@
         : convertMinor(minor, q.currency, 'CNY', a.fxRates, now);
       return {
         kind: 'holding',
-        id: h.id || null,
+        id: h.openingId != null ? h.openingId : (h.id || null),
         symbol: ins ? ins.symbol : null,
         instrumentId: h.instrumentId || null,
         accountId: h.accountId || null,
@@ -455,7 +646,7 @@
         priceCurrency: q ? q.currency : null,
         priceDate: q ? q.priceDate : null,
         priceStatus: q ? q.status : 'missing_quote',
-        asOf: h.asOf || null,
+        asOf: h.openingAsOf != null ? h.openingAsOf : (h.asOf || null),
         valueMinor: minor,
         valueCnyMinor: conv.status === 'missing_fx' ? null : conv.valueMinor,
         valueStatus: conv.status
@@ -510,6 +701,8 @@
     POOLS: POOLS,
     RISK_CLASSES: RISK_CLASSES,
     EXPOSURE_MARKETS: EXPOSURE_MARKETS,
+    SECURITY_EVENT_TYPES: SECURITY_EVENT_TYPES,
+    ASSET_KEYS: ASSET_KEYS,
     MAX_STALE_DAYS: MAX_STALE_DAYS,
     isAssetClass: isAssetClass,
     isExposureMarket: isExposureMarket,
@@ -520,6 +713,11 @@
     parseDecimal: parseDecimal,
     mulMinor: mulMinor,
     mulByRate: mulByRate,
+    formatDecimal: formatDecimal,
+    compareDecimals: compareDecimals,
+    sumQuantities: sumQuantities,
+    subtractQuantities: subtractQuantities,
+    deriveHoldings: deriveHoldings,
     daysBetween: daysBetween,
     isStaleDays: isStaleDays,
     ymOf: ymOf,

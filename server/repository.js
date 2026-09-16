@@ -36,6 +36,7 @@ const NUM = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 const BOOL = (v) => (v ? 1 : 0);
+const isDateStr = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 
 // 标的 id / 代码的形状（与目录接口同一口径）。全量写入路径也必须满足 ——
 // 只靠"过滤掉不合法行"会让非法数据悄悄消失或变形（第二轮复核 G4B-5）。
@@ -105,6 +106,17 @@ const KNOWN = {
     'classificationStatus'
   ],
   holdings: ['id', 'accountId', 'instrumentId', 'quantity', 'costMinor', 'asOf'],
+  securityEvents: [
+    'id',
+    'accountId',
+    'instrumentId',
+    'eventType',
+    'quantity',
+    'priceMinor',
+    'feeMinor',
+    'amountMinor',
+    'occurredAt'
+  ],
   quotes: ['instrumentId', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status'],
   fxRates: ['base', 'quote', 'rateDecimal', 'rateDate', 'fetchedAt', 'provider', 'status'],
   accounts: ['id', 'name', 'type', 'color', 'initialBalance', 'order', 'aliases', 'deleted'],
@@ -696,6 +708,233 @@ function readOpenings(db) {
   });
 }
 
+/* ------------------------ 证券事件（Phase 4C，D-042） ------------------------ */
+
+const EVENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const OPENING_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+// 读回全部证券事件（occurred_at 升序，便于重放与展示）。
+function readSecurityEvents(db) {
+  return all(db, 'SELECT * FROM security_events ORDER BY occurred_at ASC, rowid ASC').map((row) => {
+    const out = {
+      id: row.id,
+      accountId: row.account_id,
+      instrumentId: row.instrument_id,
+      eventType: row.event_type,
+      quantity: row.quantity,
+      priceMinor: row.price_minor,
+      feeMinor: row.fee_minor,
+      amountMinor: row.amount_minor,
+      currency: row.currency,
+      occurredAt: row.occurred_at
+    };
+    return mergeExtra(row, out);
+  });
+}
+
+// 单条事件写入前的逐字段校验（api 层已做形状校验，这里做领域校验——同一套口径两道闸）：
+//   - 事件类型在词表内；occurred_at 是 YYYY-MM-DD；
+//   - buy/sell：quantity 必填且为正定点数（≤8 位小数），amount_minor 禁止携带（不冗余落库）；
+//   - dividend/fee：amount_minor 必填且为正整数（最小货币单位），quantity 可选；
+//   - price_minor / fee_minor 可选非负整数；
+//   - 币种由标的 currency 推导，不采信载荷冗余字段（D-034/D-042）。
+function validateEventRow(db, e, at) {
+  const where = at || '该事件';
+  if (!e || typeof e !== 'object' || Array.isArray(e)) {
+    throw Object.assign(new Error('证券事件必须是对象（' + where + '）'), { code: 'invalid_event' });
+  }
+  const id = e.id == null ? '' : String(e.id).trim();
+  if (!id) throw Object.assign(new Error('证券事件缺少 id（' + where + '）'), { code: 'invalid_id' });
+  if (!EVENT_ID_RE.test(id)) {
+    throw Object.assign(new Error('证券事件 id 不合法（' + where + '）'), { code: 'invalid_id' });
+  }
+  if (!e.accountId || !e.instrumentId) {
+    throw Object.assign(new Error('证券事件必须同时指向账户与标的（' + where + '）'), { code: 'invalid_event' });
+  }
+  const eventType = String(e.eventType || '').trim();
+  if (Domain.SECURITY_EVENT_TYPES.indexOf(eventType) === -1) {
+    throw Object.assign(new Error('证券事件类型不在词表内：' + eventType + '（' + where + '）'), {
+      code: 'invalid_event_type'
+    });
+  }
+  if (!isDateStr(e.occurredAt)) {
+    throw Object.assign(new Error('事件日期必须是 YYYY-MM-DD（' + where + '）'), { code: 'invalid_event_date' });
+  }
+  let quantity = null;
+  if (eventType === 'buy' || eventType === 'sell') {
+    const q = Domain.parseDecimal(e.quantity);
+    if (!q || !(q.v > 0)) {
+      throw Object.assign(new Error('买卖事件的数量必须为正定点数（' + where + '）'), { code: 'invalid_quantity' });
+    }
+    if (e.amountMinor != null) {
+      throw Object.assign(new Error('买卖事件不得携带总额 amountMinor（金额由数量×单价推导）'), {
+        code: 'invalid_event_amount'
+      });
+    }
+    quantity = String(e.quantity).trim();
+  } else {
+    if (!Number.isSafeInteger(e.amountMinor) || e.amountMinor <= 0) {
+      throw Object.assign(new Error('分红/费用事件的总额必须是正整数（最小货币单位）'), {
+        code: 'invalid_event_amount'
+      });
+    }
+  }
+  if (e.priceMinor != null && (!Number.isSafeInteger(e.priceMinor) || e.priceMinor < 0)) {
+    throw Object.assign(new Error('每股价格必须是非负整数（' + where + '）'), { code: 'invalid_amount' });
+  }
+  if (e.feeMinor != null && (!Number.isSafeInteger(e.feeMinor) || e.feeMinor < 0)) {
+    throw Object.assign(new Error('手续费必须是非负整数（' + where + '）'), { code: 'invalid_amount' });
+  }
+  return {
+    id: id,
+    accountId: String(e.accountId),
+    instrumentId: String(e.instrumentId),
+    eventType: eventType,
+    quantity: quantity,
+    priceMinor: e.priceMinor == null ? null : e.priceMinor,
+    feeMinor: e.feeMinor == null ? null : e.feeMinor,
+    amountMinor: eventType === 'buy' || eventType === 'sell' ? null : e.amountMinor,
+    occurredAt: String(e.occurredAt)
+  };
+}
+
+function insertEventRow(db, ev) {
+  // 币种由标的推导：事件行的 currency 只用于展示与审计，绝不影响估值折算（估值取标的币种）
+  const ins = get(db, 'SELECT currency FROM instruments WHERE id = ?', [ev.instrumentId]);
+  run(
+    db,
+    `INSERT INTO security_events
+       (id, account_id, instrument_id, event_type, quantity, price_minor, fee_minor, amount_minor, currency, occurred_at, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      ev.id,
+      ev.accountId,
+      ev.instrumentId,
+      ev.eventType,
+      ev.quantity,
+      ev.priceMinor,
+      ev.feeMinor,
+      ev.amountMinor,
+      ins ? ins.currency : null,
+      ev.occurredAt,
+      extraJson(ev, KNOWN.securityEvents)
+    ]
+  );
+}
+
+// 单条事件 upsert（POST /api/v1/security-events，调用方负责 transaction）：
+//   - 同 id 重放 → duplicate_event（409，明确拒绝，不静默吞）——HTTP 层重试用 Idempotency-Key；
+//   - 账户/标的不存在 → unknown_account / unknown_instrument（422）；
+//   - 写入前用 deriveHoldings(strict) 全量重放：卖出超过当时推导数量 → insufficient_holdings（409）。
+function upsertSecurityEvent(db, e) {
+  const ev = validateEventRow(db, e);
+  if (get(db, 'SELECT id FROM security_events WHERE id = ?', [ev.id])) {
+    throw Object.assign(new Error('证券事件已存在：' + ev.id + '（同一事件不得重复提交）'), {
+      code: 'duplicate_event'
+    });
+  }
+  if (!get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [ev.accountId])) {
+    throw Object.assign(new Error('事件关联的账户不存在'), { code: 'unknown_account' });
+  }
+  if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [ev.instrumentId])) {
+    throw Object.assign(new Error('事件关联的标的不存在'), { code: 'unknown_instrument' });
+  }
+  insertEventRow(db, ev);
+  // 全量重放校验：唯一推导实现 + strict 卖出检查（D-025），不合格即抛错回滚
+  Domain.deriveHoldings(readOpenings(db), readSecurityEvents(db), { strict: true });
+  return getSecurityEvent(db, ev.id);
+}
+
+function getSecurityEvent(db, id) {
+  const row = get(db, 'SELECT * FROM security_events WHERE id = ?', [String(id)]);
+  if (!row) return null;
+  return readSecurityEvents(db).find((e) => e.id === String(id)) || null;
+}
+
+// 期初快照单条写入（POST /api/v1/portfolio-openings）：
+//   - 同 id 幂等更新；同一 (accountId, instrumentId) 出现第二行 → duplicate_opening（409）。
+function upsertPortfolioOpening(db, o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) {
+    throw Object.assign(new Error('期初快照必须是对象'), { code: 'invalid_opening' });
+  }
+  const id = o.id == null ? '' : String(o.id).trim();
+  if (!id || !OPENING_ID_RE.test(id)) {
+    throw Object.assign(new Error('期初快照 id 不合法'), { code: 'invalid_id' });
+  }
+  if (!o.accountId || !o.instrumentId) {
+    throw Object.assign(new Error('期初快照必须同时指向账户与标的'), { code: 'invalid_opening' });
+  }
+  if (!get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [String(o.accountId)])) {
+    throw Object.assign(new Error('期初快照关联的账户不存在'), { code: 'unknown_account' });
+  }
+  if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [String(o.instrumentId)])) {
+    throw Object.assign(new Error('期初快照关联的标的不存在'), { code: 'unknown_instrument' });
+  }
+  const q = Domain.parseDecimal(o.quantity);
+  if (!q || !(q.v > 0)) {
+    throw Object.assign(new Error('期初数量必须为正定点数'), { code: 'invalid_quantity' });
+  }
+  if (o.costMinor != null && (!Number.isSafeInteger(o.costMinor) || o.costMinor < 0)) {
+    throw Object.assign(new Error('期初成本必须是非负整数（最小货币单位）'), { code: 'invalid_amount' });
+  }
+  if (o.asOf != null && !isDateStr(o.asOf)) {
+    throw Object.assign(new Error('期初核对日期必须是 YYYY-MM-DD'), { code: 'invalid_date' });
+  }
+  const clash = get(
+    db,
+    'SELECT id FROM portfolio_openings WHERE account_id = ? AND instrument_id = ? AND id <> ?',
+    [String(o.accountId), String(o.instrumentId), id]
+  );
+  if (clash) {
+    throw Object.assign(
+      new Error('该账户下同一标的已有期初快照：' + clash.id + '（同一持仓只能有一行期初事实）'),
+      { code: 'duplicate_opening' }
+    );
+  }
+  run(
+    db,
+    `INSERT INTO portfolio_openings (id, account_id, instrument_id, quantity, cost_minor, as_of, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       account_id = excluded.account_id,
+       instrument_id = excluded.instrument_id,
+       quantity = excluded.quantity,
+       cost_minor = excluded.cost_minor,
+       as_of = excluded.as_of,
+       extra_json = excluded.extra_json`,
+    [
+      id,
+      String(o.accountId),
+      String(o.instrumentId),
+      String(o.quantity).trim(),
+      o.costMinor == null ? null : o.costMinor,
+      o.asOf == null ? null : String(o.asOf),
+      extraJson(o, KNOWN.holdings)
+    ]
+  );
+  return readOpenings(db).find((h) => h.id === id) || null;
+}
+
+// 全量写入路径（PUT /state、JSON 恢复、备份还原）：与单条写入同一套校验口径，
+// 逐条验证（不合格整体抛错回滚，绝不静默丢行——与 writeInstruments 同纪律），
+// id 重复 → duplicate_event；最后以 strict 重放守住"任何时刻持有数量不为负"。
+function writeSecurityEvents(db, list) {
+  const rows = Array.isArray(list) ? list : [];
+  const seen = {};
+  const normalized = rows.map((e, idx) => {
+    const ev = validateEventRow(db, e, '第 ' + (idx + 1) + ' 条');
+    if (seen[ev.id]) {
+      throw Object.assign(new Error('证券事件 id 重复写入：' + ev.id), { code: 'duplicate_event' });
+    }
+    seen[ev.id] = true;
+    return ev;
+  });
+  normalized.forEach((ev) => insertEventRow(db, ev));
+  if (normalized.length) {
+    Domain.deriveHoldings(readOpenings(db), readSecurityEvents(db), { strict: true });
+  }
+}
+
 function writeQuotes(db, list) {
   const st = db.prepare(
     `INSERT INTO quotes (instrument_id, price_minor, currency, price_date, fetched_at, provider, status)
@@ -1002,7 +1241,8 @@ function readState(db) {
       instruments: readInstruments(db),
       holdings: readOpenings(db),
       quotes: readQuotes(db),
-      fxRates: readFxRates(db)
+      fxRates: readFxRates(db),
+      securityEvents: readSecurityEvents(db)
     }
   };
 }
@@ -1032,6 +1272,8 @@ function writeState(db, state, options) {
     writeEntitlements(db, assets.entitlements);
     writeInstruments(db, assets.instruments);
     writeOpenings(db, assets.holdings);
+    // 证券事件在期初快照之后写入：writeSecurityEvents 末尾的 strict 重放依赖期初数量
+    writeSecurityEvents(db, assets.securityEvents);
     writeQuotes(db, assets.quotes);
     writeFxRates(db, assets.fxRates);
     return { ok: true };
@@ -1059,12 +1301,37 @@ function readHoldings(db) {
     accs[a.id] = a;
   });
   const quotes = readQuotes(db);
-  return readOpenings(db).map((h) => {
+
+  // 持仓数量只有一份推导口径（D-025）：有证券事件时展示推导数量
+  // （期初 + Σ买入 − Σ卖出），无事件时期初快照本身就是推导结果，零回归。
+  const openings = readOpenings(db);
+  const events = readSecurityEvents(db);
+  let rows;
+  if (events.length > 0) {
+    rows = Domain.deriveHoldings(openings, events).holdings.map((h) => ({
+      id: h.openingId || 'derived:' + h.accountId + ':' + h.instrumentId,
+      accountId: h.accountId,
+      instrumentId: h.instrumentId,
+      quantity: h.quantity,
+      costMinor: h.openingCostMinor,
+      asOf: h.openingAsOf,
+      openingId: h.openingId,
+      openingQuantity: h.openingQuantity,
+      firstActivityAt: h.firstActivityAt,
+      lastEventAt: h.lastEventAt,
+      eventCounts: h.counts,
+      oversellEvents: h.oversellEvents
+    }));
+  } else {
+    rows = openings;
+  }
+
+  return rows.map((h) => {
     const instrument = ins[h.instrumentId] || null;
     const quote = quotes
       .filter((q) => q.instrumentId === h.instrumentId)
       .sort((a, b) => String(b.priceDate || '').localeCompare(String(a.priceDate || '')))[0];
-    return {
+    const out = {
       id: h.id,
       accountId: h.accountId,
       accountName: accs[h.accountId] ? accs[h.accountId].name : null,
@@ -1077,6 +1344,13 @@ function readHoldings(db) {
       asOf: h.asOf,
       latestQuote: quote || null
     };
+    // 推导路径的附加字段（openingId / eventCounts / lastEventAt 等）必须透传，
+    // 否则"数量从哪来"这条追溯链在接口响应里断掉。
+    Object.keys(h).forEach((k) => {
+      if (Object.prototype.hasOwnProperty.call(out, k)) return;
+      out[k] = h[k];
+    });
+    return out;
   });
 }
 
@@ -1509,6 +1783,7 @@ module.exports = {
   findInstrumentByKey,
   upsertInstrument,
   readOpenings,
+  readSecurityEvents,
   readQuotes,
   readFxRates,
   readTxns,
@@ -1534,5 +1809,8 @@ module.exports = {
   insertCloseSnapshot,
   getCloseSnapshotPayload,
   getCloseSnapshot,
-  upsertFxRate
+  upsertFxRate,
+  upsertSecurityEvent,
+  getSecurityEvent,
+  upsertPortfolioOpening
 };

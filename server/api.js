@@ -53,9 +53,8 @@ const MIME = {
 // 后续阶段拥有的写接口：URL 资源边界保持稳定，但实现留给对应阶段。
 // Phase 3 已实现：institutions / accounts / account-units / asset-transfers / liabilities / entitlements
 // 与 monthly-closes（ROADMAP Phase 3 工作项 1–6）。
+// Phase 4C 已实现：portfolio-openings / security-events（D-042）。
 const DEFERRED_WRITES = {
-  'POST /api/v1/portfolio-openings': 'Phase 4',
-  'POST /api/v1/security-events': 'Phase 4',
   'POST /api/v1/market-data/refresh': 'Phase 4',
   'POST /api/v1/risk-assessments': 'Phase 5',
   'POST /api/v1/recommendations': 'Phase 5'
@@ -257,9 +256,19 @@ const DOMAIN_ERROR_STATUS = {
   invalid_classification_status: 400,
   invalid_asset_class: 400,
   invalid_exposure_market: 400,
+  invalid_event: 400,
+  invalid_event_type: 400,
+  invalid_event_date: 400,
+  invalid_event_amount: 400,
+  invalid_quantity: 400,
+  invalid_opening: 400,
+  invalid_date: 400,
   payload_too_large: 413,
   duplicate_instrument: 409,
-  ambiguous_instrument: 409
+  ambiguous_instrument: 409,
+  duplicate_event: 409,
+  duplicate_opening: 409,
+  insufficient_holdings: 409
 };
 
 function catalogFail(res, result) {
@@ -430,7 +439,16 @@ function createHandler(ctx) {
 
   function upsertFail(res, err) {
     const code = (err && err.code) || 'internal_error';
-    const status = code === 'unknown_account' || code === 'unknown_unit' ? 422 : 400;
+    // 状态码集中归位：未知引用 422、客户端可修正的冲突 409（DOMAIN_ERROR_STATUS）、
+    // 其余领域校验 400、未预期异常 500 —— 前端必须能区分"写入被拒"和"服务出错"。
+    let status;
+    if (code === 'unknown_account' || code === 'unknown_unit' || code === 'unknown_instrument') {
+      status = 422;
+    } else if (code === 'internal_error') {
+      status = 500;
+    } else {
+      status = DOMAIN_ERROR_STATUS[code] || 400;
+    }
     return fail(res, status, code, err && err.message ? err.message : '写入失败', false);
   }
 
@@ -759,6 +777,73 @@ function createHandler(ctx) {
   api['GET /api/v1/holdings'] = (req, res) => {
     sendJson(res, 200, { items: R.readHoldings(ctx.db) });
   };
+
+  /* ---------- Phase 4C：持仓账本与证券事件（D-042） ---------- */
+
+  // 期初持仓快照：同一 (账户, 标的) 只允许一行事实；同 id 重复提交即幂等更新。
+  // 标的分类未确认（suggested）时允许写入，响应带 warning：§10 的语义是阻塞正式估值，不是拒绝录入。
+  api['POST /api/v1/portfolio-openings'] = async (req, res) => {
+    const body = await readBody(req);
+    const checked = newResourcePayload(
+      body,
+      [
+        { key: 'accountId', kind: 'name', code: 'invalid_account' },
+        { key: 'instrumentId', kind: 'name', code: 'invalid_instrument_id' },
+        { key: 'quantity', kind: 'decimal', code: 'invalid_quantity' },
+        { key: 'costMinor', kind: 'minor' },
+        { key: 'asOf', kind: 'date' }
+      ],
+      'open'
+    );
+    if (checked.error) return fail(res, 400, checked.error, '期初快照字段不合法：' + checked.error, false);
+    try {
+      const item = dbm.transaction(ctx.db, () => R.upsertPortfolioOpening(ctx.db, checked.value));
+      const ins = R.getInstrument(ctx.db, checked.value.instrumentId);
+      return sendJson(res, 201, {
+        ok: true,
+        item: item,
+        warning: ins && ins.classificationStatus !== 'confirmed' ? 'classification_unconfirmed' : null
+      });
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  // 证券事件（buy/sell/dividend/fee）：追加式事实，同 id 重放 → 409 duplicate_event；
+  // HTTP 层重试用 Idempotency-Key 回放首次响应（§5.6）。
+  // 事件绝不写 txns：证券事件不是现金流，现金余额仍由余额单元人工核对（D-034/S4C.1）。
+  api['POST /api/v1/security-events'] = async (req, res) => {
+    const body = await readBody(req);
+    const idemKey = req.headers['idempotency-key'];
+    if (idemKey) {
+      const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/security-events');
+      if (cached) return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+    }
+    const payload = body && typeof body === 'object' ? body : {};
+    const clientId = typeof payload.id === 'string' ? payload.id.trim() : '';
+    if (!payload.id) payload.id = newResourceId('sev');
+    else if (clientId && !/^[A-Za-z0-9_-]{1,64}$/.test(clientId)) {
+      return fail(res, 400, 'invalid_id', '事件 id 不合法', false);
+    }
+    try {
+      const item = dbm.transaction(ctx.db, () => R.upsertSecurityEvent(ctx.db, payload));
+      const ins = R.getInstrument(ctx.db, payload.instrumentId);
+      const response = {
+        ok: true,
+        item: item,
+        warning: ins && ins.classificationStatus !== 'confirmed' ? 'classification_unconfirmed' : null
+      };
+      if (idemKey) R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/security-events', response);
+      return sendJson(res, 201, response);
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  api['GET /api/v1/security-events'] = (req, res) => {
+    sendJson(res, 200, { items: R.readSecurityEvents(ctx.db) });
+  };
+
   api['GET /api/v1/quotes'] = (req, res) => {
     sendJson(res, 200, { items: R.readQuotes(ctx.db) });
   };

@@ -1335,7 +1335,7 @@
   /* ------------------------------ 备份与恢复 ------------------------------ */
 
   // v3 资产集合键（Schema v2 新增；键名与 js/domain.js 的 ASSET_KEYS 保持一致，见 ARCHITECTURE §5.1/5.2）
-  var V3_ASSET_KEYS = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
+  var V3_ASSET_KEYS = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates', 'securityEvents'];
 
   function emptyV3Assets() {
     var a = { schemaVersion: 1 };

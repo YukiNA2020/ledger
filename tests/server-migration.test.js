@@ -11,13 +11,13 @@ const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1–v4：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1–v5：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 4);
+    assert.strictEqual(rows.length, 5);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
     assert.strictEqual(rows[1].version, 2);
@@ -26,10 +26,19 @@ test('迁移 v1–v4：schema_migrations 记录版本并建齐必需表', () => 
     assert.strictEqual(rows[2].name, 'phase3-asset-transfers');
     assert.strictEqual(rows[3].version, 4);
     assert.strictEqual(rows[3].name, 'phase4b-instrument-dedupe');
+    assert.strictEqual(rows[4].version, 5);
+    assert.strictEqual(rows[4].name, 'phase4c-security-event-amounts');
     assert.strictEqual(tableExists(ctx.db, 'asset_transfers'), true, 'v3 应建立换汇事实表');
     assert.ok(
       get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'uq_instruments_dedupe'"),
       'v4 应建立标的去重唯一索引'
+    );
+    // v5：分红/费用事件总额列 + 事件重放索引
+    const eventCols = all(ctx.db, 'PRAGMA table_info(security_events)').map((c) => c.name);
+    assert.ok(eventCols.includes('amount_minor'), 'v5 应给 security_events 加 amount_minor 列');
+    assert.ok(
+      get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_account_instrument'"),
+      'v5 应建立事件重放索引'
     );
 
     const missing = REQUIRED_TABLES.filter((t) => !tableExists(ctx.db, t));
@@ -48,7 +57,7 @@ test('已发布 v2 库前向迁移到最新版本：保留账户与余额并新�
     db.exec("INSERT INTO account_units (id,account_id,currency,balance_minor,as_of) VALUES ('u1','a1','HKD',123456,'2026-09-15')");
 
     const migrated = M.migrate(db);
-    assert.deepStrictEqual(migrated.applied, [3, 4]);
+    assert.deepStrictEqual(migrated.applied, [3, 4, 5]);
     assert.strictEqual(tableExists(db, 'asset_transfers'), true);
     assert.strictEqual(get(db, 'SELECT balance_minor FROM account_units WHERE id = ?', ['u1']).balance_minor, 123456);
   } finally {

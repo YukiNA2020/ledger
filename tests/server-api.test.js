@@ -380,9 +380,22 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
     assert.strictEqual(phase3.status, 400);
     assert.strictEqual(phase3.json.error.code, 'invalid_name');
 
+    // Phase 4C 已实现 portfolio-openings / security-events（D-042）：空载荷进入真实校验（400），
+    // 不再是 501。
+    const openings = await request(srv.port, 'POST', '/api/v1/portfolio-openings', {
+      headers: writeHeaders(ctx),
+      body: '{}'
+    });
+    assert.strictEqual(openings.status, 400);
+    assert.strictEqual(openings.json.error.code, 'invalid_account');
+    const events = await request(srv.port, 'POST', '/api/v1/security-events', {
+      headers: writeHeaders(ctx),
+      body: '{}'
+    });
+    assert.strictEqual(events.status, 400);
+    assert.strictEqual(events.json.error.code, 'invalid_event');
+
     const cases = [
-      ['POST', '/api/v1/portfolio-openings', 'Phase 4'],
-      ['POST', '/api/v1/security-events', 'Phase 4'],
       ['POST', '/api/v1/market-data/refresh', 'Phase 4'],
       ['POST', '/api/v1/risk-assessments', 'Phase 5'],
       ['POST', '/api/v1/recommendations', 'Phase 5']

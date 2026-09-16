@@ -325,7 +325,7 @@ test('未实现的 Phase 4/5 写接口仍返回 501 并说明所属阶段', asyn
   const srv = await startServer(ctx);
   try {
     const cases = [
-      ['/api/v1/portfolio-openings', 'Phase 4'],
+      // portfolio-openings 已在 Phase 4C 实现（D-042），不再是 501
       ['/api/v1/market-data/refresh', 'Phase 4'],
       ['/api/v1/risk-assessments', 'Phase 5'],
       ['/api/v1/recommendations', 'Phase 5']

@@ -344,22 +344,22 @@ test('确认接口：冲突提示带 provider 候选值与 provenance，本地�
 
 /* ============================== 边界：不碰 4C/4D ============================== */
 
-test('4B 不提前实现持仓与行情写入：portfolio-openings / security-events / market-data 仍返回 501', async (t) => {
+test('4C 起持仓与事件写入已实现，行情刷新仍返回 501', async (t) => {
   const ctx = setup('ledger-p4b-scope-');
   const srv = await startServer(ctx);
   t.after(() => srv.close().then(() => ctx.close()));
   const port = srv.port;
 
-  const paths = [
-    '/api/v1/portfolio-openings',
-    '/api/v1/security-events',
-    '/api/v1/market-data/refresh'
-  ];
-  for (const p of paths) {
-    const res = await post(port, p, {});
-    assert.strictEqual(res.status, 501, p + ' 应为 501（属后续阶段）');
-    assert.ok(res.json.error && res.json.error.message, p + ' 应说明所属阶段');
-  }
+  // Phase 4C 已实现（D-042）：空载荷进入真实校验而不是 501
+  const openings = await post(port, '/api/v1/portfolio-openings', {});
+  assert.strictEqual(openings.status, 400);
+  const events = await post(port, '/api/v1/security-events', {});
+  assert.strictEqual(events.status, 400);
+
+  // 行情刷新仍属 4D（且要过 D-038 门禁），保持 501
+  const res = await post(port, '/api/v1/market-data/refresh', {});
+  assert.strictEqual(res.status, 501, 'market-data/refresh 应为 501（属 4D，且受 D-038 门禁）');
+  assert.ok(res.json.error && res.json.error.message, '应说明所属阶段');
 });
 
 test('标的目录接口不夹带账户/持仓字段，也不把私有文本写进响应', async (t) => {

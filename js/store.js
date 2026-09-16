@@ -174,7 +174,7 @@
     if (state.settings != null) return false;
     var legacyEmpty = (!state.accounts || state.accounts.length === 0) && (!state.txns || state.txns.length === 0);
     var a = state.assets || {};
-    var keys = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
+    var keys = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates', 'securityEvents'];
     var assetsEmpty = keys.every(function (k) {
       return !a[k] || a[k].length === 0;
     });
@@ -317,9 +317,28 @@
   }
 
   // 通用单条资源写入：institutions / accounts / account-units / liabilities / entitlements
-  function createResource(resource, payload) {
+  // opts.idempotencyKey：证券事件等追加式事实用（同一 key 重放返回首次响应，§5.6）
+  function createResource(resource, payload, options) {
+    var opts = options || {};
     return requireWriteMode().then(function () {
-      return apiFetch('/' + resource, { method: 'POST', body: payload });
+      return apiFetch('/' + resource, { method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey });
+    });
+  }
+
+  /* ------------------------- Phase 4C：持仓账本与证券事件 ------------------------- */
+
+  // 持仓列表：服务端推导视图（期初 + Σ买入 − Σ卖出，D-025）
+  function listHoldings() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { items: [] };
+      return apiFetch('/holdings', { token: false });
+    });
+  }
+
+  function listSecurityEvents() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { items: [] };
+      return apiFetch('/security-events', { token: false });
     });
   }
 
@@ -411,6 +430,8 @@
     saveMonthlyClose: saveMonthlyClose,
     searchInstruments: searchInstruments,
     createInstrument: createInstrument,
-    confirmInstrument: confirmInstrument
+    confirmInstrument: confirmInstrument,
+    listHoldings: listHoldings,
+    listSecurityEvents: listSecurityEvents
   };
 });

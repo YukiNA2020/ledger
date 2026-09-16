@@ -780,6 +780,93 @@
       equal(after[0].exchange, undefined, '检索是只读的：不得把参考数据的交易所写进本地事实');
     });
 
+    // Phase 4C 持仓账本：期初快照 → 买入 → 卖出 → 持有数量由服务端推导；
+    // 事件不进入现金流；全量写回（记账路径）不得抹掉事件（writeState 先清后写的反证）。
+    await check('持仓与证券事件：期初+买入−卖出推导持有数量，事件不被全量写回抹掉', async function () {
+      // 进入资产录入页（不在 tabbar 里，从决策台入口进）
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:assets"]'); }, 8000, '决策台资产入口');
+      clickAction('#view [data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('#inst-q'); }, 8000, '标的目录区块');
+
+      var st0 = await apiState();
+      var voo = (st0.assets.instruments || []).filter(function (r) { return r.symbol === 'VOO'; })[0];
+      assert(voo && voo.classificationStatus === 'confirmed', '前置：VOO 应已确认（4B 场景产物）');
+      var acc = (st0.assets.assetAccounts || [])[0];
+      assert(acc, '前置：应已有账户');
+      var txnsBefore = (st0.txns || []).length;
+
+      // 1) 期初快照：VOO × 10
+      clickAction('[data-action="holding:opening"]');
+      await waitFor(function () { return document.querySelector('#ho-qty'); }, 5000, '期初弹层');
+      document.querySelector('#ho-acc').value = acc.id;
+      document.querySelector('#ho-inst').value = voo.id;
+      document.querySelector('#ho-qty').value = '10';
+      document.querySelector('#ho-cost').value = '4500.00';
+      clickAction('[data-action="holding:saveOpening"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.holdings || []).some(function (h) { return h.quantity === '10'; });
+      }, 8000, '期初写入事实源');
+
+      // 2) 事件：买入 2
+      clickAction('[data-action="holding:event"]');
+      await waitFor(function () { return document.querySelector('#he-type'); }, 5000, '事件弹层');
+      document.querySelector('#he-type').value = 'buy';
+      document.querySelector('#he-acc').value = acc.id;
+      document.querySelector('#he-inst').value = voo.id;
+      document.querySelector('#he-qty').value = '2';
+      document.querySelector('#he-price').value = '500.00';
+      clickAction('[data-action="holding:saveEvent"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.securityEvents || []).length === 1;
+      }, 8000, '买入事件写入事实源');
+
+      // 3) 事件：卖出 1（重复提交同 id 会被拒；这里走页面每次都是新事件）
+      clickAction('[data-action="holding:event"]');
+      await waitFor(function () { return document.querySelector('#he-type'); }, 5000, '事件弹层再次打开');
+      document.querySelector('#he-type').value = 'sell';
+      document.querySelector('#he-acc').value = acc.id;
+      document.querySelector('#he-inst').value = voo.id;
+      document.querySelector('#he-qty').value = '1';
+      clickAction('[data-action="holding:saveEvent"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.securityEvents || []).length === 2;
+      }, 8000, '卖出事件写入事实源');
+
+      // 4) 事实源核对：GET /holdings 推导 10 + 2 − 1 = 11；事件不进现金流
+      var holdings = await fetch('/api/v1/holdings').then(function (r) { return r.json(); });
+      var vooHolding = holdings.items.filter(function (h) { return h.instrumentId === voo.id; })[0];
+      assert(vooHolding, '持仓视图应有 VOO 一行');
+      equal(vooHolding.quantity, '11', '持有数量必须是推导值 11');
+      equal(vooHolding.eventCounts.buy, 1, '买入事件计数');
+      equal(vooHolding.eventCounts.sell, 1, '卖出事件计数');
+      var st = await apiState();
+      equal((st.txns || []).length, txnsBefore, '证券事件不得新增现金流交易');
+
+      // 5) 界面核对：持仓区块展示推导数量，事件流水两条（用事实源 id 定位，不数文案）
+      assert(document.querySelector('[data-holding="' + acc.id + ':' + voo.id + '"]'),
+        '持仓区块应渲染 VOO 持仓卡片');
+      var eventCards = [];
+      document.querySelectorAll('[data-event-id]').forEach(function (el) { eventCards.push(el.dataset.eventId); });
+      equal(eventCards.length, 2, '事件流水应渲染两条');
+
+      // 6) 关键反证：全量写回（记账路径）不得抹掉事件与期初
+      var raw = await Store.loadRaw();
+      await Store.saveAll({
+        accounts: raw.accounts, categories: raw.categories,
+        txns: raw.txns, settings: raw.settings, assets: raw.assets
+      });
+      var st2 = await apiState();
+      equal((st2.assets.securityEvents || []).length, 2, '全量写回后事件必须仍在');
+      equal((st2.assets.holdings || []).length, 1, '全量写回后期初快照必须仍在');
+      var holdings2 = await fetch('/api/v1/holdings').then(function (r) { return r.json(); });
+      equal(holdings2.items.filter(function (h) { return h.instrumentId === voo.id; })[0].quantity, '11',
+        '全量写回后推导数量必须仍是 11');
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();

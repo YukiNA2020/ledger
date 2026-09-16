@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.7-phase4b';
+  var APP_VERSION = '2.3.8-phase4c';
 
   /* ================= 状态 ================= */
   var state = {
@@ -668,10 +668,127 @@
       '<div class="card">' + (fxRows || '<div class="small muted">暂无手动汇率；外币余额缺汇率时不计入汇总，且会阻塞正式结账</div>') +
       '<div class="small muted" style="margin-top:6px">自动行情将在后续版本接入；在此登记的是「币对 + 汇率 + 汇率日」这一条事实。</div></div>';
 
-    return html + accountSection + transferSection + liabSection + entSection + presetSection + catalogSection() + fxSection +
+    return html + accountSection + transferSection + liabSection + entSection + presetSection + catalogSection() + holdingsSection() + fxSection +
       '<div class="small muted" style="margin-top:12px">说明：权益只展示状态与备注，不计入任何资产合计；' +
       '外币余额按估值日汇率折算，缺汇率时该项不计入；换汇只记为资产转移，不计收入或支出；' +
       '标的分类由你确认后锁定，参考数据变化只提示差异。</div>';
+  }
+
+  /* ---------- 持仓与证券事件（Phase 4C，D-042）----------
+     数量只有一份推导口径（D-025）：期初 + Σ买入 − Σ卖出，由服务端与前端共用同一份
+     Domain.deriveHoldings 计算；分红/费用只记金额、不改数量；事件绝不进入现金流。 */
+  var EVENT_TYPE_LABELS = { buy: '买入', sell: '卖出', dividend: '分红', fee: '费用' };
+
+  function holdingsSection() {
+    var a = Domain.normalizeAssets(state.assets);
+    var accountMap = {}, instMap = {};
+    a.assetAccounts.forEach(function (x) { accountMap[x.id] = x; });
+    a.instruments.forEach(function (x) { instMap[x.id] = x; });
+
+    var derived = Domain.deriveHoldings(a.holdings, a.securityEvents).holdings;
+    var holdingRows = derived.map(function (h) {
+      var ins = instMap[h.instrumentId] || {};
+      var acc = accountMap[h.accountId] || {};
+      var counts = [];
+      if (h.counts.buy) counts.push('买 ' + h.counts.buy);
+      if (h.counts.sell) counts.push('卖 ' + h.counts.sell);
+      if (h.counts.dividend) counts.push('分红 ' + h.counts.dividend);
+      if (h.counts.fee) counts.push('费用 ' + h.counts.fee);
+      return '<div class="acc-card" data-holding="' + esc(h.accountId + ':' + h.instrumentId) + '">' +
+        '<div class="row"><b>' + esc(ins.symbol || h.instrumentId) + '</b>' +
+        '<span class="small muted" style="margin-left:auto">持有 ' + esc(h.quantity) + '</span></div>' +
+        '<div class="small muted">' + esc(acc.name || h.accountId || '未知账户') +
+        ' · 期初 ' + esc(h.openingQuantity == null ? '0（无期初）' : h.openingQuantity) +
+        (counts.length ? ' · ' + esc(counts.join(' / ')) : '') +
+        (h.lastEventAt ? ' · 最近事件 ' + esc(h.lastEventAt) : '') +
+        (ins.classificationStatus === 'confirmed' ? '' : ' · 分类未确认') +
+        (h.oversellEvents && h.oversellEvents.length ? ' · 存在未通过的超额卖出' : '') + '</div>' +
+        '</div>';
+    }).join('');
+
+    var eventRows = a.securityEvents.slice().sort(function (x, y) {
+      return String(y.occurredAt || '').localeCompare(String(x.occurredAt || ''));
+    }).map(function (e) {
+      var ins = instMap[e.instrumentId] || {};
+      var acc = accountMap[e.accountId] || {};
+      var cur = e.currency || ins.currency || '';
+      var detail;
+      if (e.eventType === 'buy' || e.eventType === 'sell') {
+        detail = (e.eventType === 'buy' ? '买入 ' : '卖出 ') + esc(e.quantity || '') +
+          (e.priceMinor != null ? ' @ ' + Core.fmtMoney(e.priceMinor) + ' ' + esc(cur) : '');
+      } else {
+        detail = esc(EVENT_TYPE_LABELS[e.eventType] || e.eventType) + ' ' + Core.fmtMoney(e.amountMinor) + ' ' + esc(cur);
+      }
+      return '<div class="acc-card" data-event-id="' + esc(e.id || '') + '">' +
+        '<div class="row"><b>' + esc(ins.symbol || e.instrumentId) + '</b>' +
+        '<span class="small muted" style="margin-left:auto">' + esc(e.occurredAt || '') + '</span></div>' +
+        '<div class="small muted">' + detail + ' · ' + esc(acc.name || e.accountId || '未知账户') + '</div>' +
+        '</div>';
+    }).join('');
+
+    var section = '<div class="sec-head"><b>持仓与证券事件</b>' +
+      '<span class="small"><button class="link" data-action="holding:opening">＋期初快照</button> ' +
+      '<button class="link" data-action="holding:event">＋记录事件</button></span></div>';
+    if (!holdingRows && !eventRows) {
+      return section + '<div class="empty"><div class="e-icon">📈</div><b>还没有持仓记录</b>' +
+        '<div class="small muted">先在标的目录建立标的，再登记期初快照或买卖事件；持有数量 = 期初 + 买入 − 卖出，由服务端统一推导</div></div>';
+    }
+    return section +
+      (holdingRows ? '<div class="card">' + holdingRows + '</div>' : '') +
+      (eventRows ? '<div class="sec-head"><b>事件流水</b></div><div class="card">' + eventRows + '</div>' : '');
+  }
+
+  function holdingOpeningSheet() {
+    var a = Domain.normalizeAssets(state.assets);
+    if (!a.assetAccounts.length) { toast('请先创建账户', 'warn'); return; }
+    if (!a.instruments.length) { toast('请先在标的目录建立标的', 'warn'); return; }
+    var accOpts = a.assetAccounts.map(function (acc) {
+      return '<option value="' + esc(acc.id) + '">' + esc(acc.name) + '</option>';
+    }).join('');
+    var instOpts = a.instruments.map(function (ins) {
+      return '<option value="' + esc(ins.id) + '">' + esc(ins.symbol) + (ins.exchange ? ' · ' + esc(ins.exchange) : '') + '</option>';
+    }).join('');
+    openSheet('登记期初持仓快照',
+      '<div class="form-row">' +
+      formItem('账户', '<select id="ho-acc">' + accOpts + '</select>') +
+      formItem('标的', '<select id="ho-inst">' + instOpts + '</select>') +
+      formItem('期初数量', '<input id="ho-qty" type="number" min="0" step="0.00000001" placeholder="如 10 或 10.5">') +
+      formItem('期初总成本（可选）', '<input id="ho-cost" type="number" min="0" step="0.01" placeholder="0.00">') +
+      formItem('核对日期', '<input id="ho-date" type="date" value="' + todayDateStr() + '">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">同一账户下同一标的只能有一行期初事实；' +
+      '之后的买入 / 卖出事件在此基础上推导持有数量。</div>' +
+      '<button class="btn primary block" data-action="holding:saveOpening">保存期初</button>');
+  }
+
+  function holdingEventSheet() {
+    var a = Domain.normalizeAssets(state.assets);
+    if (!a.assetAccounts.length) { toast('请先创建账户', 'warn'); return; }
+    if (!a.instruments.length) { toast('请先在标的目录建立标的', 'warn'); return; }
+    var accOpts = a.assetAccounts.map(function (acc) {
+      return '<option value="' + esc(acc.id) + '">' + esc(acc.name) + '</option>';
+    }).join('');
+    var instOpts = a.instruments.map(function (ins) {
+      return '<option value="' + esc(ins.id) + '">' + esc(ins.symbol) + (ins.exchange ? ' · ' + esc(ins.exchange) : '') + '</option>';
+    }).join('');
+    var typeOpts = Domain.SECURITY_EVENT_TYPES.map(function (t) {
+      return '<option value="' + esc(t) + '">' + esc(EVENT_TYPE_LABELS[t] || t) + '</option>';
+    }).join('');
+    openSheet('记录证券事件',
+      '<div class="form-row">' +
+      formItem('事件类型', '<select id="he-type">' + typeOpts + '</select>') +
+      formItem('账户', '<select id="he-acc">' + accOpts + '</select>') +
+      formItem('标的', '<select id="he-inst">' + instOpts + '</select>') +
+      formItem('数量（买卖必填）', '<input id="he-qty" type="number" min="0" step="0.00000001" placeholder="如 2 或 0.1">') +
+      formItem('每股价格（可选）', '<input id="he-price" type="number" min="0" step="0.01" placeholder="0.00">') +
+      formItem('手续费（可选）', '<input id="he-fee" type="number" min="0" step="0.01" placeholder="0.00">') +
+      formItem('分红/费用总额（分红、费用必填）', '<input id="he-amount" type="number" min="0" step="0.01" placeholder="0.00">') +
+      formItem('事件日期', '<input id="he-date" type="date" value="' + todayDateStr() + '">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">事件是追加式事实，重复提交会被拒绝；' +
+      '买入 / 卖出改变持有数量（卖出不得超过当时持有数量），分红 / 费用只记金额；' +
+      '证券事件不是现金流，不会进入收入或支出。</div>' +
+      '<button class="btn primary block" data-action="holding:saveEvent">保存事件</button>');
   }
 
   /* ---------- 标的目录（Phase 4B）----------
@@ -3229,6 +3346,71 @@
       Store.createInstrument({ symbol: symbol }).then(function (r) {
         var n = r && r.conflicts ? r.conflicts.length : 0;
         toast(n ? '参考数据与本地有 ' + n + ' 项差异（已列出，未覆盖）' : '参考数据已刷新；本地已确认值不变');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    /* ---------- Phase 4C：持仓与证券事件 ---------- */
+
+    'holding:opening': holdingOpeningSheet,
+    'holding:event': holdingEventSheet,
+    'holding:saveOpening': function () {
+      var accountId = $('#ho-acc').value;
+      var instrumentId = $('#ho-inst').value;
+      var quantity = $('#ho-qty').value.trim();
+      if (!/^\d+(\.\d{1,8})?$/.test(quantity) || !(parseFloat(quantity) > 0)) {
+        toast('期初数量必须是正数（最多 8 位小数）', 'warn'); return;
+      }
+      var payload = { accountId: accountId, instrumentId: instrumentId, quantity: quantity, asOf: $('#ho-date').value };
+      var costText = $('#ho-cost').value.trim();
+      if (costText) {
+        var cost = Math.round(parseFloat(costText) * 100);
+        if (!isFinite(cost) || cost < 0) { toast('成本格式不正确', 'warn'); return; }
+        payload.costMinor = cost;
+      }
+      Store.createResource('portfolio-openings', payload).then(function (r) {
+        closeSheet();
+        toast(r && r.warning ? '已登记期初（标的分类未确认，正式估值会被阻塞）' : '已登记期初快照');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'holding:saveEvent': function () {
+      var eventType = $('#he-type').value;
+      var payload = {
+        eventType: eventType,
+        accountId: $('#he-acc').value,
+        instrumentId: $('#he-inst').value,
+        occurredAt: $('#he-date').value
+      };
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(payload.occurredAt)) { toast('请选择事件日期', 'warn'); return; }
+      function minorOf(id) {
+        var text = $(id).value.trim();
+        if (!text) return null;
+        var v = Math.round(parseFloat(text) * 100);
+        return isFinite(v) && v >= 0 ? v : NaN;
+      }
+      if (eventType === 'buy' || eventType === 'sell') {
+        var qty = $('#he-qty').value.trim();
+        if (!/^\d+(\.\d{1,8})?$/.test(qty) || !(parseFloat(qty) > 0)) {
+          toast('买卖事件的数量必须是正数（最多 8 位小数）', 'warn'); return;
+        }
+        payload.quantity = qty;
+        var price = minorOf('#he-price');
+        var fee = minorOf('#he-fee');
+        if (isNaN(price) || isNaN(fee)) { toast('价格 / 手续费格式不正确', 'warn'); return; }
+        if (price != null) payload.priceMinor = price;
+        if (fee != null) payload.feeMinor = fee;
+      } else {
+        var amount = minorOf('#he-amount');
+        if (amount == null || isNaN(amount) || amount <= 0) {
+          toast('分红 / 费用事件必须填写大于 0 的总额', 'warn'); return;
+        }
+        payload.amountMinor = amount;
+      }
+      // 追加式事实：带一次性幂等键防双击重复提交；真重放由服务端 duplicate_event 拒绝
+      var idemKey = 'evt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+      Store.createResource('security-events', payload, { idempotencyKey: idemKey }).then(function (r) {
+        closeSheet();
+        toast(r && r.warning ? '事件已记录（标的分类未确认，正式估值会被阻塞）' : '事件已记录');
         return refreshAssets();
       }).catch(resourceFail);
     },

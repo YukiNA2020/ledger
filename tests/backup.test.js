@@ -58,7 +58,7 @@ test('S1.1 v1 备份恢复后 v3 资产集合初始化为空', () => {
   // v3 集合初始化为空，且可再次导出（schemaVersion 升级为 2）
   assert.deepStrictEqual(restored.assets, {
     schemaVersion: 1, assetAccounts: [], assetUnits: [], assetTransfers: [], liabilities: [], entitlements: [],
-    instruments: [], holdings: [], quotes: [], fxRates: []
+    instruments: [], holdings: [], quotes: [], fxRates: [], securityEvents: []
   });
   const again = Core.createBackup(restored, '2.0.0-rc.3', '2026-09-06T09:00:00.000Z');
   assert.strictEqual(again.schemaVersion, 2);
