@@ -11,6 +11,25 @@
 - **空白 provider 不再冒充来源**：provider 必须在 `trim()` 后仍非空，quote/fx 构造与直接结果校验使用同一口径。
 - **纠正 T-002 与 4A 验收状态**：T-002 改为“汇率已定、行情待 4D 前决定”；D-038 只代表启用门禁，不再被写成已经选定行情源。4A 标记为“契约完成、正式验收暂不通过”。
 
+## [2.3.6-phase4b] - 2026-09-16
+
+闭合 Phase 4B 独立复核发现的 3 项阻塞问题（2 项 P0：标的身份与去重可被绕过；1 项 P1：跨市场同代码被静默合并）与 1 项文档-实现一致性冲突。**本次不新增任何业务能力，只把既有语义从"应用层约定"升级为"可拒绝的硬约束"**。原始结论清单与逐条修复状态见 `PHASE4B_ACCEPTANCE_GAPS.md`（保留原始记录作证据）。
+
+### 修复
+
+- **标的身份只能由服务端派生**：`parseCreatePayload` 遇到客户端指定的 `id` 一律返回 `client_id_forbidden`（400），**显式拒绝而不是静默忽略** —— 悄悄改写客户端提交的身份字段会让它以为存的是另一个值，4C 的账户就会引用一个不存在的身份。`createInstrument` 去掉 `v.id` 分支，id 只按 identity key 派生；错误响应不回显客户端提交的 id。
+- **去重键在所有写入路径上成立**：`repository.writeInstruments`（`PUT /state`、JSON 恢复、备份还原）写入前按领域同口径（去空白 + 大写、缺交易所计空串）预校验去重键与 id，发现重复**整体拒绝**并抛 `duplicate_instrument`，由事务回滚保证"写入被拒 = 数据没动"；此前只有目录接口遵守这条不变量。
+- **数据库层兜底（迁移 v4）**：新增表达式唯一索引 `uq_instruments_dedupe`，把"同一标的只有一行事实"变成数据库不变量。迁移前检测历史重复数据，**存在重复即显式失败**（列出 `symbol@exchange` 与修复建议）而不是替用户挑选保留哪一行；只新增索引、不新增表，`backup.js` 必需表清单不变。
+- **冲突类错误不再被报成 500**：新增领域错误码 → HTTP 状态的集中映射，`PUT /state` 遇到重复/歧义标的返回 **409**（客户端可修正的冲突），前端因此能区分"这次写入被拒、数据没动"与"服务端出错"。
+- **缺交易所时不再静默合并跨市场同代码**：`findInstrumentByKey` 收集全部退化候选，多于一条时抛 `ambiguous_instrument`（HTTP 409 + 提示"请指明交易所"），不再按数据库行顺序选中第一条；只有一条同代码记录时仍允许补全交易所，"先手工建标、后由 provider 补全"的既有路径未被破坏。
+- **稳定 id 语义确定为"首次创建即永久锁定"**：id 由首次创建时的 identity key 派生，记录持久化 `identityKey`（新增 `stableIdFromKey` / `identityKeyOf`）；即便之后补全了交易所，id 与 `identityKey` 都不重算，外部用 `identityKey` 离线复算即可。文档不再声称"用当前交易所可重算 id"。**边界**：全量 `/state` 与备份恢复通道仍原样还原既有 id（历史快照带 4B 之前的旧形状 id，强制派生会破坏备份往返保真），该通道的强约束是去重键。
+
+### 备注
+
+- **D-039 ① ② 已按要求改写**（id 派生规则、跨市场歧义处理、去重键的强制层级），并新增边界说明；ARCHITECTURE §5.2、ACCEPTANCE S4B.1、ROADMAP 4B、README 同步。
+- 测试基线 `node --test` 344 → **357**（`instrument-catalog` 33→40、`server-phase4b` 11→15、`server-migration` 14→16），浏览器 wiring 保持 **16/16**（连续两轮全绿）。新增迁移 **v4**。
+- 4B 状态：**补口完成，等待独立复核确认**（复核前为"暂不通过，不建议进入 4C"）。
+
 ## [2.3.5-phase4b] - 2026-09-16
 
 交付 Phase 4B「标的目录与分类确认」（ROADMAP 4B、ACCEPTANCE S4B.1）。本阶段**不创建持仓**：`POST /api/v1/portfolio-openings|security-events|market-data/refresh` 仍返回 `501`（属 4C/4D）。零数据库迁移、零真实网络请求。
@@ -20,7 +39,7 @@
 - **标的检索与服务端编排**（`server/instrument-catalog.js`）：本地已建标的与 provider 候选按去重键 `symbol@exchange` 合并成唯一候选列表；provider 整体失败时**仍返回本地命中**并显式报告 `provider.status`（"没搜到"与"这次调用失败"可区分）；冲突清单逐条附带 provider 候选值与 provenance。纯编排模块：不碰 HTTP、不读系统时钟（时间由 `ctx.now` 注入）、不发真实网络。
 - **标的参考数据契约**（`server/providers/contract.js` 纯新增）：`serializeSearchRequest` / `serializeMetadataRequest` 的产物键集合恒为 `{query}` / `{symbol}` —— 调用方即便传入对象或夹带私有字段也无法把账户名、数量、成本带进对外请求；新增 `instrumentResult`（字段严格按 D-037 映射，`asset_class` / `exposure_market` / 跟踪指数**不在契约内**）与 `makeProvenance`（`{provider, endpoint, sourceVersion, sourceRef, fetchedAt, payloadHash}` 六字段齐备、形状受限）；`isValidResult` 增加 `kind === 'instrument'` 分支，要求键集合精确匹配。
 - **离线参考数据 fixture**（`server/providers/fixture.js` 扩展）：新增 `CATALOG` 数据集（VOO / 0700.HK / 2800.HK / 510300.SS 覆盖美/港/A 三市场，另有上游字段全缺的 `MYSTERY.ETF`、币种非法的 `BADMETA.ETF`、鉴权与超时场景）与 `searchInstrument` / `getInstrumentMetadata`；`payloadHash` 对上游字段规范化序列化后取 sha256，**任何一条 provenance 都可被外部重算复核**；上游缺项一律 `null`，不用空串或猜测值冒充。
-- **稳定标的 id**：`inst-<sha1(symbol@exchange) 前 16 位>` 确定性派生 —— 同一标的重复检索/重复加入永远得到同一个 id，后续多个证券账户（4C）可直接引用，并在写入路径上保证"同一标的不重复创建事实"。
+- **稳定标的 id**：`inst-<sha1(symbol@exchange) 前 16 位>` 确定性派生 —— 同一标的重复检索/重复加入永远得到同一个 id，后续多个证券账户（4C）可直接引用，并在写入路径上保证"同一标的不重复创建事实"。**（注意：本版本的 id 派生口径与"去重只在部分写入路径成立"已被上方的 `2.3.6-phase4b` 复核补口修订 —— 客户端不再能指定 id，id 改为按首次创建时的 identity key 派生并永久锁定，去重键覆盖全量写入路径并由迁移 v4 唯一索引兜底，跨市场同代码报 `ambiguous_instrument`。）**
 - **用户判断字段词表**（`js/domain.js`）：`EXPOSURE_MARKETS = ['CN','HK','US','global','other']`；`USER_JUDGEMENT_FIELDS` 明示 `assetClass` / `exposureMarket` / `trackingIndex` 只能由用户填写；`diffInstrumentFields` 只比较同名字段（provider 未给的字段不构成冲突），`suggestFromProvider` 返回带依据的 `[{field, value, basis}]`。
 - **标的 API**（`server/api.js`）：`GET /api/v1/instruments/search?q=`（只读，只发送公开检索词）、`POST /api/v1/instruments`（默认从参考数据补全；`source=manual` 用于 provider 未覆盖的标的，币种必填）、`POST /api/v1/instrument-confirmations`（`asset_class` / `exposure_market` 必填）。错误码到 HTTP 状态集中映射（400 / 404 / 409 / 422 / 503）。
 - **资产页「标的目录」区块**（`js/app.js` + `js/store.js` 门面）：搜索框、候选列表（标出"已在目录中"）、目录列表（状态、来源、差异数）、确认弹层与手工建立弹层。前端不直接 `fetch`，一律走 `store.js`。

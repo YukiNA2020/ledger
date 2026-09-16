@@ -61,6 +61,12 @@ test('稳定 id 可被外部按同一口径复算（后续多个证券账户可�
   assert.strictEqual(Domain.instrumentKey('VOO', 'NYSE'), 'VOO@NYSE');
 });
 
+test('id 由 identity key 一步派生：外部只需存下 identityKey 就能复算（不需要知道派生细节）', () => {
+  assert.strictEqual(Catalog.stableIdFromKey('VOO@NYSE'), Catalog.stableInstrumentId('VOO', 'NYSE'));
+  assert.strictEqual(Catalog.stableIdFromKey('2800.HK@HKEX'), Catalog.stableInstrumentId('2800.HK', 'HKEX'));
+  assert.ok(/^inst-[0-9a-f]{16}$/.test(Catalog.stableIdFromKey('CROSS@')));
+});
+
 test('不同标的（代码或交易所不同）得到不同 id；交易所缺失时退化为代码本身这一键', () => {
   const ids = [
     Catalog.stableInstrumentId('VOO', 'NYSE'),
@@ -106,7 +112,7 @@ test('建立标的载荷：非法符号/来源/币种/分类一律稳定报错�
     [{ symbol: 'VOO', assetClass: '现金' }, 'invalid_asset_class'],
     [{ symbol: 'VOO', exposureMarket: '日本' }, 'invalid_exposure_market'],
     [{ symbol: 'VOO', name: 'x'.repeat(121) }, 'invalid_name'],
-    [{ symbol: 'VOO', id: 'bad id' }, 'invalid_id']
+    [{ symbol: 'VOO', id: 'bad id' }, 'client_id_forbidden']
   ];
   for (const [body, code] of cases) {
     const p = Catalog.parseCreatePayload(body);
@@ -630,3 +636,197 @@ test('写入未知字段进 extra_json 且读回零丢失（provider 留档与�
     ctx.close();
   }
 });
+
+/* ==================== 身份不可变、去重兜底与歧义（4B 复核补口） ==================== */
+
+test('客户端指定的 id 无法落到库里：建立 VOO 得到的是服务端派生的 id', async () => {
+  const ctx = setup('ledger-4b-id-forge-');
+  try {
+    const res = await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'VOO', id: 'client-chosen-id' },
+      CTX
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, 'client_id_forbidden');
+    assert.strictEqual(instrumentsOf(ctx.db, 'VOO').length, 0, '被拒绝的请求不得写入任何标的');
+
+    // 同一请求去掉 id 后走正常路径：id 必须是可复算的派生值
+    const ok = await Catalog.createInstrument(ctx.db, Fixture, { symbol: 'VOO' }, CTX);
+    assert.strictEqual(ok.ok, true);
+    assert.strictEqual(ok.item.id, Catalog.stableInstrumentId('VOO', 'NYSE'));
+    assert.strictEqual(ok.item.identityKey, 'VOO@NYSE');
+    assert.strictEqual(Catalog.stableIdFromKey(ok.item.identityKey), ok.item.id);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('先建无交易所标的、后补交易所：id 与 identityKey 都不重算（4C 引用永远有效）', async () => {
+  const ctx = setup('ledger-4b-idkey-');
+  try {
+    const manual = await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'CROSS', source: 'manual', currency: 'USD' },
+      CTX
+    );
+    assert.strictEqual(manual.ok, true);
+    assert.strictEqual(manual.item.id, Catalog.stableIdFromKey('CROSS@'));
+    assert.strictEqual(manual.item.identityKey, 'CROSS@');
+
+    const again = await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'CROSS', source: 'manual', currency: 'USD', exchange: 'HKEX' },
+      CTX
+    );
+    assert.strictEqual(again.ok, true);
+    assert.strictEqual(again.item.id, manual.item.id, 'id 一旦分配就必须永久不变');
+    assert.strictEqual(again.item.identityKey, 'CROSS@', 'identityKey 是首次创建时的值');
+    assert.strictEqual(again.item.exchange, 'HKEX', '补全的交易所照常写入');
+    assert.strictEqual(again.duplicated, true, '补全走的是同一行，不是第二行事实');
+    assert.strictEqual(Catalog.stableIdFromKey(again.item.identityKey), again.item.id, 'id 必须能由 identityKey 复算');
+    assert.strictEqual(instrumentsOf(ctx.db, 'CROSS').length, 1);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('同代码跨市场存在多行时，缺交易所的查找报 ambiguous_instrument 而不是任选一行', async () => {
+  const ctx = setup('ledger-4b-ambig-');
+  try {
+    R.upsertInstrument(
+      ctx.db,
+      { id: Catalog.stableInstrumentId('CROSS', 'NYSE'), symbol: 'CROSS', exchange: 'NYSE', currency: 'USD' },
+      { now: NOW }
+    );
+    R.upsertInstrument(
+      ctx.db,
+      { id: Catalog.stableInstrumentId('CROSS', 'HKEX'), symbol: 'CROSS', exchange: 'HKEX', currency: 'HKD' },
+      { now: NOW }
+    );
+
+    assert.throws(
+      () => R.findInstrumentByKey(ctx.db, 'CROSS', ''),
+      (e) => e && e.code === 'ambiguous_instrument'
+    );
+    assert.throws(
+      () => R.findInstrumentByKey(ctx.db, 'CROSS', null),
+      (e) => e && e.code === 'ambiguous_instrument'
+    );
+    // 明确指定交易所时照常命中（歧义只发生在"没说是哪个市场"的时候）
+    assert.strictEqual(R.findInstrumentByKey(ctx.db, 'CROSS', 'NYSE').exchange, 'NYSE');
+    assert.strictEqual(R.findInstrumentByKey(ctx.db, 'CROSS', 'HKEX').exchange, 'HKEX');
+
+    const res = await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'CROSS', source: 'manual', currency: 'USD' },
+      CTX
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, 'ambiguous_instrument');
+    assert.ok(res.message.indexOf('ambiguous') === -1, '对外只给中文提示，不暴露内部错误码文本');
+    assert.strictEqual(instrumentsOf(ctx.db, 'CROSS').length, 2, '报歧义时不得改动任何一行');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('退化匹配在一行时仍然补全交易所（歧义检测不破坏"手工建标后补全"的既有路径）', async () => {
+  const ctx = setup('ledger-4b-loose1-');
+  try {
+    R.upsertInstrument(
+      ctx.db,
+      { id: Catalog.stableInstrumentId('CROSS', ''), symbol: 'CROSS', exchange: null, currency: 'USD' },
+      { now: NOW }
+    );
+    const hit = R.findInstrumentByKey(ctx.db, 'CROSS', 'NYSE');
+    assert.strictEqual(hit, null === null ? hit : hit);
+    assert.strictEqual(hit.symbol, 'CROSS');
+    assert.strictEqual(hit.exchange, null);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('全量写入（PUT /state）对重复去重键整体拒绝，且已存数据原样保留', () => {
+  const ctx = setup('ledger-4b-state-dup-');
+  try {
+    const empty = { assetAccounts: [], assetUnits: [], assetTransfers: [], liabilities: [], entitlements: [], holdings: [], quotes: [], fxRates: [] };
+    const withInstruments = (instruments) =>
+      Object.assign({ settings: {} }, { assets: Object.assign({}, empty, { instruments: instruments }) });
+
+    R.writeState(
+      ctx.db,
+      withInstruments([{ id: 'inst-a', symbol: 'VOO', exchange: 'NYSE', currency: 'USD' }])
+    );
+    assert.strictEqual(instrumentsOf(ctx.db, 'VOO').length, 1);
+
+    // 4B 复核 P0：大小写/空白不同的同一标的不允许同时落库
+    assert.throws(
+      () =>
+        R.writeState(
+          ctx.db,
+          withInstruments([
+            { id: 'inst-a', symbol: 'VOO', exchange: 'NYSE', currency: 'USD' },
+            { id: 'inst-b', symbol: 'voo', exchange: 'nyse', currency: 'USD' }
+          ])
+        ),
+      (e) => e && e.code === 'duplicate_instrument'
+    );
+    // 整体回滚：写入被拒后库里还是上一次的状态，不是"清空后失败"
+    assert.strictEqual(instrumentsOf(ctx.db, 'VOO').length, 1);
+    assert.strictEqual(R.getInstrument(ctx.db, 'inst-b'), null, '被拒绝的行不得落库');
+
+    // 同一 id 重复出现同样拒绝
+    assert.throws(
+      () =>
+        R.writeState(
+          ctx.db,
+          withInstruments([
+            { id: 'inst-a', symbol: 'VOO', exchange: 'NYSE', currency: 'USD' },
+            { id: 'inst-a', symbol: 'QQQ', exchange: 'NASDAQ', currency: 'USD' }
+          ])
+        ),
+      (e) => e && e.code === 'duplicate_instrument'
+    );
+  } finally {
+    ctx.close();
+  }
+});
+
+test('数据库唯一索引兜底：绕过应用层直接插入重复去重键也会被拒', () => {
+  const ctx = setup('ledger-4b-idx-');
+  try {
+    ctx.db.exec("INSERT INTO instruments (id,symbol,exchange,currency) VALUES ('x1','VOO','NYSE','USD')");
+    // 归一后相同的两行（大小写不同）
+    assert.throws(
+      () => ctx.db.exec("INSERT INTO instruments (id,symbol,exchange,currency) VALUES ('x2','voo','nyse','USD')"),
+      /UNIQUE|constraint/i
+    );
+    // 空白差异同样参与去重
+    assert.throws(
+      () => ctx.db.exec("INSERT INTO instruments (id,symbol,exchange,currency) VALUES ('x3',' VOO ',' NYSE ','USD')"),
+      /UNIQUE|constraint/i
+    );
+    // 缺交易所计入空串这一键，两行同样冲突
+    ctx.db.exec("INSERT INTO instruments (id,symbol,exchange,currency) VALUES ('y1','CROSS',NULL,'USD')");
+    assert.throws(
+      () => ctx.db.exec("INSERT INTO instruments (id,symbol,exchange,currency) VALUES ('y2','CROSS',NULL,'USD')"),
+      /UNIQUE|constraint/i
+    );
+    // 不同交易所是不同标的，允许共存
+    ctx.db.exec("INSERT INTO instruments (id,symbol,exchange,currency) VALUES ('z1','CROSS','NYSE','USD')");
+    assertCrossExchangesCoexist(ctx);
+  } finally {
+    ctx.close();
+  }
+});
+
+function assertCrossExchangesCoexist(ctx) {
+  const rows = R.readInstrumentRecords(ctx.db).filter((r) => r.symbol === 'CROSS');
+  assert.strictEqual(rows.length, 2, '同一代码的不同交易所必须能共存');
+}

@@ -224,6 +224,7 @@ const CATALOG_ERROR_STATUS = {
   invalid_symbol: 400,
   invalid_source: 400,
   invalid_id: 400,
+  client_id_forbidden: 400,
   invalid_currency: 400,
   invalid_exchange: 400,
   invalid_name: 400,
@@ -235,9 +236,25 @@ const CATALOG_ERROR_STATUS = {
   currency_mismatch: 400,
   instrument_not_found: 404,
   duplicate_instrument: 409,
+  ambiguous_instrument: 409,
   invalid_provider_payload: 422,
   provider_unavailable: 503,
   internal_error: 500
+};
+
+// 领域层错误码 → HTTP 状态（handler 抛错时的集中映射）。
+// 关键：仓储层的重复/歧义是**客户端可修正**的冲突，不能像未预期异常那样报 500 —— 前端要能
+// 区分"这次写入被拒绝了，数据没动"和"服务端出错了"。未知码一律 500。
+const DOMAIN_ERROR_STATUS = {
+  invalid_json: 400,
+  invalid_state: 400,
+  invalid_id: 400,
+  invalid_symbol: 400,
+  invalid_currency: 400,
+  invalid_exchange: 400,
+  payload_too_large: 413,
+  duplicate_instrument: 409,
+  ambiguous_instrument: 409
 };
 
 function catalogFail(res, result) {
@@ -990,7 +1007,7 @@ function createHandlerEntry(ctx) {
         result.catch((err) => {
           if (res.headersSent) return;
           const code = err && err.code ? err.code : 'internal_error';
-          const status = code === 'invalid_json' ? 400 : code === 'payload_too_large' ? 413 : 500;
+          const status = DOMAIN_ERROR_STATUS[code] || 500;
           ctx.logger.error('处理 ' + key + ' 失败：' + (err && err.message ? err.message : String(err)));
           fail(res, status, code, err && err.message ? err.message : '服务内部错误', status >= 500);
         });

@@ -39,7 +39,6 @@ const SOURCE_PROVIDER = 'provider';
 const SOURCE_MANUAL = 'manual';
 
 const MAX_NAME_LENGTH = 120;
-const MAX_ID_LENGTH = 64;
 
 // provider 字段 → 本地记录字段（D-037 的映射）。
 // 只映射 provider 真有的字段；asset_class / exposure_market / 跟踪指数不在此列。
@@ -54,11 +53,26 @@ const PROVIDER_FIELD_MAP = {
 
 /* ------------------------------ 稳定 id ------------------------------ */
 
-// 标的 id 由去重键确定性派生：同一个 (symbol, exchange) 永远得到同一个 id，
+// identity key（`symbol@exchange`，大小写与空白归一）→ 标的 id。
+// 这是全产品**唯一**的 id 派生实现：其他模块不得另写一套哈希口径。
+function stableIdFromKey(key) {
+  return 'inst-' + crypto.createHash('sha1').update(String(key || ''), 'utf8').digest('hex').slice(0, 16);
+}
+
+// 标的 id 由 identity key 确定性派生：同一个 key 永远得到同一个 id，
 // 因此重复检索/重复加入不会凭空多出第二条事实（4C 的持仓可放心引用）。
 function stableInstrumentId(symbol, exchange) {
   const key = Domain.instrumentKey(symbol, exchange) || String(symbol || '').trim().toUpperCase();
-  return 'inst-' + crypto.createHash('sha1').update(key, 'utf8').digest('hex').slice(0, 16);
+  return stableIdFromKey(key);
+}
+
+// 一条已有标的的 identity key：创建时落库的那个，永久不变。
+// 即便后来由 provider 补全了交易所，id 也**不重算** —— 4C 的持仓引用因此永远有效。
+// 记录里持久化 identityKey，外部可用它离线复算 id（而不是用"当前交易所"重算）。
+function identityKeyOf(record) {
+  if (!record) return null;
+  if (typeof record.identityKey === 'string' && record.identityKey) return record.identityKey;
+  return Domain.instrumentKey(record.symbol, record.exchange);
 }
 
 function failure(code, message, retryable) {
@@ -89,12 +103,11 @@ function parseCreatePayload(body) {
 
   const out = { symbol: symbol, source: source };
 
+  // 标的 id 是服务端按 identity key 派生的身份，**不接受客户端指定**（D-039）。
+  // 这里显式拒绝而不是静默忽略：悄悄改写客户端提交的身份字段，正是"无声分叉"——
+  // 客户端以为自己指定了 id，实际存的是另一个值，4C 的引用就会指向不存在的身份。
   if (b.id != null && trimmed(b.id) !== '') {
-    const id = trimmed(b.id);
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id) || id.length > MAX_ID_LENGTH) {
-      return failure('invalid_id', '标的 id 不合法', false);
-    }
-    out.id = id;
+    return failure('client_id_forbidden', '标的 id 由服务端按 symbol@exchange 派生，不接受客户端指定', false);
   }
   if (b.currency != null && trimmed(b.currency) !== '') {
     const c = trimmed(b.currency).toUpperCase();
@@ -440,8 +453,15 @@ function createInstrument(db, provider, body, ctx) {
 
     const symbol = (fields && fields.symbol) || v.symbol;
     const lookupExchange = (fields && fields.exchange) || v.exchange || '';
-    const existing =
-      R.findInstrumentByKey(db, symbol, lookupExchange) || R.findInstrumentByKey(db, symbol, v.exchange || '');
+    let existing;
+    try {
+      // 退化匹配可能命中不止一条（同代码在 NYSE / HKEX 都上市）：宁可报歧义让用户指明交易所，
+      // 也不按行顺序静默合并到第一条上（那会把跨市场标的算成同一个）。
+      existing =
+        R.findInstrumentByKey(db, symbol, lookupExchange) || R.findInstrumentByKey(db, symbol, v.exchange || '');
+    } catch (e) {
+      return failure((e && e.code) || 'internal_error', (e && e.message) || '标的查找失败', false);
+    }
     const merged = mergeCandidate(existing, fields);
 
     // 已确认的标的：本地锁定。业务字段与分类**一律不改**，只刷新来源留档与冲突提示（D-037）。
@@ -461,7 +481,9 @@ function createInstrument(db, provider, body, ctx) {
               : existing.exchangeTimezone,
         classificationStatus: 'confirmed',
         confirmedAt: existing.confirmedAt,
-        createdAt: existing.createdAt
+        createdAt: existing.createdAt,
+        // 已确认标的的身份也一并锁定：id 与 identity key 都不重算（D-039）。
+        identityKey: identityKeyOf(existing) || existing.identityKey
       });
       kept.conflicts = conflictsFor(kept);
       try {
@@ -492,8 +514,13 @@ function createInstrument(db, provider, body, ctx) {
       return failure('invalid_currency', '标的币种必须是 CNY/HKD/USD', false);
     }
 
+    // 身份：已存在就沿用原 id 与 identity key（**永不重算**，即使本次补全了交易所）；
+    // 新建才派生一次。客户端无法影响这个值（载荷里的 id 已被拒绝）。
+    const identityKey = identityKeyOf(existing) || Domain.instrumentKey(symbol, merged.exchange);
+
     const record = {
-      id: existing ? existing.id : v.id || stableInstrumentId(symbol, merged.exchange),
+      id: existing ? existing.id : stableIdFromKey(identityKey),
+      identityKey: identityKey,
       symbol: symbol,
       exchange: merged.exchange,
       currency: currency,
@@ -570,6 +597,8 @@ module.exports = {
   SOURCE_PROVIDER: SOURCE_PROVIDER,
   SOURCE_MANUAL: SOURCE_MANUAL,
   stableInstrumentId: stableInstrumentId,
+  stableIdFromKey: stableIdFromKey,
+  identityKeyOf: identityKeyOf,
   parseCreatePayload: parseCreatePayload,
   parseConfirmPayload: parseConfirmPayload,
   providerFieldsOf: providerFieldsOf,

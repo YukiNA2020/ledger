@@ -143,7 +143,7 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4B｜标的目录与分类确认
 
-状态：**已完成并验收（2026-09-16，`v2.3.5-phase4b`）**。
+状态：**已完成；复核补口完成（2026-09-16，`v2.3.5-phase4b` → 补口 `v2.3.6-phase4b`），等待独立复核确认**。独立复核曾判定"暂不通过、不建议进入 4C"（标的身份与去重边界 3 项可复现问题），原始结论与逐条修复状态见 `PHASE4B_ACCEPTANCE_GAPS.md`。
 
 范围：
 
@@ -161,10 +161,10 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 - 离线参考数据：`server/providers/fixture.js` 的 `CATALOG` + `searchInstrument` / `getInstrumentMetadata`（缺项 `null`，坏元数据转显式 `invalid_payload`）；
 - 预分类与用户判断字段：`js/domain.js` 的 `diffInstrumentFields` / `suggestFromProvider` / `EXPOSURE_MARKETS` / `USER_JUDGEMENT_FIELDS`；`asset_class` / `exposure_market` / 跟踪指数只能由用户填写与确认（D-037、D-039）；
 - 确认与本地锁定：`POST /api/v1/instrument-confirmations`（两项用户判断必填）；`confirmed` 记录在后续刷新中保持状态与值不变，差异只以 `conflicts[]` + provenance 提示；
-- 稳定 id 与去重：`inst-<sha1(symbol@exchange) 前16位>`；`repository.upsertInstrument` 对同一去重键显式抛 `duplicate_instrument`（不静默删行）；
-- 前端：资产页「标的目录」区块（搜索/候选/目录/确认弹层/手工建立弹层），经 `js/store.js` 门面访问；`APP_VERSION` 与 SW 缓存键升至 `2.3.5-phase4b`。
+- 稳定 id 与去重：id 由**首次创建时的 identity key** 派生并永久锁定（`inst-<sha1(identityKey) 前16位>`，记录持久化 `identityKey`，外部可离线复算；客户端指定的 id 一律拒绝 `client_id_forbidden`）；去重键 `(symbol, exchange)` 在**所有**写入路径（目录接口 / 单条 upsert / 全量 `PUT /state`）显式拒绝同键第二行（`duplicate_instrument` → 409 + 事务回滚），并由迁移 **v4** 表达式唯一索引 `uq_instruments_dedupe` 在数据库层兜底；同代码跨市场存在多行时报 `ambiguous_instrument`（409）要求指明交易所；
+- 前端：资产页「标的目录」区块（搜索/候选/目录/确认弹层/手工建立弹层），经 `js/store.js` 门面访问；`APP_VERSION` 与 SW 缓存键升至 `2.3.6-phase4b`。
 
-退出证据：全量 `node --test` **344/344**（274 基线零回归 + 70 项 4B）；浏览器 wiring **16/16**（新增 1 项真实产品入口闭环，连续两轮全绿）；`DEFERRED_WRITES` 未动（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）；零数据库迁移、零真实网络请求。详见 `ACCEPTANCE.md` S4B.1 与 `TEST.md` 的 Phase 4B 证据节。
+退出证据：全量 `node --test` **357/357**（344 基线零回归 + 13 项复核补口反例/不变量）；浏览器 wiring **16/16**（真实产品入口闭环 + `/state` 写入回归，干净环境连续两轮全绿）；`DEFERRED_WRITES` 未动（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）；迁移 v4 只新增一条表达式唯一索引（不新增表）；零真实网络请求。详见 `ACCEPTANCE.md` S4B.1、`TEST.md` 的 Phase 4B 证据节与 `PHASE4B_ACCEPTANCE_GAPS.md`。
 
 ### Phase 4C｜持仓账本与证券事件
 

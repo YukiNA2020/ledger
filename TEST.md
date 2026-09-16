@@ -6,9 +6,9 @@
 
 ## 当前结论
 
-- **测试对象：** v2.3.5-phase4b（v3 Phase 4B 标的目录与分类确认）
-- **总体状态：** ✅ Phase 4B 已完成并验收（S4B.1 通过）。`node --test` **344/344**（274 基线零回归 + 70 项 4B：`providers-catalog` 26、`instrument-catalog` 33、`server-phase4b` 11），浏览器 wiring **16/16**（新增 1 项真实产品入口闭环，连续两轮全绿）。
-- **发布判断：** Phase 4B 退出条件全部满足。**Phase 4A 仍为「契约完成、正式验收暂不通过」**——T-002 仅汇率源已定，行情端点待 4D 开始前通过 D-038 门禁后决定。本轮零数据库迁移、零真实网络请求、未创建持仓（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）。
+- **测试对象：** v2.3.6-phase4b（v3 Phase 4B 标的目录与分类确认，含独立复核补口）
+- **总体状态：** ✅ 复核补口完成，等待独立复核确认。`node --test` **357/357**（344 基线零回归 + 13 项复核补口反例/不变量：`instrument-catalog` 33→40、`server-phase4b` 11→15、`server-migration` 14→16），浏览器 wiring **16/16**（干净环境连续两轮全绿）。
+- **发布判断：** 独立复核曾判定 4B **暂不通过、不建议进入 4C**（标的身份可被客户端指定、全量 `/state` 可绕过去重、跨市场同代码被静默合并 —— 2 项 P0 + 1 项 P1），三项均已修复并补真实 HTTP 反例，原始结论与逐条修复状态见 `PHASE4B_ACCEPTANCE_GAPS.md`。**Phase 4A 仍为「契约完成、正式验收暂不通过」**——T-002 仅汇率源已定，行情端点待 4D 开始前通过 D-038 门禁后决定。本轮新增迁移 v4（仅一条表达式唯一索引）、零真实网络请求、未创建持仓（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）。
 
 本轮只使用仓库内的虚构、脱敏数据。标准虚构数据与预期口径见 `ACCEPTANCE.md` §2。
 
@@ -43,10 +43,18 @@
 | 参考数据 adapter（检索与元数据） | `node --test tests/providers-catalog.test.js` | 2026-09-16 | ✅ 26/26 | 候选键集合精确（不夹带 `assetClass`/`exposureMarket`/`trackingIndex`）、大小写与名称片段检索、一个词命中多条且坏记录单独报错、无命中返回空数组而不是错误、provider 级失败 `subject` 为空、缺项一律 `null`（`MYSTERY.ETF` 证明"没给就不编造"）、小写币种记录转显式 `invalid_payload` 不作为候选流出、provenance 六字段与 `payloadHash` 可外部重算、`sourceRef` 缺失用 `NA` 占位、`fetchedAt` 取自注入时钟、非法检索词/缺 `ctx.now` 整体拒绝且不回显原文 |
 | 目录编排与本地锁定 | `node --test tests/instrument-catalog.test.js` | 2026-09-16 | ✅ 33/33 | 稳定 id 确定性派生与可复算、建立载荷白名单（夹带 `accountName`/`quantity`/`costMinor` 一个都进不了产物）、非法载荷稳定报错不回显、确认两项用户判断必填 + `EXPOSURE_MARKETS` 词表边界、冲突只报同名字段差异且带 provenance、检索合并与 `local+provider` 去重、provider 挂了仍返回本地命中、建立/重复建立/币种冲突/手工建标（缺币种拒绝、provider 未覆盖可用）/退化匹配补全交易所、确认与 `confirmed` 锁定、**确认后刷新不覆盖（`preserved:true`、状态不退回 `suggested`）**、`duplicate_instrument` 不静默删行、`extra_json` 零丢失 |
 | S4B.1 API 端到端 | `node --test tests/server-phase4b.test.js` | 2026-09-16 | ✅ 11/11 | 主链路（检索 → 建立 `suggested` → 确认 `confirmed` → 再刷新不覆盖且目录仅一行）走真实 HTTP 入口；provider 失败时本地命中仍返回；检索词非法 400 且不回显；写请求缺/错 `Content-Type` 415 且不改数据；建立校验失败矩阵（400/404/422 与错误码）；手工建立（provider 未覆盖）；确认失败矩阵（400/404）；冲突提示带 provider 值与 provenance；`portfolio-openings`/`security-events`/`market-data/refresh` 仍 501；目录响应不含账户/持仓字段 |
-| 全量回归 | `node --test` | 2026-09-16 | ✅ 344/344 | 274 项 Phase 1–4A 零回归 + 70 项 Phase 4B |
-| 浏览器接线验收（真实产品入口闭环） | `tests/app-wiring.html`（本地服务托管） | 2026-09-16 | ✅ 16/16 | 新增 1 项：从决策台进入资产录入页 → 检索 VOO → 加入目录（事实源为 `suggested`、`assetClass`/`exposureMarket` 未生成）→ 弹层确认 `broad_equity`/`US`/`S&P 500` → 事实源为 `confirmed` → 按参考数据刷新后 id 不变、目录仍一行、状态与三个用户值全部保持；连续两轮全绿 |
+| 全量回归 | `node --test` | 2026-09-16 | ✅ 357/357 | 344 项 Phase 1–4B 零回归 + 13 项复核补口反例/不变量 |
+| 浏览器接线验收（真实产品入口闭环） | `tests/app-wiring.html`（本地服务托管） | 2026-09-16 | ✅ 16/16 | 新增 1 项：从决策台进入资产录入页 → 检索 VOO → 加入目录（事实源为 `suggested`、`assetClass`/`exposureMarket` 未生成）→ 弹层确认 `broad_equity`/`US`/`S&P 500` → 事实源为 `confirmed` → 按参考数据刷新后 id 不变、目录仍一行、状态与三个用户值全部保持；本轮又复跑两轮确认 `/state` 写入路径改动无回归 |
 
-**Phase 4B 合计：`node --test` 344/344（274 + 70），浏览器 wiring 16/16。**
+**Phase 4B 合计：`node --test` 357/357（344 + 13），浏览器 wiring 16/16。**
+
+### Phase 4B 复核补口证据（2026-09-16，独立复核后）
+
+| 范围 | 方法 | 日期 | 结果 | 说明 |
+|------|------|------|------|------|
+| 身份、去重、歧义（纯逻辑） | `node --test tests/instrument-catalog.test.js` | 2026-09-16 | ✅ 40/40 | 新增 7 项：客户端 id（含像派生值的 `inst-…`、含空格、含中文）一律 `client_id_forbidden` 且不回显、空串/缺省不算指定；`stableIdFromKey` 与派生 id 同源；伪造 id 建立被拒且目录零写入；无交易所建标 → 补 HKEX 后 id 与 `identityKey` 都不变（`duplicated:true`、目录一行）；多候选抛 `ambiguous_instrument` 且指定交易所后仍命中同一行；退化匹配唯一命中仍可补全；全量写入重复键（大小写/同一 id）整体拒绝且已存数据保留；数据库唯一索引兜底（大小写、空白、缺交易所三种形态） |
+| 身份、去重、歧义（真实 HTTP） | `node --test tests/server-phase4b.test.js` | 2026-09-16 | ✅ 15/15 | 新增 4 项反例：复核原文载荷 `{"symbol":"VOO","id":"client-chosen-id"}` → 400 `client_id_forbidden` + 响应不回显 + `GET /state` 证明零写入；`PUT /state` 写 `VOO/NYSE` + `voo/nyse` → **409**（非 500）+ 整体回滚（上一次状态原样保留）；同代码 NYSE/HKEX 存在时缺交易所建立 → 409 `ambiguous_instrument` + 提示含"交易所" + 两行未被改动 + 指明交易所后命中同一行；补交易所后 id 与 `identityKey` 不变且目录仍一行 |
+| 迁移 v4 与历史数据守卫 | `node --test tests/server-migration.test.js` | 2026-09-16 | ✅ 16/16 | 版本序列到 v4 且 `uq_instruments_dedupe` 存在；唯一索引拒绝归一后重复行、允许不同交易所共存；**v3 库已有重复标的时 v4 迁移显式失败并整体回滚**（版本停在 v3、两行数据原样保留，不替用户挑选保留行） |
 
 ### Phase 4B 本轮发现并修复的缺陷（2026-09-16）
 
@@ -55,6 +63,15 @@
 - **B12（P1，事务边界）**：单条标的写入是"先删同 id 再插入"，裸调 repository 存在中途失败丢行的窗口。修复：统一经 `writeInstrument()` 用 `dbm.transaction` 包装（provider 调用已在事务之外完成，不嵌套）。
 - **B13（P2，契约一致性）**：`suggestFromProvider` 初版返回对象，与 `diffInstrumentFields` 的返回形状不一致，调用方容易写错。修复：统一为 `[{field, value, basis}]`。
 - **B14（测试基建）**：4B 的 wiring 场景最初写了两处"用页面文案判断状态"（`待确认` / `已确认`）与一处错误导航假设（`assets` 页其实不在底部 tabbar，必须先回决策台点入口卡片）。前者违反本项目的 wiring 铁律（文案可能被他处内容污染造成假通过），后者直接导致 `找不到元素 [data-action="nav:assets"]`。修复：状态一律用 `apiState()`（事实源）轮询判定；导航改为 `nav:home` → `#view [data-action="nav:assets"]`；"刷新是否真的执行"用 `fetch` 计数证明，而不是靠 toast 文案。同类问题参考 B5。
+
+### Phase 4B 独立复核发现的缺陷（2026-09-16，补口已修）
+
+> 原始结论原文见 `PHASE4B_ACCEPTANCE_GAPS.md`（复核当时判定 4B 暂不通过、不建议进入 4C）。
+
+- **B15（P0，身份可伪造）**：`parseCreatePayload` 接受客户端提供的任意格式合法 `id`，`createInstrument` 优先使用该值 —— `{"symbol":"VOO","id":"client-chosen-id"}` 落库 id 就是 `client-chosen-id`，绕过 D-039 的派生规则，4C 的账户会引用无法复算的身份。修复：非空 `id` 一律返回 `client_id_forbidden`（**显式拒绝而非静默忽略**），id 只由服务端按 identity key 派生；补真实 HTTP 反例（含"看起来像派生值"的伪造 id）。
+- **B16（P0，去重路径不完整）**：去重键只在目录接口与单条 upsert 上强制，`repository.writeInstruments`（`PUT /state`、JSON 恢复、备份还原）逐行直插，也没有数据库唯一约束 —— `VOO/NYSE` 与 `voo/nyse` 能同时落库，"同一标的不重复创建事实"在旧写入路径上失效。修复（两层）：① `writeInstruments` 写入前按领域同口径预校验去重键与 id，重复**整体拒绝**并抛 `duplicate_instrument`（事务回滚）；② 新增迁移 **v4** 表达式唯一索引 `uq_instruments_dedupe` 兜底，迁移前检测历史重复数据，存在重复即显式失败并列出重复键。顺带修复：领域错误码 → HTTP 状态集中映射，`/state` 的重复/歧义返回 **409** 而不是 500（前端可区分"写入被拒、数据没动"与"服务端出错"）。
+- **B17（P1，静默错误合并）**：`findInstrumentByKey` 用 `.find()` 做退化匹配，请求缺交易所时条件 `!exchange` 对所有同代码记录成立，于是按数据库行顺序返回第一条 —— 同代码同时在 NYSE / HKEX 时会静默合并并返回 `duplicated:true`，结果取决于行序。修复：收集全部退化候选，多于一条时抛 `ambiguous_instrument`（HTTP 409 + 提示指明交易所）；唯一命中时仍允许补全交易所，既有路径未被破坏。
+- **B18（一致性：id 语义未定义）**："先手工建无交易所标的、再由 provider 补全交易所"会保留旧 id，而文档声称"id 可用当前 `symbol@exchange` 复算"，两者冲突。修复：采纳"id 基于首次创建时的不可变 identity key"规则 —— 新增 `stableIdFromKey` / `identityKeyOf`，记录持久化 `identityKey`，补全交易所后 id 与 `identityKey` 都不重算，文档改为"用 `identityKey` 离线复算"。**边界（复核未要求，明确记录）**：全量 `/state` 与备份恢复通道原样还原既有 id（历史快照带 `ins-voo` 这类旧形状 id，强制派生会破坏备份往返保真），该通道的强约束是去重键。
 
 **数据源取证（非自动测试，人工一次性探测）：** 见 `server/providers/SOURCES.md`。Stooq `/q/l/` 404、`/q/d/l/` 返回 JS 验证挑战；Yahoo chart 403；Frankfurter `/v2/providers/ecb/rates` 200 且与默认多源端点值不同（USD/CNY 6.7115 vs 6.708）；Twelve Data `symbol_search` 覆盖 HKEX/SSE；腾讯/东方财富端点实测可达但无官方条款。自动测试不访问公网的门禁未被破坏。
 

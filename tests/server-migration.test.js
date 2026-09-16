@@ -11,20 +11,26 @@ const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1+v2+v3：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1–v4：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows.length, 4);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
     assert.strictEqual(rows[1].version, 2);
     assert.strictEqual(rows[1].name, 'phase3-close-schema');
     assert.strictEqual(rows[2].version, 3);
     assert.strictEqual(rows[2].name, 'phase3-asset-transfers');
+    assert.strictEqual(rows[3].version, 4);
+    assert.strictEqual(rows[3].name, 'phase4b-instrument-dedupe');
     assert.strictEqual(tableExists(ctx.db, 'asset_transfers'), true, 'v3 应建立换汇事实表');
+    assert.ok(
+      get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'uq_instruments_dedupe'"),
+      'v4 应建立标的去重唯一索引'
+    );
 
     const missing = REQUIRED_TABLES.filter((t) => !tableExists(ctx.db, t));
     assert.deepStrictEqual(missing, [], '缺少表：' + missing.join(', '));
@@ -33,7 +39,7 @@ test('迁移 v1+v2+v3：schema_migrations 记录版本并建齐必需表', () =>
   }
 });
 
-test('已发布 v2 库前向迁移到 v3：保留账户与余额并新增换汇表', () => {
+test('已发布 v2 库前向迁移到最新版本：保留账户与余额并新增换汇表', () => {
   const db = openDatabase(':memory:');
   try {
     M.migrate(db, { list: M.MIGRATIONS.slice(0, 2) });
@@ -42,7 +48,7 @@ test('已发布 v2 库前向迁移到 v3：保留账户与余额并新增换汇�
     db.exec("INSERT INTO account_units (id,account_id,currency,balance_minor,as_of) VALUES ('u1','a1','HKD',123456,'2026-09-15')");
 
     const migrated = M.migrate(db);
-    assert.deepStrictEqual(migrated.applied, [3]);
+    assert.deepStrictEqual(migrated.applied, [3, 4]);
     assert.strictEqual(tableExists(db, 'asset_transfers'), true);
     assert.strictEqual(get(db, 'SELECT balance_minor FROM account_units WHERE id = ?', ['u1']).balance_minor, 123456);
   } finally {
@@ -86,7 +92,7 @@ test('迁移失败时整体回滚：不留下半个 schema，也不写入版本�
       { version: 2, name: 'phase3-close-schema', up: M.MIGRATIONS[1].up },
       { version: 3, name: 'phase3-asset-transfers', up: M.MIGRATIONS[2].up },
       {
-        version: 4,
+        version: M.LATEST_VERSION + 1,
         name: 'broken-migration',
         up(db) {
           db.exec('CREATE TABLE probe_ok (id TEXT PRIMARY KEY)');
@@ -236,6 +242,47 @@ test('报价与汇率用表达式唯一索引去重，provider 缺省也参与�
     assert.strictEqual(get(ctx.db, 'SELECT COUNT(*) AS c FROM quotes').c, 2);
   } finally {
     ctx.close();
+  }
+});
+
+test('标的去重唯一索引（v4）：归一后相同的两行被拒，不同交易所可共存', () => {
+  const ctx = setup('ledger-mig-');
+  try {
+    ctx.db.exec("INSERT INTO instruments (id, symbol, exchange, currency) VALUES ('i1','VOO','NYSE','USD')");
+    assert.throws(
+      () => ctx.db.exec("INSERT INTO instruments (id, symbol, exchange, currency) VALUES ('i2','voo','nyse','USD')"),
+      /UNIQUE/i,
+      '大小写/空白归一的重复标的必须被数据库拒绝'
+    );
+    assert.throws(
+      () => ctx.db.exec("INSERT INTO instruments (id, symbol, exchange, currency) VALUES ('i3',' VOO ',' NYSE ','USD')"),
+      /UNIQUE/i
+    );
+    ctx.db.exec("INSERT INTO instruments (id, symbol, exchange, currency) VALUES ('i4','VOO','NASDAQ','USD')");
+    assert.strictEqual(get(ctx.db, 'SELECT COUNT(*) AS c FROM instruments').c, 2, '不同交易所是不同标的');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('v4 迁移遇到历史重复标的时显式失败，不替用户挑选保留哪一行', () => {
+  const db = openDatabase(':memory:');
+  try {
+    // 先只迁到 v3（此时还没有唯一索引），人为造出重复标的
+    M.migrate(db, { list: M.MIGRATIONS.slice(0, 3) });
+    db.exec("INSERT INTO instruments (id, symbol, exchange, currency) VALUES ('a','VOO','NYSE','USD')");
+    db.exec("INSERT INTO instruments (id, symbol, exchange, currency) VALUES ('b','voo','nyse','USD')");
+
+    assert.throws(
+      () => M.migrate(db),
+      (e) => e && e.code === 'duplicate_instrument' && /VOO@NYSE/.test(e.message),
+      '存在重复标的时必须报错而不是静默合并或丢弃'
+    );
+    // 失败即整体回滚：版本停在 v3，两行数据原样保留
+    assert.strictEqual(M.currentVersion(db), 3);
+    assert.strictEqual(get(db, 'SELECT COUNT(*) AS c FROM instruments').c, 2);
+  } finally {
+    db.close();
   }
 });
 

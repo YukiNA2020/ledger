@@ -7,7 +7,7 @@
 
 本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
 
-截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）与 Phase 4B（标的目录与分类确认）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块）。**尚无**持仓账本与证券事件（4C）、自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
+截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）与 Phase 4B（标的目录与分类确认）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块）；2026-09-16 完成独立复核补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`。**尚无**持仓账本与证券事件（4C）、自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
 
 ## 1. 架构原则
 
@@ -123,6 +123,11 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 
 `classification_status` 只允许 `suggested/confirmed`。外部分类变化不得覆盖 `confirmed`。
 
+**标的身份与去重（D-039，4B 复核补口后）：**
+
+- `id` **只能由服务端派生**：新建时按「首次创建时的 identity key」（`symbol@exchange`，大写与空白归一；交易所缺失则为 `symbol@`）派生 `inst-<sha1(identityKey) 前16位>` 一次，**此后永久不变** —— 补全交易所也不重算。`identity_key`（含 `source` / `country` / `exchange_timezone` / provider 候选与 provenance / 冲突提示）随记录存 `extra_json`，读回零丢失；外部用它离线复算 id。建立载荷里客户端指定的 `id` 一律拒绝（`client_id_forbidden`）；`PUT /state` 与备份恢复通道原样还原既有 id（历史快照带旧形状 id，强制派生会破坏备份往返保真），该通道的强约束是去重键。
+- 去重键 `(symbol, exchange)` 是**全路径**不变量：目录接口、单条 upsert、全量 `PUT /state` 都显式拒绝同键第二行（`duplicate_instrument` → 409 + 事务回滚，从不静默删行或丢行）；迁移 **v4** 的表达式唯一索引 `uq_instruments_dedupe` 在数据库层兜底（迁移遇到历史重复数据显式失败）。交易所缺失时的退化匹配**只在唯一命中时生效**，同代码跨市场存在多行时报 `ambiguous_instrument`（409）要求用户指明交易所，不按行顺序静默合并。
+
 ### 5.3 结账与决策
 
 - `monthly_closes(id, month, status, completed_at, data_cutoff)`。
@@ -165,6 +170,7 @@ GET    /api/v1/instruments
 GET    /api/v1/instruments/search?q=
 POST   /api/v1/instruments
 POST   /api/v1/instrument-confirmations
+  # 400 client_id_forbidden（客户端指定 id）/ invalid_*；409 duplicate_instrument、ambiguous_instrument；422 invalid_provider_payload；503 provider_unavailable
 POST   /api/v1/portfolio-openings
 POST   /api/v1/security-events
 POST   /api/v1/market-data/refresh

@@ -15,6 +15,8 @@
  *   - v2（Phase 3）新增 §5.3 中月度结账需要的两张表（monthly_closes / close_snapshots）。
  *   - v3（Phase 3 S3.1 补全）新增多币种子账户换汇记录；不修改已发布的 v1/v2。
  *     风险评估、目标配置与决策表仍留给 Phase 5/6，不预建空表（避免猜测未冻结的语义）。
+ *   - v4（Phase 4B 复核补口）只给 instruments 加一条表达式唯一索引，把「同一标的只有一行事实」
+ *     从应用层检查提升为数据库不变量；不新增表，旧版本代码忽略该索引仍可工作。
  *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
 'use strict';
@@ -312,6 +314,34 @@ const MIGRATIONS = [
 
         CREATE INDEX idx_asset_transfers_date ON asset_transfers(occurred_on);
         CREATE INDEX idx_asset_transfers_units ON asset_transfers(from_unit_id, to_unit_id);
+      `);
+    }
+  },
+  {
+    version: 4,
+    name: 'phase4b-instrument-dedupe',
+    up(db) {
+      /* Phase 4B 复核补口：`(symbol, exchange)` 去重键此前只在应用层检查，
+       * 全量写入路径（PUT /state、JSON 恢复）可以插进 VOO/NYSE 与 voo/nyse 两行。
+       * 这里把它变成数据库不变量：表达式索引的归一规则与 js/domain.js 的 instrumentKey 一致
+       * ——去空白 + 大写，exchange 缺失按空串参与（IFNULL 让 NULL 也进入比较，
+       * 否则两个 NULL 之间的"相等"不成立，去重会漏）。 */
+      const dups = all(
+        db,
+        `SELECT upper(trim(symbol)) AS s, upper(trim(IFNULL(exchange, ''))) AS e, COUNT(*) AS n
+           FROM instruments GROUP BY s, e HAVING n > 1`
+      );
+      // 历史数据里已经有重复时**显式失败**，不替用户挑选要保留哪一行（不静默丢数据）。
+      if (dups.length) {
+        const keys = dups.map((d) => d.s + '@' + d.e).join('、');
+        throw Object.assign(
+          new Error('instruments 存在重复标的，无法建立唯一去重索引：' + keys + '（请先人工核对后合并）'),
+          { code: 'duplicate_instrument' }
+        );
+      }
+      db.exec(`
+        CREATE UNIQUE INDEX uq_instruments_dedupe
+          ON instruments(upper(trim(symbol)), upper(trim(IFNULL(exchange, ''))));
       `);
     }
   }

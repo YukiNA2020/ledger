@@ -8,7 +8,7 @@
  * 注意：修改任何前端文件后需递增 CACHE 版本号以触发更新。
  * Phase 2：/api/ 请求一律不接管（本地服务提供事实源，缓存响应会导致读到过期财务数据）。
  */
-var CACHE = 'ledger-v2.3.5-phase4b';
+var CACHE = 'ledger-v2.3.6-phase4b';
 var ASSETS = [
   './styles.css',
   './js/core.js',

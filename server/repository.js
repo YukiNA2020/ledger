@@ -349,13 +349,37 @@ function readEntitlements(db) {
   });
 }
 
+// 全量写入（PUT /state、JSON 恢复、备份还原）必须与目录接口遵守同一条不变量：
+// 同一 (symbol, exchange) 只允许一行事实。
+// **整体拒绝**而不是静默丢行：静默丢弃会让用户以为数据已经存下了（S4B.1「同一标的不重复创建事实」）。
+// 数据库侧另有 uq_instruments_dedupe 唯一索引兜底（迁移 v4）。
 function writeInstruments(db, list) {
+  const rows = (list || []).filter((i) => i && i.id);
+  const byKey = {};
+  const byId = {};
+  rows.forEach((i) => {
+    const id = String(i.id);
+    if (byId[id]) {
+      throw Object.assign(new Error('标的 id 重复写入：' + id), { code: 'duplicate_instrument' });
+    }
+    byId[id] = true;
+    // 与领域口径一致：symbol / exchange 去空白后大写，exchange 缺失按空串参与去重
+    const key = Domain.instrumentKey(i.symbol, i.exchange);
+    if (!key) return;
+    if (byKey[key]) {
+      throw Object.assign(
+        new Error('同一标的重复写入：' + key + '（' + byKey[key] + ' 与 ' + id + '）'),
+        { code: 'duplicate_instrument' }
+      );
+    }
+    byKey[key] = id;
+  });
+
   const st = db.prepare(
     `INSERT INTO instruments (id, symbol, exchange, currency, name, instrument_type, asset_class, exposure_market, classification_status, extra_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  (list || []).forEach((i) => {
-    if (!i || !i.id) return;
+  rows.forEach((i) => {
     st.run(
       String(i.id),
       STR(i.symbol) || '',
@@ -425,17 +449,35 @@ function getInstrument(db, id) {
 
 // 按去重键找已有标的：先精确匹配 (symbol@exchange)，再退化为「同一代码且任一方交易所为空」。
 // 退化匹配是为了避免"先手工建标的、后由 provider 补全交易所"时凭空多出第二行事实。
+// 但同一代码可能在多个交易所都上市（NYSE / HKEX ...）：此时**必须报歧义**——
+// 按行顺序静默选中第一条会把跨市场标的合并错，而且结果取决于数据库行顺序。
 function findInstrumentByKey(db, symbol, exchange) {
   const records = readInstrumentRecords(db);
   const want = Domain.instrumentKey(symbol, exchange);
   if (!want) return null;
-  const exact = records.find((r) => Domain.instrumentKey(r.symbol, r.exchange) === want);
-  if (exact) return exact;
+
+  const exact = records.filter((r) => Domain.instrumentKey(r.symbol, r.exchange) === want);
+  if (exact.length > 1) {
+    // 唯一索引下不应出现；真出现说明库被手工改过，必须暴露而不是任选一行。
+    throw Object.assign(new Error('同一标的在目录中存在重复记录：' + want), { code: 'duplicate_instrument' });
+  }
+  if (exact.length === 1) return exact[0];
+
   const sym = String(symbol == null ? '' : symbol).trim().toUpperCase();
-  const loose = records.find(
+  const loose = records.filter(
     (r) => String(r.symbol || '').trim().toUpperCase() === sym && (!r.exchange || !exchange)
   );
-  return loose || null;
+  if (loose.length > 1) {
+    throw Object.assign(
+      new Error(
+        '该代码在多个交易所都有记录（' +
+          loose.map((r) => (r.exchange ? String(r.exchange) : '未注明交易所')).join(' / ') +
+          '），请指明交易所后再操作'
+      ),
+      { code: 'ambiguous_instrument' }
+    );
+  }
+  return loose.length === 1 ? loose[0] : null;
 }
 
 // 单条标的 upsert：
@@ -470,6 +512,9 @@ function upsertInstrument(db, item, options) {
   const extra = {
     trackingIndex: item.trackingIndex == null ? null : String(item.trackingIndex),
     source: item.source == null ? null : String(item.source),
+    // 身份 key（D-039）：首次创建时派生、之后永久不变；id 可由它离线复算
+    // （补全交易所后 id 不重算，因此不能用"当前交易所"反推）。
+    identityKey: item.identityKey == null ? null : String(item.identityKey),
     country: item.country == null ? null : String(item.country),
     exchangeTimezone: item.exchangeTimezone == null ? null : String(item.exchangeTimezone),
     providerCandidate: item.providerCandidate || null,

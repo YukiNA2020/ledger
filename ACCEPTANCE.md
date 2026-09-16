@@ -175,7 +175,9 @@ Phase 4A 退出证据：T-002 的汇率与行情部分、T-003 均已决定；�
 
 Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的去重和元数据冲突均有固定 fixture 用例。
 
-**验收结论（2026-09-16，当前工作区）：✅ 通过。**
+**验收结论（2026-09-16，复核补口后）：✅ 通过（3 项阻塞问题已修复，等待独立复核确认）。**
+
+复核补口说明：独立复核于 2026-09-16 判定 4B **暂不通过**（标的身份与去重边界 3 项可复现问题，其中 2 项 P0）。原始结论与逐条修复状态见 `PHASE4B_ACCEPTANCE_GAPS.md`。修复把「id 只能由服务端派生」「去重键在**所有**写入路径上成立」从应用层约定升级为可拒绝的硬约束，并新增数据库唯一索引兜底；对应新增 13 项反例/不变量测试（含真实 HTTP 反例与迁移守卫）。
 
 口径澄清：本场景原文的「可追溯的类别、市场和币种候选」按 **D-037 / D-039** 落地 —— provider 实际提供的候选是 `currency` / `exchange` / `instrument_type` / `country` / `exchange_timezone`，而 `asset_class`（资产类别）与 `exposure_market`（风险敞口市场）**没有 provider 字段来源**，属用户判断，只能由用户填写并确认；provider 未提供时保持为空而不是编造。因此"分类候选"的可追溯性由 provenance 承担，"类别/市场"的权威性由用户确认承担。
 
@@ -185,13 +187,17 @@ Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的�
 | 建立标的落成 `suggested`，不自动确认 | ✅ 通过 | `POST /api/v1/instruments` 返回 `classificationStatus:'suggested'`、`assetClass:null`、`exposureMarket:null`、`confirmedAt` 为空；provider 的部分字段缺失时保持 `null`（`MYSTERY.ETF` 用例证明"没给就不编造"） |
 | 用户确认 → `confirmed` 本地锁定 | ✅ 通过 | `POST /api/v1/instrument-confirmations` 要求 `assetClass` + `exposureMarket` 两项（缺任一项 → 400）；确认后 `classificationStatus:'confirmed'` 且写入 `confirmedAt`；非词表取值（`现金` / `日本` / `美国`）一律 400 |
 | **确认后 provider 返回不同分类：本地值保持不变，只作冲突提示** | ✅ 通过 | 核心不变量用例：确认 → 再 `POST /api/v1/instruments` 刷新，`preserved:true`、状态仍 `confirmed`、`assetClass`/`exposureMarket`/`trackingIndex`/`confirmedAt` 全部不变；本地自定义名称（`盈富基金`）不被上游 `Tracker Fund of Hong Kong` 改写，差异以 `conflicts[]` 返回且**每条都带 provider 候选值与 provenance**（`payloadHash`、`fetchedAt`） |
-| 同一标的不重复创建事实 | ✅ 通过 | 稳定 id `inst-<sha1(symbol@exchange) 前16位>` 确定性派生（大小写/空白归一后一致，可外部复算）；重复建立 `duplicated:true` 且目录里只有一行；`repository.upsertInstrument` 对同一去重键的第二次写入**显式抛 `duplicate_instrument`**（不静默删行，已确认分类不会被连带删除）；"先手工建、后由 provider 补全交易所"经退化匹配命中同一行 |
+| 同一标的不重复创建事实 | ✅ 通过 | 去重键 `(symbol, exchange)` 在**所有**写入路径上成立：目录接口 `POST /instruments`、单条 `upsertInstrument`、全量 `PUT /state`（重复键整体拒绝，事务回滚）、以及数据库表达式唯一索引 `uq_instruments_dedupe`（迁移 v4）。重复建立 `duplicated:true` 且目录里只有一行；`upsertInstrument` 对同一去重键的第二次写入**显式抛 `duplicate_instrument`**（不静默删行，已确认分类不会被连带删除）；"先手工建、后补交易所"经退化匹配命中同一行 |
+| 标的身份只能由服务端派生（复核 P0-1，`client_id_forbidden`） | ✅ 通过 | `POST /api/v1/instruments` 拒绝客户端指定的 id（400 `client_id_forbidden`，响应不回显该值，目录无任何写入）；正常建立得到派生 id `inst-<sha1(identityKey) 前16位>`。反例取自复核原文 `{"symbol":"VOO","id":"client-chosen-id"}` |
+| 全量 `/state` 不能绕过去重（复核 P0-2） | ✅ 通过 | `repository.writeInstruments` 写入前按归一后的去重键预校验，重复（含同一 id 重复）**整体拒绝**并抛 `duplicate_instrument`；handler 映射为 409（不是 500）且事务回滚，`GET /state` 证明上一次状态原样保留。反例取自复核原文 `inst-a → VOO/NYSE` + `inst-b → voo/nyse`；迁移 v4 用表达式唯一索引做数据库层兜底，历史数据已有重复时迁移**显式失败**而不是静默挑选保留行 |
+| 缺交易所时不误合并跨市场同代码（复核 P1） | ✅ 通过 | 同代码存在多行（`CROSS@NYSE` + `CROSS@HKEX`）时，缺交易所的查询/建立返回 409 `ambiguous_instrument` 并提示指定交易所（不再按行顺序静默命中第一条）；明确指定交易所照常命中同一行且不新增事实；只有一条同代码记录时仍允许补全交易所（既有路径未被破坏） |
+| 稳定 id 永久不变（复核附带项） | ✅ 通过 | id 由**首次创建时的 identity key** 派生并永久锁定：先建无交易所标的（`CROSS@`）再补交易所（HKEX），id 与 `identityKey` 都不重算，记录持久化 `identityKey` 供外部离线复算。历史快照仍按原样还原 id（`PHASE4B_ACCEPTANCE_GAPS.md` 记录该边界与理由） |
 | 缺失/冲突元数据明确提示 | ✅ 通过 | provider 整体失败时 `provider.status='error'` + `warnings[]`，本地命中照常返回（前端显示"参考数据暂不可用…确认分类不依赖外部数据"）；候选里的不可入账记录（小写币种）转为显式 `invalid_payload` 而不是"看起来是候选"；`BADMETA.ETF` 建立请求 422 |
 | 边界：本阶段不创建持仓 | ✅ 通过 | `POST /api/v1/portfolio-openings` / `security-events` / `market-data/refresh` 仍返回 `501`；`GET /api/v1/holdings` 保持只读 |
 | 隐私边界 | ✅ 通过 | 检索请求产物键集合恒为 `{query}`、元数据请求恒为 `{symbol}`；传入对象/数组/夹带私有字段的载荷被整体拒绝；错误响应不回显输入原文；目录接口响应不含 `accountName`/`quantity`/`costMinor`/`balanceMinor` |
 | 离线运行 | ✅ 通过 | 4B 全部测试使用 fixture provider 与固定时钟，无真实网络请求；未引入付费源、未处理 4D 的行情源门禁（D-038） |
 
-退出证据汇总：全量 `node --test` **344/344**（274 基线零回归 + 70 项 4B：`providers-catalog` 26、`instrument-catalog` 33、`server-phase4b` 11）；浏览器 wiring **16/16**（新增 1 项从真实产品入口走完"检索 → 加入 → 确认 → 刷新不覆盖"，连续两轮全绿）；零数据库迁移、零真实网络、`DEFERRED_WRITES` 一行未动。
+退出证据汇总：全量 `node --test` **357/357**（344 基线零回归 + 13 项复核补口反例/不变量：`instrument-catalog` 33→40、`server-phase4b` 11→15、`server-migration` 14→16）；浏览器 wiring **16/16**（连续两轮全绿，含真实产品入口的"检索 → 加入 → 确认 → 刷新不覆盖"闭环与本轮 `/state` 写入回归）；新增数据库迁移 **v4**（仅一条表达式唯一索引，不新增表，备份必需表清单不变）；零真实网络、`DEFERRED_WRITES` 一行未动。
 
 ### S4C.1 初始快照与后续事件
 

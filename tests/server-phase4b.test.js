@@ -376,3 +376,166 @@ test('标的目录接口不夹带账户/持仓字段，也不把私有文本写�
   // 稳定 id 由去重键派生，可复核
   assert.strictEqual(created.json.item.id, Catalog.stableInstrumentId('VOO', 'NYSE'));
 });
+
+/* ==================== 4B 复核补口：身份、去重与歧义（真实 HTTP） ==================== */
+
+test('建立接口：客户端指定的 id 被拒（400 client_id_forbidden），id 只能由服务端派生', async (t) => {
+  const ctx = setup('ledger-p4b-idforge-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  // 复核反例原文：{"symbol":"VOO","id":"client-chosen-id"}
+  const forged = await post(port, '/api/v1/instruments', { symbol: 'VOO', id: 'client-chosen-id' });
+  assert.strictEqual(forged.status, 400);
+  assert.strictEqual(forged.json.error.code, 'client_id_forbidden');
+  assert.strictEqual(forged.json.error.retryable, false);
+  assert.strictEqual(JSON.stringify(forged.json).indexOf('client-chosen-id'), -1, '错误响应不得回显客户端 id');
+
+  // 没有落库：目录里还是空的
+  let state = await get(port, '/api/v1/state');
+  assert.deepStrictEqual(state.json.assets.instruments, [], '被拒请求不得写入任何标的');
+
+  // 同一请求去掉 id：拿到约定中的派生 id
+  const ok = await post(port, '/api/v1/instruments', { symbol: 'VOO' });
+  assert.strictEqual(ok.status, 201);
+  assert.strictEqual(ok.json.item.id, Catalog.stableIdFromKey('VOO@NYSE'));
+  assert.strictEqual(ok.json.item.identityKey, 'VOO@NYSE');
+
+  // 伪造 id 也进不来：即便 id 长得像派生值也不行（服务端只看 symbol@exchange）
+  const fakeDerived = await post(port, '/api/v1/instruments', {
+    symbol: '2800.HK',
+    id: Catalog.stableInstrumentId('2800.HK', 'HKEX')
+  });
+  assert.strictEqual(fakeDerived.status, 400);
+  assert.strictEqual(fakeDerived.json.error.code, 'client_id_forbidden');
+});
+
+test('全量 /state 写入：重复去重键整体回滚（409），已存数据不被清空', async (t) => {
+  const ctx = setup('ledger-p4b-state-dup-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  const base = () => ({
+    accounts: [],
+    categories: [],
+    txns: [],
+    settings: {},
+    assets: {
+      schemaVersion: 1,
+      assetAccounts: [],
+      assetUnits: [],
+      assetTransfers: [],
+      liabilities: [],
+      entitlements: [],
+      instruments: [],
+      holdings: [],
+      quotes: [],
+      fxRates: []
+    }
+  });
+
+  const seed = base();
+  seed.assets.instruments = [{ id: 'inst-a', symbol: 'VOO', exchange: 'NYSE', currency: 'USD' }];
+  const first = await request(port, 'PUT', '/api/v1/state', seed);
+  assert.strictEqual(first.status, 200);
+
+  // 复核反例原文：inst-a → VOO/NYSE 与 inst-b → voo/nyse 同时落库
+  const dup = base();
+  dup.assets.instruments = [
+    { id: 'inst-a', symbol: 'VOO', exchange: 'NYSE', currency: 'USD' },
+    { id: 'inst-b', symbol: 'voo', exchange: 'nyse', currency: 'USD' }
+  ];
+  const rejected = await request(port, 'PUT', '/api/v1/state', dup);
+  assert.strictEqual(rejected.status, 409, '重复标的必须是可修正的冲突，不能报 500');
+  assert.strictEqual(rejected.json.error.code, 'duplicate_instrument');
+
+  // 整体回滚：上一次写入的状态原样保留
+  const state = await get(port, '/api/v1/state');
+  assert.strictEqual(state.json.assets.instruments.length, 1);
+  assert.strictEqual(state.json.assets.instruments[0].id, 'inst-a');
+});
+
+test('缺交易所时同代码跨市场报 409 ambiguous_instrument，要求用户指明交易所', async (t) => {
+  const ctx = setup('ledger-p4b-ambig-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  // 目录里同时存在 NYSE 与 HKEX 的 CROSS
+  const nyse = await post(port, '/api/v1/instruments', {
+    symbol: 'CROSS',
+    source: 'manual',
+    currency: 'USD',
+    exchange: 'NYSE'
+  });
+  assert.strictEqual(nyse.status, 201, JSON.stringify(nyse.json));
+  const hkex = await post(port, '/api/v1/instruments', {
+    symbol: 'CROSS',
+    source: 'manual',
+    currency: 'HKD',
+    exchange: 'HKEX'
+  });
+  assert.strictEqual(hkex.status, 201, JSON.stringify(hkex.json));
+
+  // 既不报错也不静默合并：报歧义
+  const ambiguous = await post(port, '/api/v1/instruments', {
+    symbol: 'CROSS',
+    source: 'manual',
+    currency: 'USD'
+  });
+  assert.strictEqual(ambiguous.status, 409, JSON.stringify(ambiguous.json));
+  assert.strictEqual(ambiguous.json.error.code, 'ambiguous_instrument');
+  assert.ok(ambiguous.json.error.message.indexOf('交易所') !== -1, '提示必须说清怎么解决');
+
+  // 两行都在，且行数没有因为报错而变化
+  const state = await get(port, '/api/v1/state');
+  assert.strictEqual(state.json.assets.instruments.length, 2);
+
+  // 指明交易所后照常命中同一行（不是新建第三行）
+  const again = await post(port, '/api/v1/instruments', {
+    symbol: 'CROSS',
+    source: 'manual',
+    currency: 'USD',
+    exchange: 'NYSE'
+  });
+  assert.strictEqual(again.status, 201);
+  assert.strictEqual(again.json.item.id, nyse.json.item.id);
+  assert.strictEqual(again.json.duplicated, true);
+  const after = await get(port, '/api/v1/state');
+  assert.strictEqual(after.json.assets.instruments.length, 2);
+});
+
+test('先手工建无交易所标的、后补交易所：HTTP 层 id 与 identityKey 都不变', async (t) => {
+  const ctx = setup('ledger-p4b-idkey-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  const manual = await post(port, '/api/v1/instruments', {
+    symbol: 'CROSS',
+    source: 'manual',
+    currency: 'USD'
+  });
+  assert.strictEqual(manual.status, 201);
+  const firstId = manual.json.item.id;
+  assert.strictEqual(firstId, Catalog.stableIdFromKey('CROSS@'));
+  assert.strictEqual(manual.json.item.identityKey, 'CROSS@');
+
+  const backfilled = await post(port, '/api/v1/instruments', {
+    symbol: 'CROSS',
+    source: 'manual',
+    currency: 'USD',
+    exchange: 'HKEX'
+  });
+  assert.strictEqual(backfilled.status, 201);
+  assert.strictEqual(backfilled.json.item.id, firstId, 'id 一旦分配不得重算');
+  assert.strictEqual(backfilled.json.item.identityKey, 'CROSS@', 'identityKey 是首次创建时的值');
+  assert.strictEqual(backfilled.json.item.exchange, 'HKEX');
+
+  // 外部可复算：拿 identityKey 就能算出 id（不需要知道当时的交易所）
+  assert.strictEqual(Catalog.stableIdFromKey(backfilled.json.item.identityKey), firstId);
+  const state = await get(port, '/api/v1/state');
+  assert.strictEqual(state.json.assets.instruments.length, 1, '补全交易所不得产生第二行事实');
+});
