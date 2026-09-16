@@ -6,9 +6,11 @@
 
 ## 当前结论
 
-- **测试对象：** Phase 4B 标的目录与分类确认（含两轮独立复核补口及第三轮引用安全审计）
-- **总体状态：** ✅ 第三轮补口完成，等待独立复核确认。`node --test` **371/371**；`instrument-catalog` **48/48**、真实 HTTP `server-phase4b` **17/17**。浏览器 wiring 沿用上一轮 **17/17**（本轮未改 UI）。
-- **发布判断：** 独立复核两轮判定 4B **暂不通过、不建议进入 4C**（第一轮 2×P0 + 1×P1 + 1 项一致性：客户端可指定 id、全量 `/state` 可绕过去重、跨市场同代码被静默合并、id 可复算表述冲突；第二轮 3×P1：全量写入静默丢行/接收非法标的、备份校验漏索引级不变量、检索合并漏缺交易所场景）。**六项全部已修复并补齐真实 HTTP / 真实 UI 反例**，原始结论与逐条修复状态见 `PHASE4B_ACCEPTANCE_GAPS.md`。**Phase 4A 仍为「契约完成、正式验收暂不通过」**——T-002 仅汇率源已定，行情端点待 4D 开始前通过 D-038 门禁后决定。本轮零新增迁移（schema 停在 v4）、零真实网络请求、未创建持仓（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）。
+- **测试对象：** Phase 4C 持仓账本与证券事件
+- **总体状态：** ✅ 实现与自验完成，等待独立复核确认。`node --test` **397/397**（371 基线零回归 + 领域 **16** 项 + 真实 HTTP **10** 项）；浏览器 wiring **18/18**（连续两轮全绿，新增持仓场景）。数据库迁移停在 **v5**（`security_events.amount_minor` 列 + 事件重放索引）。
+- **发布判断：** 4C 口径冻结见 `DECISIONS.md` D-042：持有数量的唯一推导实现（期初 + Σ买入 − Σ卖出，分红/费用不改数量）、同 id 重放 409、超额卖出 409（strict 时间线重放）、`duplicate_opening` 409、事件不写 `txns`、suggested 标的可录入 + 阻塞标记。**Phase 4A 仍为「契约完成、正式验收暂不通过」**——T-002 仅汇率源已定，行情端点待 4D 开始前通过 D-038 门禁后决定；`market-data/refresh` 仍 501。4B 三轮复核结论保持已修复状态（见 `PHASE4B_ACCEPTANCE_GAPS.md`）。零真实网络请求。
+
+上一阶段（4B）结论存档：`node --test` 371/371、wiring 17/17（第三轮基线），详见 ROADMAP/ACCEPTANCE 的 4B 节与 `PHASE4B_ACCEPTANCE_GAPS.md`。
 
 本轮只使用仓库内的虚构、脱敏数据。标准虚构数据与预期口径见 `ACCEPTANCE.md` §2。
 
@@ -79,6 +81,18 @@
 | 静态门禁 | `git diff --check` | ✅ | 无空白错误；零新增迁移、UI 与真实网络请求 |
 
 浏览器接线沿用第二轮 **17/17**，因为本轮没有修改前端或 UI 接线。
+
+### Phase 4C 证据（2026-09-16）
+
+| 范围 | 方法 | 日期 | 结果 | 说明 |
+|------|------|------|------|------|
+| S4C.1 领域推导 | `node --test tests/domain-phase4c.test.js` | 2026-09-16 | ✅ 16/16 | 主链路 10+2−1=11（分红/费用不改数量）；买入可无期初从 0 起算；0.1+0.2=0.3 定点精确；同标的多账户独立；`occurred_at` 重放与数组顺序无关；strict 卖出超额抛 `insufficient_holdings`、宽松跳过留痕；非法事件进 `invalidEvents` 不留持仓条目；同键多行期初取 asOf 最新；`computeOverview` 推导 11×$50×7.2 与"期初直接写 11"完全一致（无事件零回归）；清仓后估值贡献 0；月结事实透传 `openingId`；suggested 标的照常估值 + `classification_unconfirmed` 阻塞 |
+| S4C.1 API 端到端 | `node --test tests/server-phase4c.test.js` | 2026-09-16 | ✅ 10/10 | 真实 HTTP：主链路（建账户 → manual 标的 → confirm → 期初 → 买 → 卖 → 分红 → `GET /holdings`=11、事件不进 `txns`）；suggested 标的可录入 + warning；同 id 重放 409 `duplicate_event` 不增行；`Idempotency-Key` 回放首次响应；超额卖出 409 且整体回滚零残留；时间线重放（先买 2 再卖 3 仍拒）；非法字段 400 / 未知引用 422 矩阵；重复期初 409；`PUT /state` 往返无损 + 注入报价后总览 = 11×500000×7.2；备份恢复往返；全量写入非法事件整体拒绝 |
+| 迁移 v5 | `node --test tests/server-migration.test.js` | 2026-09-16 | ✅ 16/16 | `amount_minor` 列与 `idx_events_account_instrument` 索引存在；前向迁移 applied 数组 `[3,4,5]`；幂等重跑；坏迁移整体回滚（version = LATEST+1） |
+| 浏览器接线验收 | `tests/app-wiring.html`（本地服务托管） | 2026-09-16 | ✅ 18/18 | 新增 1 项：页面录入期初（VOO×10）→ 买 2 → 卖 1 → 事实源 `GET /holdings` 推导 11、事件流水两条（按事实源 id 定位，不数文案）、现金流交易数不变 → 全量写回（记账路径）后事件与期初仍在、推导仍 11；干净环境连续两轮全绿 |
+| 全量回归 | `node --test` | 2026-09-16 | ✅ 397/397 | 371 项 4B 第三轮基线零回归 + 26 项 4C 新增；同步更新 9 个空集合→10、ASSET_KEYS 列表、501 边界（portfolio-openings / security-events 已实现）三处既有断言 |
+
+**Phase 4C 合计：`node --test` 397/397（371 + 26），浏览器 wiring 18/18（连续两轮）。**
 
 ### Phase 4B 第二轮复核发现的缺陷（2026-09-16，补口已修）
 

@@ -1,6 +1,6 @@
 /* 小账本 server/repository.js — SQLite repository（Phase 2）
  *
- * 职责：把前端的全量内存状态（旧账本四键 + v3 九类资产事实集合）与 SQLite 正规表互相转换。
+ * 职责：把前端的全量内存状态（旧账本四键 + v3 十类资产事实集合，4C 起含 securityEvents）与 SQLite 正规表互相转换。
  *
  * 设计要点：
  *  1. 单一写入者：所有写操作都在 transaction() 内完成全量替换，因此重复写入天然幂等，不会出现半新半旧。

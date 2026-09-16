@@ -7,7 +7,7 @@
 
 本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
 
-截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）与 Phase 4B（标的目录与分类确认）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块）；同日完成独立复核**两轮**补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`、全量写入逐条校验（非法记录整体拒绝而非静默丢行）、备份结构校验按版本覆盖必需索引（D-040）、检索合并与建立路径共用同一套退化匹配。**尚无**持仓账本与证券事件（4C）、自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
+截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）、Phase 4B（标的目录与分类确认）与 Phase 4C（持仓账本与证券事件）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块），Phase 4C 的期初快照与证券事件写入、推导持仓视图与资产页「持仓与证券事件」区块已可用（`POST /portfolio-openings` / `POST|GET /security-events`、`deriveHoldings` 唯一推导、迁移 v5，口径见 D-042）；4B 同日完成独立复核**两轮**补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`、全量写入逐条校验（非法记录整体拒绝而非静默丢行）、备份结构校验按版本覆盖必需索引（D-040）、检索合并与建立路径共用同一套退化匹配。**尚无**自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
 
 ## 1. 架构原则
 
@@ -23,7 +23,7 @@
 
 - `server/main.js`：启动入口（配置解析、单实例锁、迁移、每日备份、随机 session token、仅 127.0.0.1 监听、优雅退出），并提供 `--self-check` / `--migrate-only` / `--print-config`；
 - `server/api.js`：`/api/v1` 与静态托管；HTML 注入 session token，写接口校验 token + Origin + Content-Type，无 CORS、无预检；
-- `server/migrations.js` / `server/db.js` / `server/repository.js`：SQLite Schema、连接与事务助手、九类资产事实集合读写；
+- `server/migrations.js` / `server/db.js` / `server/repository.js`：SQLite Schema、连接与事务助手、十类资产事实集合读写（v3 九类 + 4C 的 `securityEvents`）；
 - `server/backup.js`：`VACUUM INTO` 快照、校验、原子替换、30 份保留、恢复与回滚（见 §13.2）；
 - `server/keychain.js` / `server/login-item.js`：Keychain 适配器（暂只用探测）与 LaunchAgent 渲染/安装/卸载；
 - `js/store.js`：前端存储门面。API 模式完全不触碰 IndexedDB；服务不可达时只读降级，绝不双写（见 §13.3）；
@@ -117,11 +117,18 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 
 - `instruments(id, symbol, exchange, currency, name, instrument_type, asset_class, exposure_market, classification_status)`。
 - `portfolio_openings(id, account_id, instrument_id, quantity, cost_minor, as_of)`。
-- `security_events(id, account_id, instrument_id, event_type, quantity, price_minor, fee_minor, currency, occurred_at)`。
+- `security_events(id, account_id, instrument_id, event_type, quantity, price_minor, fee_minor, currency, occurred_at, amount_minor)`（迁移 v5 加 `amount_minor`）。
 - `quotes(instrument_id, price_minor, currency, price_date, fetched_at, provider, status)`。
 - `fx_rates(base, quote, rate_decimal, rate_date, fetched_at, provider, status)`。
 
 `classification_status` 只允许 `suggested/confirmed`。外部分类变化不得覆盖 `confirmed`。
+
+**持仓账本与证券事件（D-042，4C）：**
+
+- 持有数量的**唯一推导实现** = `js/domain.js` 的 `deriveHoldings`：数量 = 期初快照 + Σ买入 − Σ卖出；分红/费用只记金额、不改数量；买入可无期初（从 0 起算）；事件按 `occurred_at` 升序重放。`computeOverview` / `computeCloseChecklist` / `GET /holdings` 有事件时共用该推导，无事件时与期初口径一致（零回归），三处不会分叉。
+- 事件类型词表 `buy/sell/dividend/fee`；`occurred_at` 为 `YYYY-MM-DD`；buy/sell 必填 `quantity`（正定点数 ≤8 位小数）且禁止携带 `amount_minor`；dividend/fee 必填 `amount_minor`（正整数）。`price_minor` 只存每股价格，不做字段混用。
+- 显式拒绝（不静默吞）：同 id 重放 → 409 `duplicate_event`（HTTP 重试用 `Idempotency-Key` 回放首次响应）；卖出超过当时推导数量 → 409 `insufficient_holdings`（写前 strict 时间线重放，失败整体回滚）；同一（账户, 标的）第二行期初 → 409 `duplicate_opening`；未知账户/标的 → 422。全量 `PUT /state` 与单条写入同一套校验。
+- 证券事件**绝不写 `txns`**（不重复计入现金流）；币种由标的 `currency` 推导；事件重放索引 `(account_id, instrument_id, occurred_at)`（迁移 v5）。
 
 **标的身份与去重（D-039，4B 复核补口后）：**
 
@@ -174,8 +181,11 @@ POST   /api/v1/instruments
 POST   /api/v1/instrument-confirmations
   # 400 client_id_forbidden（客户端指定 id）/ invalid_*；409 duplicate_instrument、ambiguous_instrument；422 invalid_provider_payload；503 provider_unavailable
 POST   /api/v1/portfolio-openings
+  # 4C 已实现：同 id 幂等更新；同 (账户, 标的) 第二行 → 409 duplicate_opening；未知引用 422
 POST   /api/v1/security-events
+  # 4C 已实现：支持 Idempotency-Key 回放；同 id → 409 duplicate_event；卖出超额 → 409 insufficient_holdings；未知引用 422；GET /api/v1/security-events 同步可用
 POST   /api/v1/market-data/refresh
+  # 仍 501（4D）；受 D-038 门禁约束，门禁未通过前自动抓取保持关闭
 POST   /api/v1/monthly-closes
 POST   /api/v1/risk-assessments
 POST   /api/v1/recommendations

@@ -211,7 +211,23 @@ Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的�
 **When** 后续记录买入 2 份、卖出 1 份和一笔分红。
 **Then** 当前数量为 11 份；买卖影响持仓和现金但不重复计入收入支出；分红单独记录。
 
-Phase 4C 退出证据：`portfolio-openings` 与 `security-events` 的事务、幂等、非法事件、同标的多账户、备份恢复和最小浏览器闭环全部通过。
+| 验收点 | 结论 | 证据 |
+|---|---|---|
+| S4C.1 主链路：期初 10 → 买 2 → 卖 1 = 11 | ✅ 通过 | `tests/server-phase4c.test.js`：真实 HTTP 全链路（建账户 → manual 标的 → confirm → 期初 → 买 → 卖 → 分红），`GET /holdings` 推导 `quantity='11'`，`eventCounts` 精确；领域侧同链路见 `tests/domain-phase4c.test.js` |
+| 分红/费用可单独追溯、不改数量 | ✅ 通过 | 分红事件落 `amount_minor`（v5 列），`quantity` 为 null；`deriveHoldings` 后数量不变；事件流水（`GET /security-events`）带币种（由标的推导）、日期与 id 可溯源 |
+| 买卖不重复计入收入支出 | ✅ 通过 | 事件写入后 `GET /state` 的 `txns` 保持为空；浏览器 wiring 场景断言事件前后现金流交易数不变 |
+| 同 id 重放明确拒绝 | ✅ 通过 | 同 id 二次 POST → 409 `duplicate_event`，不产生第二行；`Idempotency-Key` 重放返回首次响应（200 + `X-Ledger-Idempotent: replay`）且不重复写入 |
+| 卖出超额（含时间线重放）拒绝且回滚 | ✅ 通过 | 卖出 > 当时推导数量 → 409 `insufficient_holdings`，事件表回滚为空；"先买 2 再卖 3"按 `occurred_at` 重放同样被拒 |
+| 同标的多账户独立推导 | ✅ 通过 | 领域测试：a1 卖 3 → 7，a2 买 5 → 5，互不串账 |
+| 小数数量定点精确 | ✅ 通过 | 0.1 + 0.2 = 0.3（规范化字符串，无浮点漂移）；`compareDecimals` / `sumQuantities` / `subtractQuantities` 整数运算 |
+| 非法事件字段 400 / 未知引用 422 | ✅ 通过 | `invalid_event_type` / `invalid_quantity` / `invalid_event_date` / `invalid_event_amount`（买卖携带总额、分红缺总额均拒绝）→ 400；未知账户/标的 → 422 |
+| 重复期初拒绝 | ✅ 通过 | 同 (账户, 标的) 第二行期初（不同 id）→ 409 `duplicate_opening`；同 id 为幂等更新 |
+| 未确认分类允许录入 + 阻塞标记（D-042 ⑥） | ✅ 通过 | suggested 标的录入期初/事件返回 201 + `warning: classification_unconfirmed`；总览照常估值但 `classification_unconfirmed` blocker 使状态为 estimate |
+| `PUT /state` 全量路径同口径 | ✅ 通过 | 全量写入带非法事件类型 → 400 整体回滚、事件零残留；合法往返后事件与推导数量无损 |
+| 备份恢复往返无损 | ✅ 通过 | 手动备份 → 再写 2 条事件 → 恢复后事件回到 1 条、推导数量回到 12 |
+| 浏览器最小闭环（wiring） | ✅ 通过 | `tests/app-wiring.js` 新场景：页面录入期初/买/卖 → 事实源推导 11 → 持仓卡片与事件流水渲染 → 全量写回（记账路径）后事件与期初仍在 |
+
+Phase 4C 退出证据：全量 `node --test` **397/397**（371 基线零回归 + 领域 **16** 项 + 真实 HTTP **10** 项）；浏览器 wiring **18/18**（连续两轮全绿）；数据库迁移停在 **v5**；`market-data/refresh` 仍 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-042。
 
 ### S4D.1 自动更新成功
 
