@@ -354,6 +354,41 @@
     });
   }
 
+  /* ------------------------- Phase 4B：标的目录 ------------------------- */
+
+  // 标的检索：只读。服务不可达时返回显式的不可用结果，而不是空列表
+  // ——「没搜到」与「这次没能问」必须可区分（provider 失败同理，见返回体的 provider.status）。
+  function searchInstruments(query) {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        return {
+          ok: false,
+          offline: true,
+          query: String(query || ''),
+          provider: { id: null, status: 'unavailable', code: 'unreachable', retryable: true },
+          candidates: [],
+          warnings: [{ symbol: null, code: 'unreachable', detail: '本地服务未运行，无法检索参考数据', retryable: true }]
+        };
+      }
+      return apiFetch('/instruments/search?q=' + encodeURIComponent(query), { token: false });
+    });
+  }
+
+  // 建立/刷新标的：source 缺省为 provider（从参考数据补全），source='manual' 为手工建立。
+  function createInstrument(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/instruments', { method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey });
+    });
+  }
+
+  // 用户确认分类：assetClass / exposureMarket 是用户判断，必须显式给出。
+  function confirmInstrument(payload) {
+    return requireWriteMode().then(function () {
+      return apiFetch('/instrument-confirmations', { method: 'POST', body: payload });
+    });
+  }
+
   return {
     MODE_UNKNOWN: MODE_UNKNOWN,
     MODE_API: MODE_API,
@@ -373,6 +408,9 @@
     createResource: createResource,
     listMonthlyCloses: listMonthlyCloses,
     getCloseSnapshot: getCloseSnapshot,
-    saveMonthlyClose: saveMonthlyClose
+    saveMonthlyClose: saveMonthlyClose,
+    searchInstruments: searchInstruments,
+    createInstrument: createInstrument,
+    confirmInstrument: confirmInstrument
   };
 });

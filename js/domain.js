@@ -22,6 +22,10 @@
   var MAX_SCALE = 8;                             // 定点十进制最大小数位
   var ASSET_KEYS = ['assetAccounts', 'assetUnits', 'assetTransfers', 'liabilities', 'entitlements', 'instruments', 'holdings', 'quotes', 'fxRates'];
 
+  // Phase 4B：风险敞口市场词表。属于**用户判断**，provider 不提供（D-037）；
+  // 与「交易币种（CNY/HKD/USD）」是两个不同字段，不得相互推断替代（AGENTS.md）。
+  var EXPOSURE_MARKETS = ['CN', 'HK', 'US', 'global', 'other'];
+
   /* ------------------------------ 定点十进制 ------------------------------ */
 
   // "10" → {v:10,s:0}；"10.55" → {v:1055,s:2}；非法/负数/超精度 → null
@@ -85,6 +89,70 @@
   function ymOf(dateStr) {
     return typeof dateStr === 'string' && dateStr.length >= 7 ? dateStr.slice(0, 7) : null;
   }
+
+  /* ------------------------------ 标的目录（Phase 4B） ------------------------------ */
+
+  function isAssetClass(v) {
+    return RISK_CLASSES.indexOf(v) !== -1;
+  }
+
+  function isExposureMarket(v) {
+    return EXPOSURE_MARKETS.indexOf(v) !== -1;
+  }
+
+  // 标的去重键：公开代码 + 交易所，全部大写归一。
+  // 同一个标的只能有一行事实；交易所缺失时退化为「代码本身」这一键。
+  function instrumentKey(symbol, exchange) {
+    var s = symbol == null ? '' : String(symbol).trim().toUpperCase();
+    var e = exchange == null ? '' : String(exchange).trim().toUpperCase();
+    if (!s) return null;
+    return s + '@' + e;
+  }
+
+  // provider 元数据与本地记录的差异（D-037 的冲突提示口径，全产品只有这一份实现）。
+  // 规则：
+  //   - 只比较**同名字段**，绝不跨语义比较（上市市场 ≠ 风险敞口，交易币种 ≠ 汇总币种）；
+  //   - provider 没给的字段（null）不构成冲突 —— 没有来源就没有"不同"可说；
+  //   - 只报差异，不改任何值：是否采纳由用户决定（confirmed 记录一律不覆盖）。
+  var INSTRUMENT_PROVIDER_FIELDS = ['name', 'currency', 'exchange', 'instrumentType', 'country', 'exchangeTimezone'];
+
+  function diffInstrumentFields(local, providerFields) {
+    var out = [];
+    if (!local || !providerFields) return out;
+    INSTRUMENT_PROVIDER_FIELDS.forEach(function (field) {
+      var pv = providerFields[field];
+      if (pv == null || pv === '') return;
+      var lv = local[field];
+      if (lv == null || lv === '') return; // 本地还没值：这是补全机会，不是冲突
+      if (String(lv) !== String(pv)) out.push({ field: field, localValue: lv, providerValue: pv });
+    });
+    return out;
+  }
+
+  // provider 提供的字段里，哪些可以直接作为 suggested 预填、依据是哪个上游字段。
+  // 返回 [{ field, value, basis }]；asset_class / exposure_market / 跟踪指数**不在此列**
+  // —— 它们没有 provider 字段来源，只能由用户填写（D-037）。
+  var PROVIDER_SUGGESTABLE_FIELDS = [
+    { field: 'currency', basis: 'provider.currency' },
+    { field: 'exchange', basis: 'provider.exchange' },
+    { field: 'instrumentType', basis: 'provider.instrument_type' },
+    { field: 'country', basis: 'provider.country' },
+    { field: 'exchangeTimezone', basis: 'provider.exchange_timezone' }
+  ];
+
+  function suggestFromProvider(candidate) {
+    if (!candidate) return [];
+    var out = [];
+    PROVIDER_SUGGESTABLE_FIELDS.forEach(function (f) {
+      var v = candidate[f.field];
+      if (v == null || v === '') return;
+      out.push({ field: f.field, value: v, basis: f.basis });
+    });
+    return out;
+  }
+
+  // 用户判断字段：provider 无权生成，只能由用户填写并确认（D-037）。
+  var USER_JUDGEMENT_FIELDS = ['assetClass', 'exposureMarket', 'trackingIndex'];
 
   /* ------------------------------ 汇率与报价 ------------------------------ */
 
@@ -441,7 +509,14 @@
     CURRENCIES: CURRENCIES,
     POOLS: POOLS,
     RISK_CLASSES: RISK_CLASSES,
+    EXPOSURE_MARKETS: EXPOSURE_MARKETS,
     MAX_STALE_DAYS: MAX_STALE_DAYS,
+    isAssetClass: isAssetClass,
+    isExposureMarket: isExposureMarket,
+    instrumentKey: instrumentKey,
+    diffInstrumentFields: diffInstrumentFields,
+    suggestFromProvider: suggestFromProvider,
+    USER_JUDGEMENT_FIELDS: USER_JUDGEMENT_FIELDS,
     parseDecimal: parseDecimal,
     mulMinor: mulMinor,
     mulByRate: mulByRate,

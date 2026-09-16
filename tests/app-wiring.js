@@ -656,6 +656,82 @@
       clickAction('[data-action="sheet:close"]');
     });
 
+    // C11 Phase 4B（S4B.1）：标的检索 → 预分类 → 用户确认 → 再刷新不覆盖确认值。
+    // 全程从真实产品入口走：资产录入页的「标的目录」区块，不直接调 API 造数据。
+    // 状态判定一律走事实源（apiState），不用页面文案。
+    await check('标的目录：检索加入 → 确认分类并锁定 → 刷新不覆盖已确认值', async function () {
+      // 资产录入页不在底部 tabbar 里，须从决策台的入口卡片进入
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:assets"]'); }, 8000, '决策台资产入口');
+      clickAction('#view [data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('#inst-q'); }, 8000, '标的目录区块');
+
+      // 1) 检索：候选必须来自参考数据
+      document.querySelector('#inst-q').value = 'voo';
+      clickAction('[data-action="inst:search"]');
+      await waitFor(function () { return document.querySelector('[data-action="inst:add"]'); }, 8000, '检索候选');
+      equal(document.querySelector('[data-action="inst:add"]').dataset.symbol, 'VOO', '候选应是 VOO');
+
+      // 2) 加入目录：落成「待确认」，分类留空等用户填（不得自动确认）
+      clickAction('[data-action="inst:add"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.instruments || []).some(function (r) { return r.symbol === 'VOO'; });
+      }, 8000, '标的写入事实源');
+
+      var added = (await apiState()).assets.instruments.filter(function (r) { return r.symbol === 'VOO'; });
+      equal(added.length, 1, '目录里应恰好有一条 VOO');
+      equal(added[0].classificationStatus, 'suggested', '加入目录后必须是待确认，不得自动确认');
+      equal(added[0].assetClass, undefined, 'assetClass 不由参考数据生成，必须等用户填');
+      equal(added[0].exposureMarket, undefined, 'exposureMarket 不由参考数据生成，必须等用户填');
+      assert(added[0].providerProvenance && added[0].providerProvenance.payloadHash,
+        '必须留下参考数据来源留档（provenance）');
+      var instId = added[0].id;
+
+      // 3) 确认分类：资产类别与敞口市场都是用户判断，两项都要提交
+      clickAction('[data-action="inst:confirm"]');
+      await waitFor(function () { return document.querySelector('#ic-class'); }, 5000, '确认弹层');
+      document.querySelector('#ic-class').value = 'broad_equity';
+      document.querySelector('#ic-exp').value = 'US';
+      document.querySelector('#ic-index').value = 'S&P 500';
+      clickAction('[data-action="inst:saveConfirm"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        var r = (st.assets.instruments || []).filter(function (x) { return x.id === instId; })[0];
+        return !!r && r.classificationStatus === 'confirmed';
+      }, 8000, '确认写入事实源');
+
+      var confirmed = (await apiState()).assets.instruments.filter(function (r) { return r.id === instId; })[0];
+      equal(confirmed.assetClass, 'broad_equity', '用户填写的资产类别必须落库');
+      equal(confirmed.exposureMarket, 'US', '用户填写的敞口市场必须落库');
+      equal(confirmed.trackingIndex, 'S&P 500', '跟踪指数必须落库');
+
+      // 4) 按参考数据刷新：确认分类与用户填写的值一律不被覆盖（S4B.1 核心不变量）
+      var refreshPosted = 0;
+      var origFetch = window.fetch;
+      window.fetch = function (url, init) {
+        var p = origFetch.apply(window, arguments);
+        if (init && init.method === 'POST' && String(url).indexOf('/api/v1/instruments') === 0) {
+          return p.then(function (r) { refreshPosted += 1; return r; });
+        }
+        return p;
+      };
+      try {
+        clickAction('[data-action="inst:refresh"]');
+        await waitFor(function () { return refreshPosted > 0; }, 8000, '刷新请求完成');
+      } finally {
+        window.fetch = origFetch;
+      }
+
+      var kept = (await apiState()).assets.instruments.filter(function (r) { return r.symbol === 'VOO'; });
+      equal(kept.length, 1, '刷新不得多出第二行事实');
+      equal(kept[0].id, instId, '刷新必须命中既有标的');
+      equal(kept[0].classificationStatus, 'confirmed', '刷新不得把状态退回 suggested');
+      equal(kept[0].assetClass, 'broad_equity', '刷新不得覆盖用户确认的资产类别');
+      equal(kept[0].exposureMarket, 'US', '刷新不得覆盖用户确认的敞口市场');
+      equal(kept[0].trackingIndex, 'S&P 500', '刷新不得覆盖用户填写的跟踪指数');
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();

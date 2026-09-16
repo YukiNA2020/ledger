@@ -21,6 +21,11 @@ const R = require('./repository');
 const backupLib = require('./backup');
 const keychain = require('./keychain');
 const migrations = require('./migrations');
+const Catalog = require('./instrument-catalog');
+// Phase 4B 的标的检索/元数据 provider 固定为离线 fixture（不发真实网络）。
+// 真实行情源要等 4D 通过 D-038 门禁后才允许接入；届时这里换成真实 provider 即可，
+// 上层的 catalog 模块与前端不需要改。
+const FixtureProvider = require('./providers/fixture');
 const Domain = require('../js/domain.js');
 const Core = require('../js/core.js');
 
@@ -209,6 +214,40 @@ function sendJson(res, status, payload, extraHeaders) {
 
 function fail(res, status, code, message, retryable) {
   sendJson(res, status, { error: { code: code, message: message, retryable: !!retryable } });
+}
+
+/* ---------------------- 标的目录（Phase 4B）错误映射 ---------------------- */
+
+// catalog 模块只返回稳定错误码，HTTP 状态由这里集中决定（ARCHITECTURE §5.6）。
+const CATALOG_ERROR_STATUS = {
+  invalid_query: 400,
+  invalid_symbol: 400,
+  invalid_source: 400,
+  invalid_id: 400,
+  invalid_currency: 400,
+  invalid_exchange: 400,
+  invalid_name: 400,
+  invalid_instrument_type: 400,
+  invalid_country: 400,
+  invalid_asset_class: 400,
+  invalid_exposure_market: 400,
+  invalid_tracking_index: 400,
+  currency_mismatch: 400,
+  instrument_not_found: 404,
+  duplicate_instrument: 409,
+  invalid_provider_payload: 422,
+  provider_unavailable: 503,
+  internal_error: 500
+};
+
+function catalogFail(res, result) {
+  const status = CATALOG_ERROR_STATUS[result.code] || 500;
+  return fail(res, status, result.code, result.message || '标的目录操作失败', !!result.retryable);
+}
+
+// provider 需要抓取时间：生产环境用真实当前时间（带时区），测试可用 ctx.providerNow 注入固定时间。
+function providerCtx(ctx) {
+  return { now: typeof ctx.providerNow === 'function' ? ctx.providerNow() : new Date().toISOString() };
 }
 
 function readBody(req) {
@@ -646,6 +685,54 @@ function createHandler(ctx) {
 
   api['GET /api/v1/instruments'] = (req, res) => {
     sendJson(res, 200, { items: R.readInstruments(ctx.db) });
+  };
+
+  /* ---------- Phase 4B：标的检索、目录建立与分类确认 ---------- */
+
+  // 只读检索：本地已建标的 + provider 候选，按去重键合并（provider 失败时本地命中仍可用）。
+  // 检索词走 query string；对外只发送公开检索词，不含任何账户/持仓信息。
+  api['GET /api/v1/instruments/search'] = (req, res) => {
+    const q = (req.query && req.query.q) || '';
+    return Catalog.searchCatalog(ctx.db, FixtureProvider, q, providerCtx(ctx)).then((result) => {
+      if (!result.ok) return catalogFail(res, result);
+      return sendJson(res, 200, {
+        ok: true,
+        query: result.query,
+        provider: result.provider,
+        candidates: result.candidates,
+        warnings: result.warnings
+      });
+    });
+  };
+
+  // 建立/刷新标的：默认从 provider 参考数据补全（source 缺省即 provider）；
+  // provider 未覆盖的标的用 source=manual 手工建立（币种必填）。
+  // 一律落成 suggested —— 分类确认必须由用户显式发起（ARCHITECTURE §10）。
+  api['POST /api/v1/instruments'] = async (req, res) => {
+    const body = await readBody(req);
+    const result = await Catalog.createInstrument(ctx.db, FixtureProvider, body, providerCtx(ctx));
+    if (!result.ok) return catalogFail(res, result);
+    return sendJson(res, 201, {
+      ok: true,
+      item: result.item,
+      duplicated: !!result.duplicated,
+      preserved: !!result.preserved,
+      conflicts: result.conflicts || [],
+      suggestions: result.suggestions || []
+    });
+  };
+
+  // 用户确认分类：asset_class / exposure_market 是用户判断，两项必填；
+  // 确认后 classification_status 锁定为 confirmed，外部元数据变化只能产生冲突提示。
+  api['POST /api/v1/instrument-confirmations'] = async (req, res) => {
+    const body = await readBody(req);
+    const result = Catalog.confirmInstrument(ctx.db, body, providerCtx(ctx));
+    if (!result.ok) return catalogFail(res, result);
+    return sendJson(res, 201, {
+      ok: true,
+      item: result.item,
+      conflicts: result.conflicts || []
+    });
   };
   api['GET /api/v1/holdings'] = (req, res) => {
     sendJson(res, 200, { items: R.readHoldings(ctx.db) });

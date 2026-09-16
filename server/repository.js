@@ -388,8 +388,123 @@ function readInstruments(db) {
   });
 }
 
-function writeOpenings(db, list) {
-  const st = db.prepare(
+/* -------- 标的单条写入（Phase 4B）：稳定 id、按去重键保证同一标的只有一行 -------- */
+
+// 标的的业务列（其余字段一律进 extra_json，保持零丢失）。
+const INSTRUMENT_COLUMNS = [
+  'id', 'symbol', 'exchange', 'currency', 'name',
+  'instrument_type', 'asset_class', 'exposure_market', 'classification_status'
+];
+
+// 完整还原一行标的（含 null 字段），供目录模块做比较/合并。
+// 公开读取接口 readInstruments 保持既有形状不变（只在有值时给出可选字段）。
+function hydrateInstrument(row) {
+  const out = {
+    id: row.id,
+    symbol: row.symbol,
+    exchange: row.exchange,
+    currency: row.currency,
+    name: row.name,
+    instrumentType: row.instrument_type,
+    assetClass: row.asset_class,
+    exposureMarket: row.exposure_market,
+    classificationStatus: row.classification_status
+  };
+  return mergeExtra(row, out);
+}
+
+function readInstrumentRecords(db) {
+  return all(db, 'SELECT * FROM instruments ORDER BY rowid').map(hydrateInstrument);
+}
+
+function getInstrument(db, id) {
+  if (!id) return null;
+  const row = get(db, 'SELECT * FROM instruments WHERE id = ?', [String(id)]);
+  return row ? hydrateInstrument(row) : null;
+}
+
+// 按去重键找已有标的：先精确匹配 (symbol@exchange)，再退化为「同一代码且任一方交易所为空」。
+// 退化匹配是为了避免"先手工建标的、后由 provider 补全交易所"时凭空多出第二行事实。
+function findInstrumentByKey(db, symbol, exchange) {
+  const records = readInstrumentRecords(db);
+  const want = Domain.instrumentKey(symbol, exchange);
+  if (!want) return null;
+  const exact = records.find((r) => Domain.instrumentKey(r.symbol, r.exchange) === want);
+  if (exact) return exact;
+  const sym = String(symbol == null ? '' : symbol).trim().toUpperCase();
+  const loose = records.find(
+    (r) => String(r.symbol || '').trim().toUpperCase() === sym && (!r.exchange || !exchange)
+  );
+  return loose || null;
+}
+
+// 单条标的 upsert：
+//   - 以 id 为冲突键（同 id 重复提交即幂等更新）；
+//   - 以 (symbol, exchange) 为去重键：写入前删除同键的其他 id 行，
+//     从写入路径上保证"同一标的不重复创建事实"（而不是靠调用方自觉）；
+//   - 未知字段进 extra_json，读回时零丢失。
+function upsertInstrument(db, item, options) {
+  const opts = options || {};
+  if (!item || !item.id) throw Object.assign(new Error('缺少标的 id'), { code: 'invalid_id' });
+  const id = String(item.id);
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw Object.assign(new Error('标的 id 不合法'), { code: 'invalid_id' });
+  const symbol = STR(item.symbol || '').trim();
+  if (!symbol) throw Object.assign(new Error('标的代码不能为空'), { code: 'invalid_symbol' });
+  const currency = STR(item.currency);
+  if (Domain.CURRENCIES.indexOf(currency) === -1) {
+    throw Object.assign(new Error('标的币种必须是 CNY/HKD/USD'), { code: 'invalid_currency' });
+  }
+  const status = item.classificationStatus === 'confirmed' ? 'confirmed' : 'suggested';
+
+  // 去重键：同一 (symbol, exchange) 只允许一行。
+  // 这里**不静默删除**冲突行 —— 那会连带丢掉已确认的分类；改为显式报错，
+  // 由调用方先用 findInstrumentByKey 解析出既有标的后再写入（catalog 模块就是这么做的）。
+  const key = Domain.instrumentKey(symbol, item.exchange);
+  const clash = readInstrumentRecords(db).find(
+    (r) => r.id !== id && Domain.instrumentKey(r.symbol, r.exchange) === key
+  );
+  if (clash) {
+    throw Object.assign(new Error('同一标的已存在：' + clash.id), { code: 'duplicate_instrument' });
+  }
+
+  const extra = {
+    trackingIndex: item.trackingIndex == null ? null : String(item.trackingIndex),
+    source: item.source == null ? null : String(item.source),
+    country: item.country == null ? null : String(item.country),
+    exchangeTimezone: item.exchangeTimezone == null ? null : String(item.exchangeTimezone),
+    providerCandidate: item.providerCandidate || null,
+    providerProvenance: item.providerProvenance || null,
+    conflicts: item.conflicts || null,
+    createdAt: item.createdAt || opts.now || new Date().toISOString(),
+    updatedAt: opts.now || new Date().toISOString(),
+    confirmedAt: item.confirmedAt || null
+  };
+  Object.keys(extra).forEach((k) => {
+    if (extra[k] === null || extra[k] === undefined) delete extra[k];
+  });
+
+  run(db, 'DELETE FROM instruments WHERE id = ?', [id]);
+  run(
+    db,
+    `INSERT INTO instruments (id, symbol, exchange, currency, name, instrument_type, asset_class, exposure_market, classification_status, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      symbol,
+      STR(item.exchange),
+      currency,
+      STR(item.name),
+      STR(item.instrumentType),
+      STR(item.assetClass),
+      STR(item.exposureMarket),
+      status,
+      Object.keys(extra).length ? JSON.stringify(extra) : null
+    ]
+  );
+  return hydrateInstrument(get(db, 'SELECT * FROM instruments WHERE id = ?', [id]));
+}
+
+function writeOpenings(db, list) {  const st = db.prepare(
     `INSERT INTO portfolio_openings (id, account_id, instrument_id, quantity, cost_minor, as_of, extra_json)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
   );
@@ -1229,6 +1344,10 @@ module.exports = {
   readLiabilities,
   readEntitlements,
   readInstruments,
+  readInstrumentRecords,
+  getInstrument,
+  findInstrumentByKey,
+  upsertInstrument,
   readOpenings,
   readQuotes,
   readFxRates,

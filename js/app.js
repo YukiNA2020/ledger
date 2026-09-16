@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.2-phase3';
+  var APP_VERSION = '2.3.5-phase4b';
 
   /* ================= 状态 ================= */
   var state = {
@@ -25,6 +25,8 @@
     statNec: '',         // V2.2.1 必要性筛选（'' 全部 / need / want）
     pendingRecurring: 0, // 待生成的周期账笔数（首页横幅）
     closes: [], closesLoaded: false, // Phase 3：月度结账历史
+    // Phase 4B：标的目录（检索结果只存在内存里，不写事实源；事实源只有 instruments 表）
+    instQuery: '', instResult: null, instBusy: false, instError: '',
     wiz: null
   };
 
@@ -489,6 +491,17 @@
   var ACC_KIND_LABELS = { bank_card: '储蓄卡', credit_card: '信用卡', broker: '证券账户', government: '公积金/社保', other: '其他' };
   var ENT_KIND_LABELS = { social_security: '社保', housing_fund: '公积金', insurance: '商业保险', other: '其他' };
   var TERM_LABELS = { current: '当期（12个月内到期）', non_current: '长期负债' };
+  // Phase 4B：资产类别为**用户判断**（provider 不提供），敞口市场词表与 domain 保持一份实现。
+  var ASSET_CLASS_LABELS = {
+    cash: '现金/货币',
+    fixed_income: '固定收益',
+    broad_equity: '宽基权益',
+    theme_equity: '行业/主题权益',
+    stock: '个股',
+    other: '其他'
+  };
+  var EXPOSURE_LABELS = { CN: '中国内地', HK: '中国香港', US: '美国', global: '全球', other: '其他' };
+  var INSTR_STATUS_LABELS = { suggested: '待确认', confirmed: '已确认' };
 
   function optList(map, def) {
     return Object.keys(map).map(function (k) {
@@ -655,9 +668,102 @@
       '<div class="card">' + (fxRows || '<div class="small muted">暂无手动汇率；外币余额缺汇率时不计入汇总，且会阻塞正式结账</div>') +
       '<div class="small muted" style="margin-top:6px">自动行情将在后续版本接入；在此登记的是「币对 + 汇率 + 汇率日」这一条事实。</div></div>';
 
-    return html + accountSection + transferSection + liabSection + entSection + presetSection + fxSection +
+    return html + accountSection + transferSection + liabSection + entSection + presetSection + catalogSection() + fxSection +
       '<div class="small muted" style="margin-top:12px">说明：权益只展示状态与备注，不计入任何资产合计；' +
-      '外币余额按估值日汇率折算，缺汇率时该项不计入；换汇只记为资产转移，不计收入或支出。</div>';
+      '外币余额按估值日汇率折算，缺汇率时该项不计入；换汇只记为资产转移，不计收入或支出；' +
+      '标的分类由你确认后锁定，参考数据变化只提示差异。</div>';
+  }
+
+  /* ---------- 标的目录（Phase 4B）----------
+     流程：搜索（本地缓存 + 参考数据候选）→ 加入目录（suggested）→ 用户确认分类（confirmed）。
+     参考数据只提供代码/名称/币种/交易所/类型/上市地区；资产类别与风险敞口是**用户判断**，
+     参考数据没有就留空（不编造）。确认后参考数据的变化只提示冲突，不覆盖本地值（D-037）。 */
+  function instSourceLabel(c) {
+    if (c.origin === 'local+provider') return '本地已有 · 参考数据可刷新';
+    if (c.origin === 'local') return '本地已有';
+    return '来自参考数据';
+  }
+
+  function conflictBlock(conflicts) {
+    if (!conflicts || !conflicts.length) return '';
+    var rows = conflicts.map(function (c) {
+      var prov = c.provenance || {};
+      return '<div class="todo-item small">· <b>' + esc(c.field) + '</b>：本地「' + esc(c.localValue) +
+        '」← 参考数据「' + esc(c.providerValue) + '」<span class="muted">（' +
+        esc(prov.provider || '未知来源') + ' ' + esc(prov.endpoint || '') + ' · ' + esc(prov.fetchedAt || '') + '）</span></div>';
+    }).join('');
+    return '<div class="over-banner info" style="margin:6px 0 0">本地值保持不变，以下差异仅作提示：' + rows + '</div>';
+  }
+
+  function candidateRow(c) {
+    var meta = [c.currency, c.exchange, c.instrumentType, c.country].filter(Boolean).join(' · ');
+    return '<div class="acc-card"><div class="row"><b>' + esc(c.symbol) + '</b>' +
+      '<span class="small muted" style="margin-left:auto">' + esc(instSourceLabel(c)) + '</span></div>' +
+      (c.name ? '<div class="small">' + esc(c.name) + '</div>' : '') +
+      '<div class="small muted">' + esc(meta || '参考数据未提供更多元数据') + '</div>' +
+      '<div style="margin-top:6px">' + (c.local
+        ? '<span class="small muted">已在目录中（' + esc(INSTR_STATUS_LABELS[c.local.classificationStatus] || c.local.classificationStatus) + '）</span>'
+        : '<button class="btn ghost small" data-action="inst:add" data-symbol="' + esc(c.symbol) + '">加入目录</button>') +
+      '</div></div>';
+  }
+
+  function instrumentRow(i) {
+    var meta = [i.currency, i.exchange, i.instrumentType].filter(Boolean).join(' · ');
+    var cls = i.assetClass ? (ASSET_CLASS_LABELS[i.assetClass] || i.assetClass) : '类别未填';
+    var exp = i.exposureMarket ? (EXPOSURE_LABELS[i.exposureMarket] || i.exposureMarket) : '敞口未填';
+    var status = INSTR_STATUS_LABELS[i.classificationStatus] || i.classificationStatus;
+    var conflictCount = (i.conflicts || []).length;
+    return '<div class="acc-card"><div class="row"><b>' + esc(i.symbol) + '</b>' +
+      '<span class="small muted" style="margin-left:auto">' + esc(status) + ' · ' +
+      (i.source === 'manual' ? '手工建立' : '参考数据') + (conflictCount ? ' · ' + conflictCount + ' 项差异' : '') + '</span></div>' +
+      (i.name ? '<div class="small">' + esc(i.name) + '</div>' : '') +
+      '<div class="small muted">' + esc(meta || '元数据不足') + ' · 分类 ' + esc(cls) + ' · 敞口 ' + esc(exp) +
+      (i.trackingIndex ? ' · 跟踪 ' + esc(i.trackingIndex) : '') + '</div>' +
+      '<div class="small muted">' + (i.classificationStatus === 'confirmed'
+        ? '分类已锁定：参考数据变化只会提示冲突，不会覆盖你的判断'
+        : '待确认：未确认分类不进入正式配置分析') + '</div>' +
+      conflictBlock(i.conflicts) +
+      '<div class="row" style="margin-top:6px">' +
+      '<button class="btn ghost small" data-action="inst:confirm" data-id="' + esc(i.id) + '">' +
+      (i.classificationStatus === 'confirmed' ? '修改分类' : '确认分类') + '</button>' +
+      '<button class="btn ghost small" data-action="inst:refresh" data-id="' + esc(i.id) + '" data-symbol="' + esc(i.symbol) + '">按参考数据刷新</button>' +
+      '</div></div>';
+  }
+
+  function catalogSection() {
+    var a = Domain.normalizeAssets(state.assets);
+    var items = a.instruments || [];
+    var pending = items.filter(function (i) { return i.classificationStatus !== 'confirmed'; }).length;
+    var conflicts = items.filter(function (i) { return (i.conflicts || []).length; }).length;
+    var res = state.instResult;
+    var providerBanner = res && res.provider && res.provider.status === 'error'
+      ? '<div class="over-banner warn" style="margin-top:6px">参考数据暂不可用（' + esc(res.provider.code || 'error') +
+        '）：本地已建标的仍可检索与确认，确认分类不依赖外部数据。</div>'
+      : '';
+    var warnRows = res && res.warnings && res.warnings.length
+      ? '<div class="small muted" style="margin-top:4px">' + res.warnings.map(function (w) {
+        return '· ' + esc(w.code) + (w.symbol ? '（' + esc(w.symbol) + '）' : '') + '：' + esc(w.detail || '');
+      }).join('<br>') + '</div>'
+      : '';
+    var candRows = '';
+    if (res && res.candidates && res.candidates.length) candRows = res.candidates.map(candidateRow).join('');
+    else if (res) candRows = '<div class="small muted" style="padding:4px 0">没有匹配的候选；参考数据未覆盖时可手工建立。</div>';
+    return '<div class="sec-head"><b>标的目录</b>' +
+      '<span class="small muted">' + items.length + ' 个标的 · ' + pending + ' 个待确认' +
+      (conflicts ? ' · ' + conflicts + ' 个有差异' : '') + '</span></div>' +
+      '<div class="card">' +
+      '<div class="row" style="gap:8px">' +
+      '<input id="inst-q" placeholder="代码或名称，如 VOO / 2800.HK / 沪深300" value="' + esc(state.instQuery || '') + '" style="flex:1">' +
+      '<button class="btn primary small" data-action="inst:search">' + (state.instBusy ? '搜索中…' : '搜索') + '</button></div>' +
+      '<div class="small muted" style="margin-top:6px">只把检索词发给参考数据来源；账户名、数量、成本、余额一律不出本机。</div>' +
+      '<div class="row" style="margin-top:6px"><button class="link small" data-action="inst:manual">＋ 手工建立标的（参考数据未覆盖时）</button></div>' +
+      providerBanner + warnRows +
+      (candRows ? '<div style="margin-top:8px">' + candRows + '</div>' : '') +
+      '</div>' +
+      (items.length
+        ? items.map(instrumentRow).join('')
+        : '<div class="empty"><div class="e-icon">📈</div><b>目录里还没有标的</b>' +
+          '<div class="small muted">先搜索并加入，再确认资产类别与风险敞口</div></div>');
   }
 
   /* ---------- 福利预设（青岛）----------
@@ -751,8 +857,70 @@
       '<button class="btn primary block" data-action="asset:saveFx">保存汇率</button>');
   }
 
-  function assetAccountSheet() {
-    openSheet('新增账户',
+  /* ---------- 标的目录：检索与确认弹层（Phase 4B） ---------- */
+
+  function runInstrumentSearch() {
+    var q = String(state.instQuery || '').trim();
+    if (!q) { toast('请输入检索词', 'warn'); return; }
+    state.instBusy = true;
+    render();
+    Store.searchInstruments(q)
+      .then(function (res) {
+        state.instBusy = false;
+        state.instResult = res || null;
+        if (res && res.offline) toast('本地服务未运行，检索不可用', 'err');
+        render();
+      })
+      .catch(function (e) {
+        state.instBusy = false;
+        state.instResult = null;
+        render();
+        resourceFail(e);
+      });
+  }
+
+  function instrumentManualSheet() {
+    var curOpts = Domain.CURRENCIES.map(function (c) {
+      return '<option value="' + esc(c) + '"' + (c === 'CNY' ? ' selected' : '') + '>' + esc(c) + '</option>';
+    }).join('');
+    openSheet('手工建立标的',
+      '<div class="form-row">' +
+      formItem('公开证券代码', '<input id="im-symbol" placeholder="如 512880.SS">') +
+      formItem('名称（可选）', '<input id="im-name" placeholder="如 证券ETF">') +
+      formItem('交易币种', '<select id="im-currency">' + curOpts + '</select>') +
+      formItem('交易所（可选）', '<input id="im-exchange" placeholder="如 SSE">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">用于参考数据未覆盖的标的（例如 A 股本土 ETF）；' +
+      '手工建立的标的同样是「待确认」，分类需要你确认。</div>' +
+      '<button class="btn primary block" data-action="inst:saveManual">建立</button>');
+  }
+
+  function instrumentConfirmSheet(id) {
+    var a = Domain.normalizeAssets(state.assets);
+    var inst = (a.instruments || []).find(function (x) { return x.id === id; });
+    if (!inst) { toast('标的不存在', 'warn'); return; }
+    var prov = inst.providerProvenance || null;
+    var classOpts = Object.keys(ASSET_CLASS_LABELS).map(function (k) {
+      return '<option value="' + esc(k) + '"' + (inst.assetClass === k ? ' selected' : '') + '>' + esc(ASSET_CLASS_LABELS[k]) + '</option>';
+    }).join('');
+    var expOpts = Domain.EXPOSURE_MARKETS.map(function (m) {
+      return '<option value="' + esc(m) + '"' + (inst.exposureMarket === m ? ' selected' : '') + '>' + esc(EXPOSURE_LABELS[m] || m) + '</option>';
+    }).join('');
+    openSheet('确认标的分类',
+      '<div class="form-row">' +
+      formItem('标的', '<div>' + esc(inst.symbol) + (inst.name ? ' · ' + esc(inst.name) : '') + '</div>') +
+      formItem('资产类别', '<select id="ic-class">' + classOpts + '</select>') +
+      formItem('风险敞口市场', '<select id="ic-exp">' + expOpts + '</select>') +
+      formItem('跟踪指数（可选）', '<input id="ic-index" value="' + esc(inst.trackingIndex || '') + '">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">资产类别与风险敞口是<b>你的判断</b>，参考数据不提供；' +
+      '确认后本地锁定，参考数据再变化也只提示差异、不覆盖。' +
+      (prov ? '（当前来源 ' + esc(prov.provider) + ' ' + esc(prov.endpoint) + ' · ' + esc(prov.sourceVersion || '') + '）' : '') + '</div>' +
+      conflictBlock(inst.conflicts) +
+      '<button class="btn primary block" data-action="inst:saveConfirm" data-id="' + esc(inst.id) + '">确认分类并锁定</button>');
+  }
+
+  function assetAccountSheet() {    openSheet('新增账户',
       '<div class="form-row">' +
       formItem('账户名称', '<input id="aa-name" placeholder="如 招行储蓄卡(1234)">') +
       formItem('所属机构', '<input id="aa-inst" placeholder="如 招商银行（可留空）">') +
@@ -2997,6 +3165,70 @@
         provider: 'manual', status: 'ok'
       }).then(function () {
         closeSheet(); toast(base + '→' + quote + ' 汇率已登记');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+
+    /* ---------- Phase 4B：标的目录 ---------- */
+
+    'inst:search': function () {
+      var el = $('#inst-q');
+      if (el) state.instQuery = el.value.trim();
+      runInstrumentSearch();
+    },
+    'inst:add': function (el) {
+      var symbol = el && el.dataset ? el.dataset.symbol : '';
+      if (!symbol) return;
+      Store.createInstrument({ symbol: symbol }).then(function (r) {
+        toast(r && r.duplicated ? '该标的已在目录中' : '已加入目录，待确认分类');
+        return refreshAssets();
+      }).then(function () {
+        if (state.instQuery) runInstrumentSearch();
+      }).catch(resourceFail);
+    },
+    'inst:manual': instrumentManualSheet,
+    'inst:saveManual': function () {
+      var symbol = $('#im-symbol').value.trim();
+      if (!symbol) { toast('请填写公开证券代码', 'warn'); return; }
+      var payload = { symbol: symbol, source: 'manual', currency: $('#im-currency').value };
+      var name = $('#im-name').value.trim();
+      var exchange = $('#im-exchange').value.trim();
+      if (name) payload.name = name;
+      if (exchange) payload.exchange = exchange;
+      Store.createInstrument(payload).then(function () {
+        closeSheet();
+        toast('已手工建立标的，待确认分类');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'inst:confirm': function (el) {
+      var id = el && el.dataset ? el.dataset.id : '';
+      if (id) instrumentConfirmSheet(id);
+    },
+    'inst:saveConfirm': function (el) {
+      var id = el && el.dataset ? el.dataset.id : '';
+      if (!id) return;
+      var payload = {
+        instrumentId: id,
+        assetClass: $('#ic-class').value,
+        exposureMarket: $('#ic-exp').value
+      };
+      var idx = $('#ic-index').value.trim();
+      if (idx) payload.trackingIndex = idx;
+      Store.confirmInstrument(payload).then(function (r) {
+        closeSheet();
+        var n = r && r.conflicts ? r.conflicts.length : 0;
+        toast(n ? '分类已锁定；参考数据有 ' + n + ' 项差异（已列出，未覆盖你的值）' : '分类已确认并锁定');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'inst:refresh': function (el) {
+      var symbol = el && el.dataset ? el.dataset.symbol : '';
+      if (!symbol) return;
+      // 按参考数据刷新：已确认的标的不会被覆盖，只会把差异记成冲突提示
+      Store.createInstrument({ symbol: symbol }).then(function (r) {
+        var n = r && r.conflicts ? r.conflicts.length : 0;
+        toast(n ? '参考数据与本地有 ' + n + ' 项差异（已列出，未覆盖）' : '参考数据已刷新；本地已确认值不变');
         return refreshAssets();
       }).catch(resourceFail);
     },

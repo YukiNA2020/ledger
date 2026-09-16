@@ -20,6 +20,13 @@
  *   getFxRates(pairs, asOf, ctx)            → Promise<Result[]>   （4A 起）
  *   searchInstrument(query, ctx)            → Promise<Result[]>   （4B）
  *   getInstrumentMetadata(symbol, ctx)      → Promise<Result>     （4B）
+ *
+ * 4B 追加（不改变 4A 已冻结的 quote/fx/error 语义）：
+ *   - 第三类成功结果 `instrument`：标的元数据候选，字段严格按 D-037 的 provider 字段映射，
+ *     并强制携带 provenance `{provider, endpoint, sourceVersion, sourceRef, fetchedAt, payloadHash}`；
+ *   - 检索请求只序列化 query 字符串、元数据请求只序列化 symbol —— 结构上无法夹带账户或持仓字段；
+ *   - `asset_class` / `exposure_market` / 跟踪指数**不是** provider 字段，因此不出现在结果里：
+ *     契约层面就不给外部来源编造用户判断的机会（D-037）。
  */
 'use strict';
 
@@ -83,6 +90,28 @@ var TIMESTAMP_RE = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,3})?(Z|(
 
 // 币对键：'USD/CNY'，只用于错误结果的 subject。
 var PAIR_KEY_RE = /^[A-Z]{3}\/[A-Z]{3}$/;
+
+// 检索词（4B）：公开的证券名称或代码片段，1–32 个字符，必须由字母/数字开头，
+// 允许字母（含 CJK）、数字、空格与常用符号；拒绝控制字符、换行与纯符号串。
+// 检索文本本身会暴露关注方向，这一残余风险已被 ARCHITECTURE §7 明确接受，
+// 但长度与字符集必须收敛，避免把整段备注、持仓清单或带换行的私有文本发出去。
+var SEARCH_QUERY_RE = /^[\p{L}\p{N}][\p{L}\p{N} ._&()\/'-]{0,31}$/u;
+
+// provenance 的 endpoint：provider 的公开端点路径（以 / 开头，无空白与控制字符）。
+var ENDPOINT_RE = /^\/[A-Za-z0-9._~:\/?=&%{}-]{0,160}$/;
+
+// provenance 的 sourceRef：上游原始代码形状（如 '510300@SSE@SSE'）。
+// 只允许代码/交易所字符，从形状上排除"误把账户名当来源标识"的可能。
+var SOURCE_REF_RE = /^[A-Za-z0-9._@:-]{1,80}$/;
+
+// provenance 的 payloadHash：原始响应留档的 sha256 十六进制摘要。
+var SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+// 交易所 / instrument_type 这类上游短标识：单行、有界、无空白。
+var SHORT_TOKEN_RE = /^[A-Za-z0-9._:-]{1,32}$/;
+
+// instrument 结果里可选文本字段的上限（provider 未提供时必须是 null，不能用空串冒充）。
+var MAX_INSTRUMENT_TEXT = 120;
 
 // 单批请求上限：一次请求最多多少只标的 / 多少组币对。
 var MAX_BATCH_SIZE = 200;
@@ -172,6 +201,39 @@ function isPairKey(v) {
   return typeof v === 'string' && PAIR_KEY_RE.test(v);
 }
 
+// 检索词：形状合格且去空白后非空（'   ' 这类"看起来非空"的输入一律拒绝）。
+function isSearchQuery(v) {
+  return typeof v === 'string' && SEARCH_QUERY_RE.test(v.trim()) && v.trim() === v;
+}
+
+// 可选的上游文本字段：provider 未提供时必须是 null / undefined，不能用空串或占位符冒充。
+function isOptionalText(v, maxLength) {
+  if (v == null) return true;
+  if (typeof v !== 'string') return false;
+  var s = v.trim();
+  if (!s || s.length > (maxLength || MAX_INSTRUMENT_TEXT)) return false;
+  return !/[\u0000-\u001f\u007f]/.test(s);
+}
+
+// 可选的上游短标识（exchange / mic_code 等）。
+function isOptionalShortToken(v) {
+  if (v == null) return true;
+  return typeof v === 'string' && SHORT_TOKEN_RE.test(v);
+}
+
+// provenance：provider 候选的可追溯来源（D-037 要求逐候选记录这六个字段）。
+function isProvenance(v) {
+  return (
+    hasExactKeys(v, ['provider', 'endpoint', 'sourceVersion', 'sourceRef', 'fetchedAt', 'payloadHash']) &&
+    nonEmptyString(v.provider) &&
+    typeof v.endpoint === 'string' && ENDPOINT_RE.test(v.endpoint) &&
+    nonEmptyString(v.sourceVersion) &&
+    typeof v.sourceRef === 'string' && SOURCE_REF_RE.test(v.sourceRef) &&
+    isTimestamp(v.fetchedAt) &&
+    typeof v.payloadHash === 'string' && SHA256_HEX_RE.test(v.payloadHash)
+  );
+}
+
 /* ------------------------------ 请求校验 + 序列化（隐私边界核心） ------------------------------ */
 
 // 失败请求：detail 只含"第 N 项 / 形状说明"，绝不回显输入原文。
@@ -212,6 +274,24 @@ function serializeFxRequest(pairs) {
     out.push({ base: pairs[i].base, quote: pairs[i].quote });
   }
   return okRequest('pairs', out);
+}
+
+// 标的检索请求（4B）：只序列化一个公开检索词。
+// 产物键集合恒为 { query } —— 调用方即便传入对象、数组或夹带私有字段的载荷，
+// 也不可能把账户名、持仓数量或成本带进对外请求。
+function serializeSearchRequest(query) {
+  if (typeof query !== 'string') return invalidRequest('检索请求必须是单个字符串检索词');
+  var q = query.trim();
+  if (!isSearchQuery(q)) {
+    return invalidRequest('检索词必须是 1–32 个字符的公开证券名称或代码，且不含控制字符');
+  }
+  return okRequest('query', q);
+}
+
+// 标的元数据请求（4B）：只序列化一个公开证券代码。
+function serializeMetadataRequest(symbol) {
+  if (!isSymbol(symbol)) return invalidRequest('元数据请求需要合法的公开证券代码形状');
+  return okRequest('symbol', symbol);
 }
 
 /* ------------------------------ 统一结果形状（严格构造） ------------------------------ */
@@ -262,6 +342,70 @@ function fxResult(o) {
     status: 'ok'
   };
 }
+
+/* --------------------------- 标的元数据结果（4B） --------------------------- */
+
+// provenance（D-037）：逐候选记录可追溯来源。六个字段全部必需且形状受限，
+// 使"这条元数据从哪来、上游原始代码是什么、响应摘要是什么"可复核、可留档。
+function makeProvenance(o) {
+  requireOrThrow(!!o && typeof o === 'object', 'provenance 需要对象');
+  requireOrThrow(nonEmptyString(o.provider), 'provenance.provider 必须是非空字符串');
+  requireOrThrow(
+    typeof o.endpoint === 'string' && ENDPOINT_RE.test(o.endpoint),
+    'provenance.endpoint 必须是 provider 的公开端点路径（以 / 开头、无空白）'
+  );
+  requireOrThrow(
+    typeof o.sourceVersion === 'string' && !!o.sourceVersion.trim() && o.sourceVersion.length <= 40 &&
+      !/[\u0000-\u001f\u007f]/.test(o.sourceVersion),
+    'provenance.sourceVersion 必须是有界的单行版本标识'
+  );
+  requireOrThrow(
+    typeof o.sourceRef === 'string' && SOURCE_REF_RE.test(o.sourceRef),
+    'provenance.sourceRef 必须是上游原始代码形状'
+  );
+  requireOrThrow(isTimestamp(o.fetchedAt), 'provenance.fetchedAt 必须是带时区的 ISO 时间戳');
+  requireOrThrow(
+    typeof o.payloadHash === 'string' && SHA256_HEX_RE.test(o.payloadHash),
+    'provenance.payloadHash 必须是原始响应的 sha256 十六进制摘要'
+  );
+  return {
+    provider: o.provider,
+    endpoint: o.endpoint,
+    sourceVersion: o.sourceVersion.trim(),
+    sourceRef: o.sourceRef,
+    fetchedAt: o.fetchedAt,
+    payloadHash: o.payloadHash
+  };
+}
+
+// 标的元数据候选结果（4B）：字段严格按 D-037 的 provider 字段映射，
+// provider 未提供的可为 null —— 契约层不提供 asset_class / exposure_market / 跟踪指数，
+// 因为那三项属于用户判断，外部来源不能生成（AGENTS.md「来源必须可区分」）。
+function instrumentResult(o) {
+  requireOrThrow(!!o && typeof o === 'object', 'instrumentResult 需要对象');
+  requireOrThrow(isSymbol(o.symbol), 'instrument.symbol 不是合法的公开证券代码形状');
+  requireOrThrow(isCurrency(o.currency), 'instrument.currency 必须是 3 位大写币种代码');
+  requireOrThrow(isOptionalText(o.name), 'instrument.name 必须是 null 或有界的单行文本');
+  requireOrThrow(isOptionalShortToken(o.exchange), 'instrument.exchange 必须是 null 或上游短标识');
+  requireOrThrow(isOptionalText(o.country, 40), 'instrument.country 必须是 null 或有界的单行文本');
+  requireOrThrow(isOptionalText(o.instrumentType, 40), 'instrument.instrumentType 必须是 null 或有界的单行文本');
+  requireOrThrow(isOptionalText(o.exchangeTimezone, 64), 'instrument.exchangeTimezone 必须是 null 或有界的单行文本');
+  requireOrThrow(isProvenance(o.provenance), 'instrument.provenance 不满足来源记录要求');
+  return {
+    kind: 'instrument',
+    symbol: o.symbol,
+    name: o.name == null ? null : o.name.trim(),
+    currency: o.currency,
+    exchange: o.exchange == null ? null : o.exchange,
+    country: o.country == null ? null : o.country.trim(),
+    instrumentType: o.instrumentType == null ? null : o.instrumentType.trim(),
+    exchangeTimezone: o.exchangeTimezone == null ? null : o.exchangeTimezone.trim(),
+    provenance: makeProvenance(o.provenance),
+    status: 'ok'
+  };
+}
+
+/* ------------------------------ 错误结果 ------------------------------ */
 
 // 错误结果的 subject 只接受公开代码 / 币对形状；其他字符串一律置空。
 // 这是隐私边界的第二道闸：即便上游 adapter 误把账户名当 subject 传进来，也不会写进结果。
@@ -319,6 +463,21 @@ function isValidResult(r) {
       nonEmptyString(r.provider) &&
       r.status === 'ok';
   }
+  if (r.kind === 'instrument') {
+    return hasExactKeys(r, [
+      'kind', 'symbol', 'name', 'currency', 'exchange', 'country',
+      'instrumentType', 'exchangeTimezone', 'provenance', 'status'
+    ]) &&
+      isSymbol(r.symbol) &&
+      isCurrency(r.currency) &&
+      isOptionalText(r.name) &&
+      isOptionalShortToken(r.exchange) &&
+      isOptionalText(r.country, 40) &&
+      isOptionalText(r.instrumentType, 40) &&
+      isOptionalText(r.exchangeTimezone, 64) &&
+      isProvenance(r.provenance) &&
+      r.status === 'ok';
+  }
   if (r.kind === 'error') {
     return hasExactKeys(r, ['kind', 'subject', 'code', 'detail', 'retryable']) &&
       isErrorCode(r.code) &&
@@ -341,6 +500,7 @@ module.exports = {
   RETRYABLE: RETRYABLE,
   MAX_BATCH_SIZE: MAX_BATCH_SIZE,
   MAX_DETAIL_LENGTH: MAX_DETAIL_LENGTH,
+  MAX_INSTRUMENT_TEXT: MAX_INSTRUMENT_TEXT,
   ContractError: ContractError,
   isErrorCode: isErrorCode,
   isRetryable: isRetryable,
@@ -353,10 +513,16 @@ module.exports = {
   isPositiveSafeInteger: isPositiveSafeInteger,
   isDateString: isDateString,
   isTimestamp: isTimestamp,
+  isSearchQuery: isSearchQuery,
+  isProvenance: isProvenance,
   serializeQuotesRequest: serializeQuotesRequest,
   serializeFxRequest: serializeFxRequest,
+  serializeSearchRequest: serializeSearchRequest,
+  serializeMetadataRequest: serializeMetadataRequest,
   quoteResult: quoteResult,
   fxResult: fxResult,
+  instrumentResult: instrumentResult,
+  makeProvenance: makeProvenance,
   errorResult: errorResult,
   isValidResult: isValidResult,
   assertValidResult: assertValidResult
