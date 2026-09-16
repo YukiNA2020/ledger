@@ -268,6 +268,33 @@ test('provider 整体失败时仍返回本地命中，并显式报告 provider �
   }
 });
 
+test('provider 检索返回非数组或非法候选时显式报契约错误，不能伪装成空结果', async () => {
+  const ctx = setup('ledger-4b-search-shape-');
+  try {
+    await Catalog.createInstrument(ctx.db, Fixture, { symbol: 'VOO' }, CTX);
+    const badShape = {
+      PROVIDER_ID: 'bad-shape',
+      searchInstrument() { return Promise.resolve({ items: [] }); }
+    };
+    const shapeRes = await Catalog.searchCatalog(ctx.db, badShape, 'voo', CTX);
+    assert.strictEqual(shapeRes.provider.status, 'error');
+    assert.strictEqual(shapeRes.provider.code, 'invalid_payload');
+    assert.strictEqual(shapeRes.candidates.length, 1, 'provider 契约错误时本地结果仍可用');
+
+    const badItem = {
+      PROVIDER_ID: 'bad-item',
+      searchInstrument() { return Promise.resolve([{ kind: 'instrument', symbol: 'VOO', currency: 'USD' }]); }
+    };
+    const itemRes = await Catalog.searchCatalog(ctx.db, badItem, 'voo', CTX);
+    assert.strictEqual(itemRes.provider.status, 'error');
+    assert.strictEqual(itemRes.provider.code, 'invalid_payload');
+    assert.ok(itemRes.warnings.some((w) => w.code === 'invalid_payload'));
+    assert.strictEqual(itemRes.candidates.length, 1, '非法候选不得进入结果，但本地结果不能丢');
+  } finally {
+    ctx.close();
+  }
+});
+
 test('检索时本地与 provider 命中同一标的只出现一条候选（不重复）', async () => {
   const ctx = setup('ledger-4b-merge-');
   try {
@@ -356,6 +383,47 @@ test('provider 返回不可入账元数据时拒绝建立标的（坏数据不�
     const res = await Catalog.createInstrument(ctx.db, Fixture, { symbol: 'BADMETA.ETF' }, CTX);
     assert.strictEqual(res.ok, false);
     assert.strictEqual(res.code, 'invalid_provider_payload');
+    assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 0);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('provider 元数据必须绑定请求代码；返回另一个合法标的也拒绝入库', async () => {
+  const ctx = setup('ledger-4b-meta-substitution-');
+  try {
+    const provider = {
+      PROVIDER_ID: 'substitution',
+      getInstrumentMetadata() {
+        return Promise.resolve(
+          Contract.instrumentResult({
+            symbol: 'QQQ',
+            exchange: 'NASDAQ',
+            currency: 'USD',
+            name: 'Different Instrument',
+            provenance: {
+              provider: 'substitution', endpoint: '/metadata', sourceVersion: 'v1',
+              sourceRef: 'QQQ@NASDAQ', fetchedAt: NOW, payloadHash: 'c'.repeat(64)
+            }
+          })
+        );
+      }
+    };
+    const res = await Catalog.createInstrument(ctx.db, provider, { symbol: 'VOO' }, CTX);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, 'invalid_provider_payload');
+    assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 0);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('提交交易所与 provider 元数据不一致时明确报 exchange_mismatch', async () => {
+  const ctx = setup('ledger-4b-exchange-mismatch-');
+  try {
+    const res = await Catalog.createInstrument(ctx.db, Fixture, { symbol: 'VOO', exchange: 'HKEX' }, CTX);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, 'exchange_mismatch');
     assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 0);
   } finally {
     ctx.close();
@@ -589,7 +657,10 @@ test('repository 对同一去重键的第二次写入显式报 duplicate_instrum
   try {
     R.upsertInstrument(
       ctx.db,
-      { id: 'inst-aaaa', symbol: 'VOO', exchange: 'NYSE', currency: 'USD', classificationStatus: 'confirmed' },
+      {
+        id: 'inst-aaaa', symbol: 'VOO', exchange: 'NYSE', currency: 'USD',
+        classificationStatus: 'confirmed', assetClass: 'broad_equity', exposureMarket: 'US'
+      },
       { now: NOW }
     );
     assert.throws(
@@ -603,6 +674,34 @@ test('repository 对同一去重键的第二次写入显式报 duplicate_instrum
     );
     assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 1, '冲突行必须原样保留，不被删除');
     assert.strictEqual(R.getInstrument(ctx.db, 'inst-aaaa').classificationStatus, 'confirmed');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('原位更新 instrument 保留其持仓、证券事件与报价外键事实', () => {
+  const ctx = setup('ledger-4b-upsert-fk-');
+  try {
+    R.upsertInstrument(
+      ctx.db,
+      { id: 'inst-parent', symbol: 'VOO', exchange: 'NYSE', currency: 'USD', name: 'Old name' },
+      { now: NOW }
+    );
+    ctx.db.exec("INSERT INTO asset_accounts (id,name,kind,pool) VALUES ('acc-1','券商','broker','investable')");
+    ctx.db.exec("INSERT INTO portfolio_openings (id,account_id,instrument_id,quantity) VALUES ('opening-1','acc-1','inst-parent','2')");
+    ctx.db.exec("INSERT INTO security_events (id,account_id,instrument_id,event_type,quantity,currency,occurred_at) VALUES ('event-1','acc-1','inst-parent','buy','1','USD','2026-09-15T08:00:00Z')");
+    ctx.db.exec("INSERT INTO quotes (instrument_id,price_minor,currency,price_date,provider,status) VALUES ('inst-parent',50000,'USD','2026-09-15','fixture','ok')");
+
+    R.upsertInstrument(
+      ctx.db,
+      { id: 'inst-parent', symbol: 'VOO', exchange: 'NYSE', currency: 'USD', name: 'New name' },
+      { now: NOW }
+    );
+
+    assert.strictEqual(ctx.db.prepare('SELECT COUNT(*) AS c FROM portfolio_openings').get().c, 1);
+    assert.strictEqual(ctx.db.prepare('SELECT COUNT(*) AS c FROM security_events').get().c, 1);
+    assert.strictEqual(ctx.db.prepare('SELECT COUNT(*) AS c FROM quotes').get().c, 1);
+    assert.strictEqual(R.getInstrument(ctx.db, 'inst-parent').name, 'New name');
   } finally {
     ctx.close();
   }
@@ -966,17 +1065,17 @@ test('检索歧义：本地只有一条缺交易所记录 + 参考数据给出�
     const res = await Catalog.searchCatalog(ctx.db, provider, 'DUAL', CTX);
     assert.strictEqual(res.ok, true);
 
-    // 第一条候选可以安全合并（本地只有一条、且本地缺交易所）
+    // 两个市场都可能对应这条无交易所记录，不能让遍历顺序决定谁先认领。
     const merged = res.candidates.filter((c) => c.origin === 'local+provider');
-    assert.strictEqual(merged.length, 1, '只有一条本地记录，最多只能被一个市场认领');
-    assert.strictEqual(merged[0].local.id, manual.item.id);
+    assert.strictEqual(merged.length, 0, '歧义时两个市场都不得认领本地记录');
 
     // 第二个市场无法判断是否同一条本地记录 → 报歧义且不合并
     const warn = res.warnings.filter((w) => w.code === 'ambiguous_instrument');
-    assert.strictEqual(warn.length, 1, '第二个市场必须报歧义：' + JSON.stringify(res.warnings));
+    assert.strictEqual(warn.length, 1, '多个市场必须报一次歧义：' + JSON.stringify(res.warnings));
     const other = res.candidates.filter((c) => c.origin === 'provider');
-    assert.strictEqual(other.length, 1);
-    assert.strictEqual(other[0].local, null);
+    assert.strictEqual(other.length, 2);
+    assert.ok(other.every((c) => c.local === null));
+    assert.strictEqual(res.candidates.filter((c) => c.origin === 'local').length, 1);
     assert.strictEqual(instrumentsOf(ctx.db, 'DUAL').length, 1, '检索是只读的：不得新增/删除本地事实');
   } finally {
     ctx.close();
@@ -998,6 +1097,10 @@ test('全量写入逐条校验：缺 id / 空白代码 / 非法币种一律抛�
       ['代码不是证券代码形状（含空格）', { id: 'inst-space', symbol: 'VOO NYSE', currency: 'USD' }, 'invalid_symbol'],
       ['币种不在白名单', { id: 'inst-badcur', symbol: 'BAD', exchange: 'NYSE', currency: 'XXX' }, 'invalid_currency'],
       ['币种缺失', { id: 'inst-nocur', symbol: 'NOCUR', exchange: 'NYSE' }, 'invalid_currency'],
+      ['分类状态非法', { id: 'inst-status', symbol: 'STATUS', currency: 'USD', classificationStatus: 'locked' }, 'invalid_classification_status'],
+      ['资产类别非法', { id: 'inst-class', symbol: 'CLASS', currency: 'USD', assetClass: 'equity-ish' }, 'invalid_asset_class'],
+      ['敞口市场非法', { id: 'inst-market', symbol: 'MARKET', currency: 'USD', exposureMarket: 'JP' }, 'invalid_exposure_market'],
+      ['确认态缺资产类别', { id: 'inst-confirmed', symbol: 'CONF', currency: 'USD', classificationStatus: 'confirmed', exposureMarket: 'US' }, 'invalid_asset_class'],
       ['标的不是对象', 'VOO/NYSE', 'invalid_instrument']
     ];
     for (const [label, row, code] of cases) {
@@ -1013,6 +1116,12 @@ test('全量写入逐条校验：缺 id / 空白代码 / 非法币种一律抛�
     // 合法行照常写入（校验没有把正常路径堵死）
     R.writeState(ctx.db, withInstruments([{ id: 'inst-ok', symbol: 'VTI', exchange: 'NYSE', currency: 'USD' }]));
     assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 1);
+
+    R.writeState(ctx.db, withInstruments([{ id: 'inst-ok', symbol: 'vti', exchange: 'nyse', currency: 'usd' }]));
+    const normalized = R.getInstrument(ctx.db, 'inst-ok');
+    assert.strictEqual(normalized.symbol, 'VTI');
+    assert.strictEqual(normalized.exchange, 'NYSE');
+    assert.strictEqual(normalized.currency, 'USD');
 
     // 与单个接口同一口径：非法行不会挤掉既有数据（整体回滚，而不是"先清后写"留下空库）
     assert.throws(

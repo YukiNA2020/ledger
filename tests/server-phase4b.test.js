@@ -230,6 +230,7 @@ test('建立接口：校验失败一律 4xx，且稳定错误码 + 不写入', a
     [{ symbol: 'VOO', assetClass: '现金' }, 400, 'invalid_asset_class'],
     [{ symbol: 'VOO', exposureMarket: '日本' }, 400, 'invalid_exposure_market'],
     [{ symbol: 'VOO', currency: 'HKD' }, 400, 'currency_mismatch'],
+    [{ symbol: 'VOO', exchange: 'HKEX' }, 400, 'exchange_mismatch'],
     [{ symbol: '159915.SZ', source: 'manual' }, 400, 'invalid_currency'],
     [{ symbol: 'NOPE.ZZ' }, 404, 'instrument_not_found'],
     [{ symbol: 'BADMETA.ETF' }, 422, 'invalid_provider_payload']
@@ -563,7 +564,7 @@ function emptyState() {
   };
 }
 
-test('/state 全量写入逐条校验：缺 id / 空白代码 / 非法币种一律稳定 4xx 且整体回滚', async (t) => {
+test('/state 全量写入逐条校验：身份、币种与分类非法一律稳定 4xx 且整体回滚', async (t) => {
   const ctx = setup('ledger-p4b-stateval-');
   const srv = await startServer(ctx);
   t.after(() => srv.close().then(() => ctx.close()));
@@ -585,7 +586,11 @@ test('/state 全量写入逐条校验：缺 id / 空白代码 / 非法币种一�
     ['缺 id 的标的被静默丢弃', { symbol: 'NO-ID', exchange: 'NYSE', currency: 'USD' }, 'invalid_id'],
     ['空白代码被写成空字符串', { id: 'inst-blank', symbol: '     ', currency: 'USD' }, 'invalid_symbol'],
     ['币种不在白名单内', { id: 'inst-badcur', symbol: 'BAD', exchange: 'NYSE', currency: 'XXX' }, 'invalid_currency'],
-    ['币种缺失', { id: 'inst-nocur', symbol: 'NOCUR', exchange: 'NYSE' }, 'invalid_currency']
+    ['币种缺失', { id: 'inst-nocur', symbol: 'NOCUR', exchange: 'NYSE' }, 'invalid_currency'],
+    ['分类状态非法', { id: 'inst-status', symbol: 'STATUS', currency: 'USD', classificationStatus: 'locked' }, 'invalid_classification_status'],
+    ['资产类别非法', { id: 'inst-class', symbol: 'CLASS', currency: 'USD', assetClass: 'equity-ish' }, 'invalid_asset_class'],
+    ['敞口市场非法', { id: 'inst-market', symbol: 'MARKET', currency: 'USD', exposureMarket: 'JP' }, 'invalid_exposure_market'],
+    ['确认态缺少完整分类', { id: 'inst-confirmed', symbol: 'CONF', currency: 'USD', classificationStatus: 'confirmed', exposureMarket: 'US' }, 'invalid_asset_class']
   ];
   for (const [label, row, code] of cases) {
     const payload = emptyState();
@@ -602,7 +607,7 @@ test('/state 全量写入逐条校验：缺 id / 空白代码 / 非法币种一�
 
   // 合法写入照常成功（校验没有把正常路径堵住）
   const ok = emptyState();
-  ok.assets.instruments = [{ id: 'inst-ok', symbol: 'VTI', exchange: 'NYSE', currency: 'USD' }];
+  ok.assets.instruments = [{ id: 'inst-ok', symbol: 'vti', exchange: 'nyse', currency: 'usd' }];
   const done = await request(port, 'PUT', '/api/v1/state', ok);
   assert.strictEqual(done.status, 200);
   const finalState = await get(port, '/api/v1/state');
@@ -610,6 +615,9 @@ test('/state 全量写入逐条校验：缺 id / 空白代码 / 非法币种一�
     finalState.json.assets.instruments.map((r) => r.id),
     ['inst-ok']
   );
+  assert.strictEqual(finalState.json.assets.instruments[0].symbol, 'VTI');
+  assert.strictEqual(finalState.json.assets.instruments[0].exchange, 'NYSE');
+  assert.strictEqual(finalState.json.assets.instruments[0].currency, 'USD');
 });
 
 test('检索合并复用安全退化匹配：本地缺交易所的标的与参考数据合成一条候选', async (t) => {

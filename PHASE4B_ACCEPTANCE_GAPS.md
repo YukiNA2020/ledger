@@ -1,7 +1,23 @@
 # Phase 4B 验收缺口记录（独立复核）
 
-> 记录来源：独立复核 Agent 于 2026-09-16 对 Phase 4B 的两轮复核结论 —— 第一轮针对提交 `689743e`（基线 `node --test` 344/344、wiring 16/16），第二轮针对补口提交 `147588e`（基线 357/357、wiring 16/16）。
+> 记录来源：独立复核 Agent 于 2026-09-16 对 Phase 4B 的两轮复核结论 —— 第一轮针对提交 `689743e`（基线 `node --test` 344/344、wiring 16/16），第二轮针对补口提交 `147588e`（基线 357/357、wiring 16/16）；其后执行 Agent 又做了一轮面向 4C 引用安全的反向审计。
 > 本文件规则：**原始复核结论原样保留作证据**（按轮次倒序，最新一轮状态在前），修复状态追加在对应轮次的状态节里，不删改原始条目。
+
+## 第三轮反向审计与修复状态（2026-09-16，执行 Agent）
+
+| 编号 | 级别 | 反向审计结论 | 修复状态 |
+|---|---|---|---|
+| G4B-8 | P0 | `upsertInstrument` 用“先删后插”更新父记录，会触发外键 `ON DELETE CASCADE`，删除该标的已有的持仓快照、证券事件与报价 | ✅ 已修：改为 `INSERT ... ON CONFLICT(id) DO UPDATE` 原位更新；新增真实外键事实反例，更新名称后 `portfolio_openings` / `security_events` / `quotes` 各自仍为 1 行 |
+| G4B-9 | P0 | 元数据只校验契约形状，不校验返回的 `symbol` 是否等于请求代码；合法的“另一只标的”可被替包入库。调用方提交交易所与 provider 不一致时也会静默采用 provider 值 | ✅ 已修：元数据必须绑定请求代码，不一致返回 `invalid_provider_payload` 且零写入；交易所冲突返回稳定 `exchange_mismatch`（HTTP 400），与既有币种冲突规则一致 |
+| G4B-10 | P1 | 搜索 provider 返回非数组或非法候选时被静默当成空结果/丢弃，用户无法区分“无命中”与“契约坏了” | ✅ 已修：非数组或非法候选转为显式 `invalid_payload` provider 状态与 warning；本地命中仍可降级返回，坏候选不进入目录 |
+| G4B-11 | P1 | 本地只有一条无交易所记录、provider 同时返回两个市场时，旧实现先把第一条候选合并到本地，再只对第二条报警；归属由 provider 返回顺序决定 | ✅ 已修：合并前先计算完整的松匹配认领集合；若同一本地记录对应多个市场，则两个 provider 候选都保持独立、本地记录也单独保留，只报告一次歧义 |
+| G4B-12 | P0 | 全量 `/state` 虽校验 id/symbol/currency，但可写入任意 `classificationStatus`、非法 `assetClass`/`exposureMarket`，也可写入缺少完整分类的 `confirmed`；同时未统一大写规范化 | ✅ 已修：全量写入与单条 upsert 使用同一组严格规则；状态只允许 `suggested/confirmed`，分类使用领域词表，`confirmed` 必须两项齐全；symbol/exchange/currency 去空白并大写。错误稳定映射为 HTTP 400，事务整体回滚 |
+
+**本轮测试证据：** `instrument-catalog` **48/48**、真实 HTTP `server-phase4b` **17/17**、全量 `node --test` **371/371**；`git diff --check` 通过。没有新增迁移、UI 或真实网络请求；浏览器接线未改，沿用上一轮 **17/17** 证据。
+
+**审计结论状态：** G4B-8–12 已修复。4B 的标的身份、引用完整性、provider 绑定、歧义处理与分类写入边界均已由反例锁定，可交独立复核确认。
+
+---
 
 ## 第二轮修复状态（2026-09-16，执行 Agent）
 

@@ -143,7 +143,7 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4B｜标的目录与分类确认
 
-状态：**已完成；两轮复核补口完成（2026-09-16，`v2.3.5-phase4b` → `v2.3.6-phase4b` → `v2.3.7-phase4b`），等待独立复核确认**。独立复核两轮共判定"暂不通过、不建议进入 4C"（第一轮：标的身份与去重边界 2×P0 + 1×P1 + 1 项一致性；第二轮：全量写入校验、备份不变量覆盖、检索合并 3×P1），原始结论与逐条修复状态见 `PHASE4B_ACCEPTANCE_GAPS.md`。
+状态：**已完成；两轮独立复核补口 + 第三轮引用安全审计完成（2026-09-16），等待独立复核确认**。第三轮进一步修复 instrument 更新级联删除关联事实、provider 身份未绑定、搜索契约错误静默化、跨市场合并受返回顺序影响、全量写入绕过分类门禁等问题；逐条状态见 `PHASE4B_ACCEPTANCE_GAPS.md` G4B-8–12。
 
 范围：
 
@@ -163,9 +163,9 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 - 确认与本地锁定：`POST /api/v1/instrument-confirmations`（两项用户判断必填）；`confirmed` 记录在后续刷新中保持状态与值不变，差异只以 `conflicts[]` + provenance 提示；
 - 稳定 id 与去重：id 由**首次创建时的 identity key** 派生并永久锁定（`inst-<sha1(identityKey) 前16位>`，记录持久化 `identityKey`，外部可离线复算；客户端指定的 id 一律拒绝 `client_id_forbidden`）；去重键 `(symbol, exchange)` 在**所有**写入路径（目录接口 / 单条 upsert / 全量 `PUT /state`）显式拒绝同键第二行（`duplicate_instrument` → 409 + 事务回滚），并由迁移 **v4** 表达式唯一索引 `uq_instruments_dedupe` 在数据库层兜底；同代码跨市场存在多行时报 `ambiguous_instrument`（409）要求指明交易所；
 - 前端：资产页「标的目录」区块（搜索/候选/目录/确认弹层/手工建立弹层），经 `js/store.js` 门面访问；`APP_VERSION` 与 SW 缓存键升至 `2.3.7-phase4b`。
-- 全量写入与结构校验（第二轮补口）：`repository.writeInstruments` **逐条**验证 id / `symbol` / `currency` 后整体拒绝非法行（不静默丢行）；`backup.js` 按 schema 版本校验**必需索引**（v4 要求 `uq_instruments_dedupe` 存在且唯一，见 D-040）；检索合并与建立路径共用同一套本地匹配规则（缺交易所唯一命中才合并，多命中报 `ambiguous_instrument`）。
+- 引用安全与写入门禁（第三轮补口）：instrument 更新采用原位 upsert，不触发持仓/事件/报价外键级联；provider 元数据必须绑定请求代码，搜索非法响应显式报错；多市场松匹配先完整判歧义；`/state` 与单条 upsert 同样校验分类状态、分类词表与 confirmed 完整性，并统一规范化身份字段。
 
-退出证据：全量 `node --test` **367/367**（357 第二轮基线零回归 + 10 项新反例/不变量）；浏览器 wiring **17/17**（真实产品入口闭环 + 缺交易所合并闭环 + `/state` 写入回归，干净环境连续两轮全绿）；`DEFERRED_WRITES` 未动（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）；迁移停在 v4（只新增一条表达式唯一索引，不新增表）；零真实网络请求。详见 `ACCEPTANCE.md` S4B.1、`TEST.md` 的 Phase 4B 证据节与 `PHASE4B_ACCEPTANCE_GAPS.md`。
+退出证据：全量 `node --test` **371/371**、4B 编排 **48/48**、真实 HTTP **17/17**；浏览器 wiring 沿用上一轮 **17/17**（本轮未改 UI）；`DEFERRED_WRITES` 未动；迁移停在 v4；零真实网络请求。详见 `ACCEPTANCE.md` S4B.1、`TEST.md` 与 `PHASE4B_ACCEPTANCE_GAPS.md`。
 
 ### Phase 4C｜持仓账本与证券事件
 

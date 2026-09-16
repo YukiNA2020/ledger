@@ -28,7 +28,7 @@ const Domain = require('../js/domain.js');
 const R = require('./repository');
 const dbm = require('./db');
 
-// 单条标的写入总是"先删同 id 再插入"，必须在事务里完成，否则中途失败会丢掉这条标的。
+// 单条标的写入在事务里原位 upsert；不得删除父记录，否则会级联删除持仓、事件与报价。
 // 标的写入路径是同步的（provider 调用在事务之外完成），因此这里可以安全地开事务（不可嵌套）。
 function writeInstrument(db, record, now) {
   return dbm.transaction(db, () => R.upsertInstrument(db, record, { now: now }));
@@ -246,17 +246,17 @@ function normSymbol(v) {
 //   ① 精确 (symbol, exchange) 命中；
 //   ② 同代码且一方缺交易所：本地只有一条时安全合并（"先手工建标、后由参考数据补全交易所"的常态）；
 //   ③ 同代码存在多个市场：报歧义，**绝不按行顺序任选一条**（那会把跨市场标的算成同一个）。
-// 返回 { record } / { record: null } / { ambiguous: [records] }。
+// 返回 { record, exact } / { record: null } / { ambiguous: [records] }。
 function matchLocalRecord(locals, symbol, exchange) {
   const want = Domain.instrumentKey(symbol, exchange);
   if (want) {
     const exact = locals.filter((r) => Domain.instrumentKey(r.symbol, r.exchange) === want);
-    if (exact.length) return { record: exact[0] };
+    if (exact.length) return { record: exact[0], exact: true };
   }
   const sym = normSymbol(symbol);
   if (!sym) return { record: null };
   const loose = locals.filter((r) => normSymbol(r.symbol) === sym && (!r.exchange || !exchange));
-  if (loose.length === 1) return { record: loose[0] };
+  if (loose.length === 1) return { record: loose[0], exact: false };
   if (loose.length > 1) return { ambiguous: loose };
   return { record: null };
 }
@@ -351,11 +351,33 @@ function searchCatalog(db, provider, query, ctx) {
     if (res.status === 'error') {
       providerStatus = { id: providerId, status: 'error', code: res.code, retryable: res.retryable };
       warnings.push({ symbol: null, code: res.code, detail: res.detail, retryable: res.retryable });
+    } else if (!Array.isArray(res.value)) {
+      providerStatus = { id: providerId, status: 'error', code: 'invalid_payload', retryable: false };
+      warnings.push({
+        symbol: null,
+        code: 'invalid_payload',
+        detail: 'provider 返回了不满足契约的检索结果',
+        retryable: false,
+        provider: providerId
+      });
     } else {
-      const list = Array.isArray(res.value) ? res.value : [];
+      const list = res.value;
       list.forEach((r) => {
-        if (!r || r.kind === 'error') {
-          if (r && r.kind === 'error') {
+        if (!Contract.isValidResult(r)) {
+          warnings.push({
+            symbol: null,
+            code: 'invalid_payload',
+            detail: 'provider 返回了不满足契约的检索结果',
+            retryable: false,
+            provider: providerId
+          });
+          if (list.length === 1 && providerStatus.status === 'ok') {
+            providerStatus = { id: providerId, status: 'error', code: 'invalid_payload', retryable: false };
+          }
+          return;
+        }
+        if (r.kind === 'error') {
+          if (r) {
             warnings.push({
               symbol: r.subject,
               code: r.code,
@@ -372,7 +394,6 @@ function searchCatalog(db, provider, query, ctx) {
           }
           return;
         }
-        if (!Contract.isValidResult(r)) return; // 不信任何"看起来是候选"的非法结果
         providerCandidates.push(r);
       });
     }
@@ -383,7 +404,17 @@ function searchCatalog(db, provider, query, ctx) {
     const merged = [];
     const byKey = {};
     const consumed = {}; // 本地 id → 已被某条候选认领（避免同一条本地记录出现两次）
-    const claimedBy = {}; // 本地 id → 认领它的候选去重键（用于识别"同一本地记录被两个市场认领"）
+    // 松匹配（本地缺交易所）只有在 provider 对该本地记录也只有一个可能市场时才安全。
+    // 先完整计算认领集合，避免按遍历顺序把第一条市场候选错误地并入本地。
+    const matches = providerCandidates.map((r) => matchLocalRecord(locals, r.symbol, r.exchange));
+    const looseClaims = {};
+    matches.forEach((m, index) => {
+      if (!m.record || m.exact) return;
+      const key = Domain.instrumentKey(providerCandidates[index].symbol, providerCandidates[index].exchange);
+      if (!looseClaims[m.record.id]) looseClaims[m.record.id] = {};
+      looseClaims[m.record.id][key] = true;
+    });
+    const warnedLoose = {};
     function push(candidate) {
       const key = Domain.instrumentKey(candidate.symbol, candidate.exchange);
       if (byKey[key]) {
@@ -397,16 +428,15 @@ function searchCatalog(db, provider, query, ctx) {
       merged.push(candidate);
     }
 
-    function attachLocal(candidate, rec, key) {
+    function attachLocal(candidate, rec) {
       candidate.local = localRefOf(rec);
       candidate.origin = 'local+provider';
       fillDisplayFromLocal(candidate, rec);
       consumed[rec.id] = true;
-      claimedBy[rec.id] = key;
       return candidate;
     }
 
-    providerCandidates.forEach((r) => {
+    providerCandidates.forEach((r, providerIndex) => {
       const cand = buildCandidate(
         {
           symbol: r.symbol,
@@ -423,7 +453,7 @@ function searchCatalog(db, provider, query, ctx) {
       cand.origin = 'provider';
       cand.local = null;
       const key = Domain.instrumentKey(r.symbol, r.exchange);
-      const m = matchLocalRecord(locals, r.symbol, r.exchange);
+      const m = matches[providerIndex];
       if (m.ambiguous) {
         // 检索是只读的：不能像建立流程那样拒绝，但必须**显式报告歧义**并保持两条事实分离，
         // 绝不按行顺序把候选并到其中一条本地记录上。
@@ -431,18 +461,22 @@ function searchCatalog(db, provider, query, ctx) {
           ambiguityWarning(r.symbol, m.ambiguous, '本地目录中该代码有多个交易所的记录，本次未与其中任何一条合并', providerId)
         );
       } else if (m.record) {
-        if (claimedBy[m.record.id] && claimedBy[m.record.id] !== key) {
-          // 同一条本地记录（缺交易所）被两个市场的候选同时认领：无法判断它属于哪一个，报歧义。
-          warnings.push(
-            ambiguityWarning(
-              r.symbol,
-              [m.record],
-              '本地只有一条未注明交易所的记录，参考数据同时返回了多个市场，无法判断它属于哪一个，本次未合并',
-              providerId
-            )
-          );
+        const claims = looseClaims[m.record.id] ? Object.keys(looseClaims[m.record.id]) : [];
+        if (!m.exact && claims.length > 1) {
+          // 同一条本地记录（缺交易所）对应多个市场候选：无法判断它属于哪一个，所有候选都不合并。
+          if (!warnedLoose[m.record.id]) {
+            warnings.push(
+              ambiguityWarning(
+                r.symbol,
+                [m.record],
+                '本地只有一条未注明交易所的记录，参考数据同时返回了多个市场，无法判断它属于哪一个，本次未合并',
+                providerId
+              )
+            );
+            warnedLoose[m.record.id] = true;
+          }
         } else {
-          attachLocal(cand, m.record, key);
+          attachLocal(cand, m.record);
         }
       }
       push(cand);
@@ -518,6 +552,9 @@ function fetchMetadata(provider, symbol, ctx) {
     if (!Contract.isValidResult(r)) {
       return failure('invalid_provider_payload', 'provider 结果不满足契约形状', false);
     }
+    if (normSymbol(r.symbol) !== normSymbol(symbol)) {
+      return failure('invalid_provider_payload', 'provider 返回的标的代码与请求不一致', false);
+    }
     return {
       ok: true,
       value: { fields: Object.assign({}, providerFieldsOf(r), { symbol: r.symbol }), provenance: r.provenance }
@@ -548,6 +585,15 @@ function createInstrument(db, provider, body, ctx) {
     // provider 来源：不接受与上游不一致的币种，也不静默二选一。
     if (v.source === SOURCE_PROVIDER && v.currency && fields && fields.currency && v.currency !== fields.currency) {
       return failure('currency_mismatch', '提交的币种与参考数据不一致；请核对后再建立标的', false);
+    }
+    if (
+      v.source === SOURCE_PROVIDER &&
+      v.exchange &&
+      fields &&
+      fields.exchange &&
+      trimmed(v.exchange).toUpperCase() !== trimmed(fields.exchange).toUpperCase()
+    ) {
+      return failure('exchange_mismatch', '提交的交易所与参考数据不一致；请核对后再建立标的', false);
     }
 
     const symbol = (fields && fields.symbol) || v.symbol;

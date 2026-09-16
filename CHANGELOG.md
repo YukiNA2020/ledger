@@ -6,6 +6,11 @@
 
 ### 修复
 
+- **Phase 4B 更新标的不再级联删除后续事实**：单条 instrument 写入从“先删后插”改为原位 upsert，保持持仓快照、证券事件与报价的外键引用。
+- **Phase 4B provider 身份绑定与失败语义补齐**：元数据返回代码必须与请求一致，提交交易所与 provider 不一致时返回 `exchange_mismatch`；搜索返回非数组/非法候选时显式报告 `invalid_payload`，不再伪装成“无命中”。
+- **Phase 4B 跨市场歧义不再受返回顺序影响**：一个无交易所本地记录对应多个 provider 市场时，任何市场都不与本地合并，本地记录单独保留并报告歧义。
+- **Phase 4B 全量写入分类门禁补齐**：`/state` 与单条 upsert 同样限制 `classificationStatus`、`assetClass`、`exposureMarket`；`confirmed` 必须同时具备合法类别和市场，并统一规范化 symbol/exchange/currency。
+
 - **Phase 4A 结果白名单真正落到校验器**：`isValidResult` / `assertValidResult` 现在要求 quote、fx、error 结果恰好只含契约键，拒绝 adapter 夹带 `accountName`、数量、成本、余额或持仓等额外字段；错误 `detail` 必须已经完成单行清洗与长度限制。
 - **Phase 4A 时间戳不再接受被 JavaScript 自动归一的伪日期**：显式校验日期、时分秒与时区偏移，拒绝 `2026-02-30T…`、`24:00:00` 和超范围时区；固定时钟沿用同一严格口径。
 - **空白 provider 不再冒充来源**：provider 必须在 `trim()` 后仍非空，quote/fx 构造与直接结果校验使用同一口径。

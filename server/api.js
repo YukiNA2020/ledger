@@ -234,6 +234,7 @@ const CATALOG_ERROR_STATUS = {
   invalid_exposure_market: 400,
   invalid_tracking_index: 400,
   currency_mismatch: 400,
+  exchange_mismatch: 400,
   instrument_not_found: 404,
   duplicate_instrument: 409,
   ambiguous_instrument: 409,
@@ -253,6 +254,9 @@ const DOMAIN_ERROR_STATUS = {
   invalid_instrument: 400,
   invalid_currency: 400,
   invalid_exchange: 400,
+  invalid_classification_status: 400,
+  invalid_asset_class: 400,
+  invalid_exposure_market: 400,
   payload_too_large: 413,
   duplicate_instrument: 409,
   ambiguous_instrument: 409

@@ -40,7 +40,8 @@ const BOOL = (v) => (v ? 1 : 0);
 // 标的 id / 代码的形状（与目录接口同一口径）。全量写入路径也必须满足 ——
 // 只靠"过滤掉不合法行"会让非法数据悄悄消失或变形（第二轮复核 G4B-5）。
 const INSTRUMENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const INSTRUMENT_SYMBOL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+const INSTRUMENT_SYMBOL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,15}$/;
+const INSTRUMENT_EXCHANGE_RE = /^[A-Za-z0-9._:-]{1,32}$/;
 
 function extraJson(obj, known) {
   const extra = {};
@@ -382,7 +383,7 @@ function writeInstruments(db, list) {
     }
     byId[id] = true;
 
-    const symbol = i.symbol == null ? '' : String(i.symbol).trim();
+    const symbol = i.symbol == null ? '' : String(i.symbol).trim().toUpperCase();
     if (!INSTRUMENT_SYMBOL_RE.test(symbol)) {
       throw Object.assign(new Error('标的代码不合法（' + at + '）：需为公开证券代码形状'), {
         code: 'invalid_symbol'
@@ -390,17 +391,56 @@ function writeInstruments(db, list) {
     }
 
     // 币种是估值必需字段：缺失或不在白名单一律拒绝，不用"默认 CNY"蒙过去
-    const currency = i.currency == null ? '' : String(i.currency).trim();
+    const currency = i.currency == null ? '' : String(i.currency).trim().toUpperCase();
     if (Domain.CURRENCIES.indexOf(currency) === -1) {
       throw Object.assign(new Error('标的币种必须是 CNY/HKD/USD（' + at + '）'), { code: 'invalid_currency' });
     }
 
-    return { raw: i, id: id, symbol: symbol, currency: currency };
+    const exchangeText = i.exchange == null ? '' : String(i.exchange).trim();
+    if (exchangeText && !INSTRUMENT_EXCHANGE_RE.test(exchangeText)) {
+      throw Object.assign(new Error('标的交易所标识不合法（' + at + '）'), { code: 'invalid_exchange' });
+    }
+    const exchange = exchangeText ? exchangeText.toUpperCase() : null;
+
+    const statusText = i.classificationStatus == null || i.classificationStatus === ''
+      ? 'suggested'
+      : String(i.classificationStatus).trim();
+    if (statusText !== 'suggested' && statusText !== 'confirmed') {
+      throw Object.assign(new Error('标的分类状态不合法（' + at + '）'), { code: 'invalid_classification_status' });
+    }
+    const assetClass = i.assetClass == null || i.assetClass === '' ? null : String(i.assetClass).trim();
+    const exposureMarket = i.exposureMarket == null || i.exposureMarket === ''
+      ? null
+      : String(i.exposureMarket).trim();
+    if (assetClass != null && !Domain.isAssetClass(assetClass)) {
+      throw Object.assign(new Error('标的资产类别不在允许词表内（' + at + '）'), { code: 'invalid_asset_class' });
+    }
+    if (exposureMarket != null && !Domain.isExposureMarket(exposureMarket)) {
+      throw Object.assign(new Error('标的风险敞口市场不在允许词表内（' + at + '）'), {
+        code: 'invalid_exposure_market'
+      });
+    }
+    if (statusText === 'confirmed' && (assetClass == null || exposureMarket == null)) {
+      throw Object.assign(new Error('已确认标的必须同时包含资产类别与风险敞口市场（' + at + '）'), {
+        code: assetClass == null ? 'invalid_asset_class' : 'invalid_exposure_market'
+      });
+    }
+
+    return {
+      raw: i,
+      id: id,
+      symbol: symbol,
+      exchange: exchange,
+      currency: currency,
+      classificationStatus: statusText,
+      assetClass: assetClass,
+      exposureMarket: exposureMarket
+    };
   });
 
   // 第二遍：去重键（与领域口径一致：symbol / exchange 去空白后大写，缺交易所按空串参与）
   normalized.forEach((n) => {
-    const key = Domain.instrumentKey(n.symbol, n.raw.exchange);
+    const key = Domain.instrumentKey(n.symbol, n.exchange);
     if (byKey[key]) {
       throw Object.assign(
         new Error('同一标的重复写入：' + key + '（' + byKey[key] + ' 与 ' + n.id + '）'),
@@ -419,13 +459,13 @@ function writeInstruments(db, list) {
     st.run(
       n.id,
       n.symbol,
-      STR(i.exchange),
+      n.exchange,
       n.currency,
       STR(i.name),
       STR(i.instrumentType),
-      STR(i.assetClass),
-      STR(i.exposureMarket),
-      i.classificationStatus === 'confirmed' ? 'confirmed' : 'suggested',
+      n.assetClass,
+      n.exposureMarket,
+      n.classificationStatus,
       extraJson(i, KNOWN.instruments)
     );
   });
@@ -526,21 +566,46 @@ function upsertInstrument(db, item, options) {
   if (!item || !item.id) throw Object.assign(new Error('缺少标的 id'), { code: 'invalid_id' });
   const id = String(item.id);
   if (!INSTRUMENT_ID_RE.test(id)) throw Object.assign(new Error('标的 id 不合法'), { code: 'invalid_id' });
-  const symbol = STR(item.symbol || '').trim();
+  const symbol = STR(item.symbol || '').trim().toUpperCase();
   if (!symbol) throw Object.assign(new Error('标的代码不能为空'), { code: 'invalid_symbol' });
   if (!INSTRUMENT_SYMBOL_RE.test(symbol)) {
     throw Object.assign(new Error('标的代码不合法：需为公开证券代码形状'), { code: 'invalid_symbol' });
   }
-  const currency = STR(item.currency);
+  const exchangeText = item.exchange == null ? '' : String(item.exchange).trim();
+  if (exchangeText && !INSTRUMENT_EXCHANGE_RE.test(exchangeText)) {
+    throw Object.assign(new Error('标的交易所标识不合法'), { code: 'invalid_exchange' });
+  }
+  const exchange = exchangeText ? exchangeText.toUpperCase() : null;
+  const currency = item.currency == null ? '' : String(item.currency).trim().toUpperCase();
   if (Domain.CURRENCIES.indexOf(currency) === -1) {
     throw Object.assign(new Error('标的币种必须是 CNY/HKD/USD'), { code: 'invalid_currency' });
   }
-  const status = item.classificationStatus === 'confirmed' ? 'confirmed' : 'suggested';
+  const status = item.classificationStatus == null || item.classificationStatus === ''
+    ? 'suggested'
+    : String(item.classificationStatus).trim();
+  if (status !== 'suggested' && status !== 'confirmed') {
+    throw Object.assign(new Error('标的分类状态不合法'), { code: 'invalid_classification_status' });
+  }
+  const assetClass = item.assetClass == null || item.assetClass === '' ? null : String(item.assetClass).trim();
+  const exposureMarket = item.exposureMarket == null || item.exposureMarket === ''
+    ? null
+    : String(item.exposureMarket).trim();
+  if (assetClass != null && !Domain.isAssetClass(assetClass)) {
+    throw Object.assign(new Error('标的资产类别不在允许词表内'), { code: 'invalid_asset_class' });
+  }
+  if (exposureMarket != null && !Domain.isExposureMarket(exposureMarket)) {
+    throw Object.assign(new Error('标的风险敞口市场不在允许词表内'), { code: 'invalid_exposure_market' });
+  }
+  if (status === 'confirmed' && (assetClass == null || exposureMarket == null)) {
+    throw Object.assign(new Error('已确认标的必须同时包含资产类别与风险敞口市场'), {
+      code: assetClass == null ? 'invalid_asset_class' : 'invalid_exposure_market'
+    });
+  }
 
   // 去重键：同一 (symbol, exchange) 只允许一行。
   // 这里**不静默删除**冲突行 —— 那会连带丢掉已确认的分类；改为显式报错，
   // 由调用方先用 findInstrumentByKey 解析出既有标的后再写入（catalog 模块就是这么做的）。
-  const key = Domain.instrumentKey(symbol, item.exchange);
+  const key = Domain.instrumentKey(symbol, exchange);
   const clash = readInstrumentRecords(db).find(
     (r) => r.id !== id && Domain.instrumentKey(r.symbol, r.exchange) === key
   );
@@ -567,20 +632,31 @@ function upsertInstrument(db, item, options) {
     if (extra[k] === null || extra[k] === undefined) delete extra[k];
   });
 
-  run(db, 'DELETE FROM instruments WHERE id = ?', [id]);
+  // 不能用“先删后插”模拟 upsert：instruments 是持仓、事件、报价的父表，DELETE 会触发
+  // ON DELETE CASCADE，把 4C/4D 已存在的事实一并删掉。原位 UPDATE 才能保持稳定 id 的引用语义。
   run(
     db,
     `INSERT INTO instruments (id, symbol, exchange, currency, name, instrument_type, asset_class, exposure_market, classification_status, extra_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       symbol = excluded.symbol,
+       exchange = excluded.exchange,
+       currency = excluded.currency,
+       name = excluded.name,
+       instrument_type = excluded.instrument_type,
+       asset_class = excluded.asset_class,
+       exposure_market = excluded.exposure_market,
+       classification_status = excluded.classification_status,
+       extra_json = excluded.extra_json`,
     [
       id,
       symbol,
-      STR(item.exchange),
+      exchange,
       currency,
       STR(item.name),
       STR(item.instrumentType),
-      STR(item.assetClass),
-      STR(item.exposureMarket),
+      assetClass,
+      exposureMarket,
       status,
       Object.keys(extra).length ? JSON.stringify(extra) : null
     ]
