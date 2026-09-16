@@ -77,8 +77,9 @@ var DECIMAL_RE = /^\d+(\.\d+)?$/;
 // 日期：严格 YYYY-MM-DD（形状），真实存在性另由 isDateString 校验。
 var DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-// 时间戳：必须带日期 + 时分秒 + 时区（Z 或 ±HH:MM）。不接受仅日期或本地无时区写法。
-var TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
+// 时间戳：必须带日期 + 时分秒 + 时区（Z 或 ±HH:MM）。捕获各字段后再做真实值域校验，
+// 避免 Date.parse 把 2026-02-30 或 24:00:00 静默归一到下一个有效时刻。
+var TIMESTAMP_RE = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,3})?(Z|([+-])(\d{2}):(\d{2}))$/;
 
 // 币对键：'USD/CNY'，只用于错误结果的 subject。
 var PAIR_KEY_RE = /^[A-Z]{3}\/[A-Z]{3}$/;
@@ -117,7 +118,26 @@ function isPositiveSafeInteger(v) {
 }
 
 function nonEmptyString(v) {
-  return typeof v === 'string' && v.length > 0;
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function isPlainRecord(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  var proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+// 结果是跨 provider 的安全边界，必须只含契约白名单键；否则 adapter 夹带的账户、数量、成本等
+// 私人字段可能穿过 assertValidResult 进入日志或持久层。
+function hasExactKeys(v, expected) {
+  if (!isPlainRecord(v)) return false;
+  var actual = Object.keys(v).sort();
+  var wanted = expected.slice().sort();
+  if (actual.length !== wanted.length) return false;
+  for (var i = 0; i < actual.length; i++) {
+    if (actual[i] !== wanted[i]) return false;
+  }
+  return true;
 }
 
 // 真实存在的日历日：'2026-02-30'、'2026-13-01'、'2026-9-1' 一律拒绝。
@@ -133,7 +153,18 @@ function isDateString(v) {
 
 // 有效 ISO 时间戳：形状必须带时区，且时间本身可被解析（拒绝 '2026-09-15T99:00:00Z'）。
 function isTimestamp(v) {
-  if (typeof v !== 'string' || !TIMESTAMP_RE.test(v)) return false;
+  if (typeof v !== 'string') return false;
+  var match = TIMESTAMP_RE.exec(v);
+  if (!match || !isDateString(match[1])) return false;
+  var hour = Number(match[2]);
+  var minute = Number(match[3]);
+  var second = Number(match[4]);
+  if (hour > 23 || minute > 59 || second > 59) return false;
+  if (match[6] !== 'Z') {
+    var offsetHour = Number(match[8]);
+    var offsetMinute = Number(match[9]);
+    if (offsetHour > 14 || offsetMinute > 59 || (offsetHour === 14 && offsetMinute !== 0)) return false;
+  }
   return Number.isFinite(Date.parse(v));
 }
 
@@ -268,9 +299,10 @@ function errorResult(o) {
 // 校验一个结果对象是否满足契约形状（供 fixture 自检，以及 4D 接真实 provider 时"先校验响应再落库"）。
 // 判定标准与构造函数的严格程度保持一致：通过这里就等于可以入账。
 function isValidResult(r) {
-  if (!r || typeof r !== 'object') return false;
+  if (!isPlainRecord(r)) return false;
   if (r.kind === 'quote') {
-    return isSymbol(r.symbol) &&
+    return hasExactKeys(r, ['kind', 'symbol', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status']) &&
+      isSymbol(r.symbol) &&
       isPositiveSafeInteger(r.priceMinor) &&
       isCurrency(r.currency) &&
       isDateString(r.priceDate) &&
@@ -279,7 +311,8 @@ function isValidResult(r) {
       r.status === 'ok';
   }
   if (r.kind === 'fx') {
-    return isCurrency(r.base) && isCurrency(r.quote) &&
+    return hasExactKeys(r, ['kind', 'base', 'quote', 'rateDecimal', 'rateDate', 'fetchedAt', 'provider', 'status']) &&
+      isCurrency(r.base) && isCurrency(r.quote) &&
       isPositiveDecimalString(r.rateDecimal) &&
       isDateString(r.rateDate) &&
       isTimestamp(r.fetchedAt) &&
@@ -287,10 +320,12 @@ function isValidResult(r) {
       r.status === 'ok';
   }
   if (r.kind === 'error') {
-    return isErrorCode(r.code) &&
+    return hasExactKeys(r, ['kind', 'subject', 'code', 'detail', 'retryable']) &&
+      isErrorCode(r.code) &&
       r.retryable === isRetryable(r.code) &&
       (r.subject === null || isSymbol(r.subject) || isPairKey(r.subject)) &&
-      typeof r.detail === 'string';
+      typeof r.detail === 'string' &&
+      r.detail === safeDetail(r.detail);
   }
   return false;
 }

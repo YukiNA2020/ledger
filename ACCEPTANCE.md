@@ -148,24 +148,24 @@ Phase 4 按 4A–4E 独立验收。任一子阶段未通过时，只回滚该子
 **Then** 输出统一结果或明确错误分类；请求只含公开代码/币对，不含账户名、数量、成本、余额或其他私人财务事实；自动测试不访问公网。
 **并且** 非公开代码/币对等非法输入必须被拒绝为 `invalid_payload`（不得流进 adapter 被误判为 `not_found`），且错误结果不回显输入原文；不满足契约的结果（负价、零汇率、假日期、坏时间戳、`retryable` 与错误码不一致）不得以成功结果的形态存在。
 
-Phase 4A 退出证据：T-002/T-003 已决定；契约、固定时钟与全部 fixture 用例通过；无数据库迁移、API 或 UI 改动。
+Phase 4A 退出证据：T-002 的汇率与行情部分、T-003 均已决定；契约、固定时钟与全部 fixture 用例通过；无数据库迁移、API 或 UI 改动。当前 T-002 行情端点仍待 4D 前决定，因此退出条件尚未全部满足。
 
-**验收结论（2026-09-15，`2.3.4-phase4a`，含独立复核补口）：**
+**验收结论（2026-09-16，当前工作区）：⚠️ 契约代码通过，Phase 4A 正式验收暂不通过。**
 
 | 场景 | 结论 | 证据 |
 |---|---|---|
-| T-002/T-003 数据源决策 | ✅ 已定 | `DECISIONS.md`：**D-036**（汇率 = Frankfurter，固定 `/v2/providers/ecb/…`；删除不可复核的固定货币数量）、**D-037**（元数据候选来源 = Twelve Data 参考数据 `/symbol_search` + 字段映射 + provenance + 用户确认锁定）、**D-038**（行情源不冻结端点，冻结启用门禁）；可复现探测证据见 `server/providers/SOURCES.md` |
+| T-002/T-003 数据源决策 | ⚠️ 部分完成 | T-003 已定；T-002 的汇率部分已定为 Frankfurter ECB 固定端点，行情端点仍待 4D 前决定。D-038 只是启用门禁，不等于选定行情源；门禁通过前自动行情关闭。可复现探测证据见 `server/providers/SOURCES.md` |
 | 统一 adapter 契约 | ✅ 通过 | `server/providers/contract.js`：成功结果带原始代码/价格/汇率/数据日/抓取时间/provider；错误分类恰为 `timeout/rate_limit/not_found/invalid_payload/auth` 五类 + 可重试映射；`isValidResult` / `assertValidResult` 严格校验 |
 | 输入边界（复核 P0-1） | ✅ 通过 | 序列化**前**逐项校验数组/symbol/pair；非数组、空数组、超限、`"V OO"`、`null`、小写币种等一律整体返回稳定 `invalid_payload`；拒绝原因只含"第 N 项 + 形状说明"，断言错误产物不含私有文本片段 |
-| 结果校验（复核 P0-2） | ✅ 通过 | `priceMinor: -1 / 0 / 1.5 / "5000"`、`rateDecimal: "0" / "0.0000"`、`priceDate/fetchedAt: "bad"`、`2026-02-30`、无时区时间戳、`{code:"timeout", retryable:false}` 全部被拒绝；`errorResult` 未知错误码抛 `ContractError`，`subject` 中私有文本被置空 |
+| 结果校验（复核 P0-2、G4A-7–10） | ✅ 通过 | `priceMinor: -1 / 0 / 1.5 / "5000"`、`rateDecimal: "0" / "0.0000"`、`priceDate/fetchedAt: "bad"`、伪日历时间戳、无时区时间戳、空白 provider、`{code:"timeout", retryable:false}` 全部被拒绝；quote/fx/error 结果键集合必须严格等于白名单，夹带私有字段与未经清洗的错误 detail 不得通过 `assertValidResult`；`errorResult` 未知错误码抛 `ContractError`，`subject` 中私有文本被置空 |
 | 固定时钟 | ✅ 通过 | `server/providers/clock.js` 经 `ctx.now` 注入；`fixedClock` 恒定且拒绝非法时间戳；缺 `ctx.now` 时返回 `invalid_payload`，不读真实 `Date.now` |
-| fixture 覆盖成功/超时/限额/缺标的/节假日 | ✅ 通过 | `tests/providers-contract.test.js` 42/42：成功（VOO/0700.HK/510300.SS 三市场）、timeout、rate_limit、not_found、invalid_payload、auth、节假日回退（数据日早于请求日且不报错） |
+| fixture 覆盖成功/超时/限额/缺标的/节假日 | ✅ 通过 | `tests/providers-contract.test.js` 44/44：成功（VOO/0700.HK/510300.SS 三市场）、timeout、rate_limit、not_found、invalid_payload、auth、节假日回退（数据日早于请求日且不报错） |
 | `asOf` 取数（复核 P1-4） | ✅ 通过 | fixture 改为时间序列，只取 `date <= asOf` 的最近一条；`asOf=2026-09-01` 不再返回 2026-09-11 行情而是 `not_found`；不变量测试遍历多个 `asOf` 断言从不返回未来数据；非法 `asOf` 整体拒绝 |
 | 隐私边界 | ✅ 通过 | 序列化白名单（`serializeFxRequest` 剥离 amount/accountName 等字段、产物键集合固定）；adapter 在塞满账户名/数量/成本/余额/持仓的 `ctx` 下，结果对象仍只含契约白名单键；错误 `subject` 只接受公开代码/币对形状 |
 | 离线运行 / 零越界改动 | ✅ 通过 | 全部测试无真实网络请求（数据源取证为人工一次性探测，见 `SOURCES.md`，不属自动测试）；`git` 确认未改动 `migrations.js`/`repository.js`/`api.js`/`keychain.js`/前端文件 |
-| 行情主源端点 | ⚠️ 不在本阶段冻结 | 实测不存在"免费 + 无 key + 官方条款/限额/授权 + 覆盖 A/H/US ETF 日终"的源（Stooq 接口失效、Yahoo 403、Twelve Data 免费层仅 3 市场）；改由 **D-038 启用门禁**约束，端点选定属 4D 前置；门禁通过前自动抓取默认关闭、行情走手动补价 |
+| 行情主源端点 | ❌ 尚未决定 | 实测不存在"免费 + 无 key + 官方条款/限额/授权 + 覆盖 A/H/US ETF 日终"的源（Stooq 接口失效、Yahoo 403、Twelve Data 免费层仅 3 市场）；端点延期至 4D 开始前决定。D-038 只约束启用门禁，不能替代 T-002 的行情源决策；门禁通过前自动抓取默认关闭、行情走手动补价 |
 
-补口后全量 `node --test` **272/272**（230 旧零回归 + 42 项 4A 契约/隐私/反例测试）；浏览器 wiring **15/15**（连续两轮全绿）。独立复核的原始结论与逐条修复状态见 `PHASE4A_ACCEPTANCE_GAPS.md`。
+二次补口后全量 `node --test` **274/274**（230 旧零回归 + 44 项 4A 契约/隐私/反例测试）；浏览器 wiring **15/15**。代码与回归门禁全绿，但 T-002 行情端点未定，所以不能据此宣称 Phase 4A 正式验收通过。独立复核的原始结论与逐条修复状态见 `PHASE4A_ACCEPTANCE_GAPS.md`。
 
 ### S4B.1 标的分类确认与锁定
 

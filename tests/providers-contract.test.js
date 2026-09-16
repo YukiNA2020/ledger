@@ -101,7 +101,13 @@ test('isTimestamp 要求带时区的 ISO 时间，拒绝仅日期与无时区写
   ['2026-09-15T08:00:00Z', '2026-09-15T08:00:00.123Z', '2026-09-15T08:00:00+08:00'].forEach((t) => {
     assert.ok(Contract.isTimestamp(t), t);
   });
-  ['2026-09-15', '2026-09-15T08:00:00', '2026-09-15T08:00Z', 'bad', '', null].forEach((t) => {
+  [
+    '2026-09-15', '2026-09-15T08:00:00', '2026-09-15T08:00Z',
+    '2026-02-30T08:00:00Z', '2026-09-31T08:00:00Z',
+    '2026-09-15T24:00:00Z', '2026-09-15T08:60:00Z', '2026-09-15T08:00:60Z',
+    '2026-09-15T08:00:00+14:01', '2026-09-15T08:00:00+15:00',
+    'bad', '', null
+  ].forEach((t) => {
     assert.ok(!Contract.isTimestamp(t), JSON.stringify(t));
   });
 });
@@ -209,6 +215,7 @@ test('quoteResult 拒绝不可入账的行情（负/零/小数价格、假日期
     { ...good, fetchedAt: 'bad' },
     { ...good, fetchedAt: '2026-09-15' },
     { ...good, provider: '' },
+    { ...good, provider: '   ' },
     null
   ].forEach((bad) => throwsContract(() => Contract.quoteResult(bad), JSON.stringify(bad)));
 });
@@ -225,6 +232,7 @@ test('fxResult 拒绝不可入账的汇率（0 / 负 / 假日期 / 坏时间）'
     { ...good, fetchedAt: 'bad' },
     { ...good, base: 'usd' },
     { ...good, provider: '' },
+    { ...good, provider: '\t  ' },
     null
   ].forEach((bad) => throwsContract(() => Contract.fxResult(bad), JSON.stringify(bad)));
 });
@@ -268,11 +276,13 @@ test('isValidResult 拒绝验收指出的全部不可入账形状', () => {
   assert.ok(!Contract.isValidResult({ ...VALID_QUOTE, priceDate: '2026-02-30' }));
   assert.ok(!Contract.isValidResult({ ...VALID_QUOTE, fetchedAt: 'bad' }));
   assert.ok(!Contract.isValidResult({ ...VALID_QUOTE, fetchedAt: '2026-09-15' }));
+  assert.ok(!Contract.isValidResult({ ...VALID_QUOTE, provider: '   ' }));
 
   assert.ok(!Contract.isValidResult({ ...VALID_FX, rateDecimal: '0' }));
   assert.ok(!Contract.isValidResult({ ...VALID_FX, rateDecimal: '0.0000' }));
   assert.ok(!Contract.isValidResult({ ...VALID_FX, rateDate: 'bad' }));
   assert.ok(!Contract.isValidResult({ ...VALID_FX, fetchedAt: 'bad' }));
+  assert.ok(!Contract.isValidResult({ ...VALID_FX, provider: '\t' }));
 });
 
 test('isValidResult 对错误结果要求 retryable 严格等于映射', () => {
@@ -288,6 +298,28 @@ test('isValidResult 拒绝未知 kind、非对象与缺失字段', () => {
   assert.ok(!Contract.isValidResult(null));
   assert.ok(!Contract.isValidResult(undefined));
   assert.ok(!Contract.isValidResult({ kind: 'quote', symbol: 'VOO' }));
+});
+
+test('isValidResult 严格限制结果白名单键，拒绝 adapter 夹带私人字段', () => {
+  const privateFields = {
+    accountName: '汇丰 USD 子账户', quantity: '10', costMinor: 45000,
+    balanceMinor: 100000, holdings: [{ symbol: 'VOO', quantity: '10' }]
+  };
+  assert.ok(!Contract.isValidResult({ ...VALID_QUOTE, ...privateFields }));
+  assert.ok(!Contract.isValidResult({ ...VALID_FX, accountName: privateFields.accountName }));
+  assert.ok(!Contract.isValidResult({
+    kind: 'error', subject: 'VOO', code: 'timeout', detail: '', retryable: true,
+    accountName: privateFields.accountName
+  }));
+  throwsContract(() => Contract.assertValidResult({ ...VALID_QUOTE, accountName: privateFields.accountName }));
+});
+
+test('isValidResult 拒绝未经构造器清洗的错误 detail', () => {
+  const base = { kind: 'error', subject: 'VOO', code: 'timeout', detail: '', retryable: true };
+  assert.ok(!Contract.isValidResult({ ...base, detail: '上游失败\n原始响应' }));
+  assert.ok(!Contract.isValidResult({ ...base, detail: 'x'.repeat(Contract.MAX_DETAIL_LENGTH + 1) }));
+  assert.ok(!Contract.isValidResult({ ...base, detail: '  未清洗  ' }));
+  assert.ok(Contract.isValidResult(Contract.errorResult({ code: 'timeout', detail: '上游失败\n原始响应' })));
 });
 
 test('assertValidResult 对不合格结果抛 ContractError，对合格结果原样返回', () => {
@@ -533,6 +565,8 @@ test('固定时钟确定性：fetchedAt 恒等于注入时间，不读真实时�
 test('fixedClock 拒绝非法时间戳，避免把无效抓取时间写进行情', () => {
   assert.throws(() => Clock.fixedClock('bad'));
   assert.throws(() => Clock.fixedClock('2026-09-15'));
+  assert.throws(() => Clock.fixedClock('2026-02-30T08:00:00Z'));
+  assert.throws(() => Clock.fixedClock('2026-09-15T24:00:00Z'));
   assert.throws(() => Clock.fixedClock(undefined));
   assert.strictEqual(Clock.fixedClock(NOW).now, NOW);
 });
