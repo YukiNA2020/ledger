@@ -175,6 +175,24 @@ Phase 4A 退出证据：T-002 的汇率与行情部分、T-003 均已决定；�
 
 Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的去重和元数据冲突均有固定 fixture 用例。
 
+**验收结论（2026-09-16，当前工作区）：✅ 通过。**
+
+口径澄清：本场景原文的「可追溯的类别、市场和币种候选」按 **D-037 / D-039** 落地 —— provider 实际提供的候选是 `currency` / `exchange` / `instrument_type` / `country` / `exchange_timezone`，而 `asset_class`（资产类别）与 `exposure_market`（风险敞口市场）**没有 provider 字段来源**，属用户判断，只能由用户填写并确认；provider 未提供时保持为空而不是编造。因此"分类候选"的可追溯性由 provenance 承担，"类别/市场"的权威性由用户确认承担。
+
+| 场景要点 | 结论 | 证据 |
+|---|---|---|
+| 搜索 → 预分类（suggested） | ✅ 通过 | `GET /api/v1/instruments/search?q=` 返回合并候选，每条带 `provenance`（六字段、`payloadHash` 可由上游字段重算）与带依据的 `suggestions`（如 `{field:'currency', value:'USD', basis:'provider.currency'}`）；`userJudgementRequired` 明示哪些字段必须用户填。`tests/providers-catalog.test.js` 26/26、`tests/instrument-catalog.test.js` |
+| 建立标的落成 `suggested`，不自动确认 | ✅ 通过 | `POST /api/v1/instruments` 返回 `classificationStatus:'suggested'`、`assetClass:null`、`exposureMarket:null`、`confirmedAt` 为空；provider 的部分字段缺失时保持 `null`（`MYSTERY.ETF` 用例证明"没给就不编造"） |
+| 用户确认 → `confirmed` 本地锁定 | ✅ 通过 | `POST /api/v1/instrument-confirmations` 要求 `assetClass` + `exposureMarket` 两项（缺任一项 → 400）；确认后 `classificationStatus:'confirmed'` 且写入 `confirmedAt`；非词表取值（`现金` / `日本` / `美国`）一律 400 |
+| **确认后 provider 返回不同分类：本地值保持不变，只作冲突提示** | ✅ 通过 | 核心不变量用例：确认 → 再 `POST /api/v1/instruments` 刷新，`preserved:true`、状态仍 `confirmed`、`assetClass`/`exposureMarket`/`trackingIndex`/`confirmedAt` 全部不变；本地自定义名称（`盈富基金`）不被上游 `Tracker Fund of Hong Kong` 改写，差异以 `conflicts[]` 返回且**每条都带 provider 候选值与 provenance**（`payloadHash`、`fetchedAt`） |
+| 同一标的不重复创建事实 | ✅ 通过 | 稳定 id `inst-<sha1(symbol@exchange) 前16位>` 确定性派生（大小写/空白归一后一致，可外部复算）；重复建立 `duplicated:true` 且目录里只有一行；`repository.upsertInstrument` 对同一去重键的第二次写入**显式抛 `duplicate_instrument`**（不静默删行，已确认分类不会被连带删除）；"先手工建、后由 provider 补全交易所"经退化匹配命中同一行 |
+| 缺失/冲突元数据明确提示 | ✅ 通过 | provider 整体失败时 `provider.status='error'` + `warnings[]`，本地命中照常返回（前端显示"参考数据暂不可用…确认分类不依赖外部数据"）；候选里的不可入账记录（小写币种）转为显式 `invalid_payload` 而不是"看起来是候选"；`BADMETA.ETF` 建立请求 422 |
+| 边界：本阶段不创建持仓 | ✅ 通过 | `POST /api/v1/portfolio-openings` / `security-events` / `market-data/refresh` 仍返回 `501`；`GET /api/v1/holdings` 保持只读 |
+| 隐私边界 | ✅ 通过 | 检索请求产物键集合恒为 `{query}`、元数据请求恒为 `{symbol}`；传入对象/数组/夹带私有字段的载荷被整体拒绝；错误响应不回显输入原文；目录接口响应不含 `accountName`/`quantity`/`costMinor`/`balanceMinor` |
+| 离线运行 | ✅ 通过 | 4B 全部测试使用 fixture provider 与固定时钟，无真实网络请求；未引入付费源、未处理 4D 的行情源门禁（D-038） |
+
+退出证据汇总：全量 `node --test` **344/344**（274 基线零回归 + 70 项 4B：`providers-catalog` 26、`instrument-catalog` 33、`server-phase4b` 11）；浏览器 wiring **16/16**（新增 1 项从真实产品入口走完"检索 → 加入 → 确认 → 刷新不覆盖"，连续两轮全绿）；零数据库迁移、零真实网络、`DEFERRED_WRITES` 一行未动。
+
 ### S4C.1 初始快照与后续事件
 
 **Given** 用户首次录入 10 份 ETF。

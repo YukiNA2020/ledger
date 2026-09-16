@@ -7,7 +7,7 @@
 
 本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
 
-截至 2026-09-14，Phase 1（资产领域基础）与 Phase 2（本地服务与 SQLite）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`。**尚无**行情 provider、风险问卷或决策状态机——这些属于 Phase 3 以后。
+截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）与 Phase 4B（标的目录与分类确认）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块）。**尚无**持仓账本与证券事件（4C）、自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
 
 ## 1. 架构原则
 
@@ -161,6 +161,10 @@ POST   /api/v1/asset-transfers
 POST   /api/v1/liabilities
 POST   /api/v1/entitlements
 GET    /api/v1/holdings
+GET    /api/v1/instruments
+GET    /api/v1/instruments/search?q=
+POST   /api/v1/instruments
+POST   /api/v1/instrument-confirmations
 POST   /api/v1/portfolio-openings
 POST   /api/v1/security-events
 POST   /api/v1/market-data/refresh
@@ -195,7 +199,7 @@ getFxRates(pairs, asOf)
 getInstrumentMetadata(instrument)
 ```
 
-MVP 可配置一个主数据源和手动 provider。**行情主源在接入前必须先通过 `DECISIONS.md` D-038 的启用门禁**（官方条款与自动化授权、可复核 API 版本、调用限额、认证方式、市场覆盖声明、失败语义映射）；门禁通过前自动抓取默认关闭，行情以手动补价 + 本地缓存为事实来源。每次响应必须保存 provider、价格日期、抓取时间和原始代码，并在落库前经 `server/providers/contract.js` 的 `assertValidResult` 校验 —— 不可入账的数据（负价、零汇率、假日期、无时区时间戳）一律拒绝写入。失败采用有限重试；超过阈值后保留最后有效值并标记 stale，不级联删除历史行情。
+MVP 可配置一个主数据源和手动 provider。Phase 4B 已落地 `searchInstrument(query)` 与 `getInstrumentMetadata(symbol)` 的契约与**离线 fixture** 实现（`server/providers/fixture.js` 的 `CATALOG`，不发真实网络），供标的目录使用；`getEndOfDayQuotes` / `getFxRates` 目前仍只有契约与 fixture，真实接入属 4D。**行情主源在接入前必须先通过 `DECISIONS.md` D-038 的启用门禁**（官方条款与自动化授权、可复核 API 版本、调用限额、认证方式、市场覆盖声明、失败语义映射）；门禁通过前自动抓取默认关闭，行情以手动补价 + 本地缓存为事实来源。每次响应必须保存 provider、价格日期、抓取时间和原始代码，并在落库前经 `server/providers/contract.js` 的 `assertValidResult` 校验 —— 不可入账的数据（负价、零汇率、假日期、无时区时间戳）一律拒绝写入。失败采用有限重试；超过阈值后保留最后有效值并标记 stale，不级联删除历史行情。
 
 提供方不得收到账户名、持仓数量、成本、余额或决策信息。请求代码列表本身可能暴露关注标的，这一残余风险已接受。
 

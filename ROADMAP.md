@@ -116,7 +116,7 @@
 
 目标：形成可信可投资资产与风险敞口。
 
-Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前子阶段通过、提交且文档交接完成后，才进入下一个。唯一例外是 T-002 的行情端点：因 4A 取证确认当时没有候选满足 D-038，明确延期到 4D 开始前决定；4B/4C 不接真实行情，因此可在保留该验收缺口的前提下推进，但不得把 4A 标成正式通过。
+Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前子阶段通过、提交且文档交接完成后，才进入下一个。唯一例外是 T-002 的行情端点：因 4A 取证确认当时没有候选满足 D-038，明确延期到 4D 开始前决定；4B/4C 不接真实行情，因此可在保留该验收缺口的前提下推进（4B 已于 2026-09-16 完成验收，4C 可继续），但不得把 4A 标成正式通过。
 
 ### Phase 4A｜数据源决策与适配器契约
 
@@ -143,6 +143,8 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4B｜标的目录与分类确认
 
+状态：**已完成并验收（2026-09-16，`v2.3.5-phase4b`）**。
+
 范围：
 
 1. 标的检索、候选结果与元数据缓存。
@@ -151,6 +153,18 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 4. 建立稳定的标的 id，供后续多个证券账户共同引用；本阶段不创建持仓。
 
 退出条件：固定 fixture 可完成“搜索 → 预分类 → 用户确认 → 再刷新不覆盖确认值”；缺失或冲突元数据明确提示；同一标的不重复创建事实。
+
+已交付：
+
+- 检索/候选/合并与冲突：`server/instrument-catalog.js`（纯编排）、`GET /api/v1/instruments/search`；本地命中在 provider 不可用时仍可用，且"没搜到"与"调用失败"可区分；
+- 参考数据契约与 provenance：`server/providers/contract.js` 的 `serializeSearchRequest` / `serializeMetadataRequest` / `instrumentResult` / `makeProvenance`（D-037 六字段，`payloadHash` 可重算复核）；检索请求产物键集合恒为 `{query}`；
+- 离线参考数据：`server/providers/fixture.js` 的 `CATALOG` + `searchInstrument` / `getInstrumentMetadata`（缺项 `null`，坏元数据转显式 `invalid_payload`）；
+- 预分类与用户判断字段：`js/domain.js` 的 `diffInstrumentFields` / `suggestFromProvider` / `EXPOSURE_MARKETS` / `USER_JUDGEMENT_FIELDS`；`asset_class` / `exposure_market` / 跟踪指数只能由用户填写与确认（D-037、D-039）；
+- 确认与本地锁定：`POST /api/v1/instrument-confirmations`（两项用户判断必填）；`confirmed` 记录在后续刷新中保持状态与值不变，差异只以 `conflicts[]` + provenance 提示；
+- 稳定 id 与去重：`inst-<sha1(symbol@exchange) 前16位>`；`repository.upsertInstrument` 对同一去重键显式抛 `duplicate_instrument`（不静默删行）；
+- 前端：资产页「标的目录」区块（搜索/候选/目录/确认弹层/手工建立弹层），经 `js/store.js` 门面访问；`APP_VERSION` 与 SW 缓存键升至 `2.3.5-phase4b`。
+
+退出证据：全量 `node --test` **344/344**（274 基线零回归 + 70 项 4B）；浏览器 wiring **16/16**（新增 1 项真实产品入口闭环，连续两轮全绿）；`DEFERRED_WRITES` 未动（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）；零数据库迁移、零真实网络请求。详见 `ACCEPTANCE.md` S4B.1 与 `TEST.md` 的 Phase 4B 证据节。
 
 ### Phase 4C｜持仓账本与证券事件
 

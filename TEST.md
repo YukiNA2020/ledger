@@ -6,9 +6,9 @@
 
 ## 当前结论
 
-- **测试对象：** v2.3.4-phase4a（v3 Phase 4A 数据源决策与适配器契约，含独立复核补口）
-- **总体状态：** ⚠️ Phase 4A 契约代码与测试通过，但正式验收暂不通过。`node --test` **274/274**（230 旧零回归 + 44 项 4A 契约/隐私测试），浏览器 wiring **15/15**。
-- **发布判断：** T-002 仅汇率源已定，行情端点仍待 4D 开始前决定，因此不能宣称 Phase 4A 退出条件全部满足。4B/4C 不依赖真实行情，可按 ROADMAP 的明确例外推进；4D 不得在行情源通过 D-038 门禁前开始自动抓取。本轮零数据库迁移、零 API 改动、零 UI 改动、零真实网络请求。
+- **测试对象：** v2.3.5-phase4b（v3 Phase 4B 标的目录与分类确认）
+- **总体状态：** ✅ Phase 4B 已完成并验收（S4B.1 通过）。`node --test` **344/344**（274 基线零回归 + 70 项 4B：`providers-catalog` 26、`instrument-catalog` 33、`server-phase4b` 11），浏览器 wiring **16/16**（新增 1 项真实产品入口闭环，连续两轮全绿）。
+- **发布判断：** Phase 4B 退出条件全部满足。**Phase 4A 仍为「契约完成、正式验收暂不通过」**——T-002 仅汇率源已定，行情端点待 4D 开始前通过 D-038 门禁后决定。本轮零数据库迁移、零真实网络请求、未创建持仓（`portfolio-openings` / `security-events` / `market-data/refresh` 仍 501）。
 
 本轮只使用仓库内的虚构、脱敏数据。标准虚构数据与预期口径见 `ACCEPTANCE.md` §2。
 
@@ -35,6 +35,26 @@
 | 浏览器接线回归 | `tests/app-wiring.html`（本地服务托管） | 2026-09-15 | ✅ 15/15 | 连续两轮全绿；4A 未改前端/API，属回归确认 |
 
 **Phase 4A 合计：`node --test` 274/274（230 + 44），浏览器 wiring 15/15。**
+
+### Phase 4B 证据（2026-09-16）
+
+| 范围 | 方法 | 日期 | 结果 | 说明 |
+|------|------|------|------|------|
+| 参考数据 adapter（检索与元数据） | `node --test tests/providers-catalog.test.js` | 2026-09-16 | ✅ 26/26 | 候选键集合精确（不夹带 `assetClass`/`exposureMarket`/`trackingIndex`）、大小写与名称片段检索、一个词命中多条且坏记录单独报错、无命中返回空数组而不是错误、provider 级失败 `subject` 为空、缺项一律 `null`（`MYSTERY.ETF` 证明"没给就不编造"）、小写币种记录转显式 `invalid_payload` 不作为候选流出、provenance 六字段与 `payloadHash` 可外部重算、`sourceRef` 缺失用 `NA` 占位、`fetchedAt` 取自注入时钟、非法检索词/缺 `ctx.now` 整体拒绝且不回显原文 |
+| 目录编排与本地锁定 | `node --test tests/instrument-catalog.test.js` | 2026-09-16 | ✅ 33/33 | 稳定 id 确定性派生与可复算、建立载荷白名单（夹带 `accountName`/`quantity`/`costMinor` 一个都进不了产物）、非法载荷稳定报错不回显、确认两项用户判断必填 + `EXPOSURE_MARKETS` 词表边界、冲突只报同名字段差异且带 provenance、检索合并与 `local+provider` 去重、provider 挂了仍返回本地命中、建立/重复建立/币种冲突/手工建标（缺币种拒绝、provider 未覆盖可用）/退化匹配补全交易所、确认与 `confirmed` 锁定、**确认后刷新不覆盖（`preserved:true`、状态不退回 `suggested`）**、`duplicate_instrument` 不静默删行、`extra_json` 零丢失 |
+| S4B.1 API 端到端 | `node --test tests/server-phase4b.test.js` | 2026-09-16 | ✅ 11/11 | 主链路（检索 → 建立 `suggested` → 确认 `confirmed` → 再刷新不覆盖且目录仅一行）走真实 HTTP 入口；provider 失败时本地命中仍返回；检索词非法 400 且不回显；写请求缺/错 `Content-Type` 415 且不改数据；建立校验失败矩阵（400/404/422 与错误码）；手工建立（provider 未覆盖）；确认失败矩阵（400/404）；冲突提示带 provider 值与 provenance；`portfolio-openings`/`security-events`/`market-data/refresh` 仍 501；目录响应不含账户/持仓字段 |
+| 全量回归 | `node --test` | 2026-09-16 | ✅ 344/344 | 274 项 Phase 1–4A 零回归 + 70 项 Phase 4B |
+| 浏览器接线验收（真实产品入口闭环） | `tests/app-wiring.html`（本地服务托管） | 2026-09-16 | ✅ 16/16 | 新增 1 项：从决策台进入资产录入页 → 检索 VOO → 加入目录（事实源为 `suggested`、`assetClass`/`exposureMarket` 未生成）→ 弹层确认 `broad_equity`/`US`/`S&P 500` → 事实源为 `confirmed` → 按参考数据刷新后 id 不变、目录仍一行、状态与三个用户值全部保持；连续两轮全绿 |
+
+**Phase 4B 合计：`node --test` 344/344（274 + 70），浏览器 wiring 16/16。**
+
+### Phase 4B 本轮发现并修复的缺陷（2026-09-16）
+
+- **B10（P0，本地锁定）**：`createInstrument` 初版对所有记录统一写 `classificationStatus: 'suggested'`，用户在界面确认分类后只要再点一次「按参考数据刷新」就会**退回未确认状态**——D-037 的本地锁定形同虚设。修复：对 `confirmed` 记录显式保留 `classificationStatus`/`confirmedAt` 与全部本地值（含自定义名称），只刷新来源留档与冲突提示，并在响应里以 `preserved: true` 明示；用例覆盖"确认 → 刷新 → 状态与值全部不变 + 名称不被上游改写"。
+- **B11（P0，去重路径）**：`repository.upsertInstrument` 初版按 `(symbol, exchange)` 去重时**静默 `DELETE` 冲突行**——那会把已确认的分类连同整行一起删掉。修复：改为显式抛 `duplicate_instrument`，由调用方先用 `findInstrumentByKey` 解析既有标的后再写入；并保留"同一代码且任一方交易所为空"的退化匹配，避免"先手工建、后由 provider 补全交易所"时凭空多出第二行事实。
+- **B12（P1，事务边界）**：单条标的写入是"先删同 id 再插入"，裸调 repository 存在中途失败丢行的窗口。修复：统一经 `writeInstrument()` 用 `dbm.transaction` 包装（provider 调用已在事务之外完成，不嵌套）。
+- **B13（P2，契约一致性）**：`suggestFromProvider` 初版返回对象，与 `diffInstrumentFields` 的返回形状不一致，调用方容易写错。修复：统一为 `[{field, value, basis}]`。
+- **B14（测试基建）**：4B 的 wiring 场景最初写了两处"用页面文案判断状态"（`待确认` / `已确认`）与一处错误导航假设（`assets` 页其实不在底部 tabbar，必须先回决策台点入口卡片）。前者违反本项目的 wiring 铁律（文案可能被他处内容污染造成假通过），后者直接导致 `找不到元素 [data-action="nav:assets"]`。修复：状态一律用 `apiState()`（事实源）轮询判定；导航改为 `nav:home` → `#view [data-action="nav:assets"]`；"刷新是否真的执行"用 `fetch` 计数证明，而不是靠 toast 文案。同类问题参考 B5。
 
 **数据源取证（非自动测试，人工一次性探测）：** 见 `server/providers/SOURCES.md`。Stooq `/q/l/` 404、`/q/d/l/` 返回 JS 验证挑战；Yahoo chart 403；Frankfurter `/v2/providers/ecb/rates` 200 且与默认多源端点值不同（USD/CNY 6.7115 vs 6.708）；Twelve Data `symbol_search` 覆盖 HKEX/SSE；腾讯/东方财富端点实测可达但无官方条款。自动测试不访问公网的门禁未被破坏。
 

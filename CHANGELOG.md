@@ -11,9 +11,32 @@
 - **空白 provider 不再冒充来源**：provider 必须在 `trim()` 后仍非空，quote/fx 构造与直接结果校验使用同一口径。
 - **纠正 T-002 与 4A 验收状态**：T-002 改为“汇率已定、行情待 4D 前决定”；D-038 只代表启用门禁，不再被写成已经选定行情源。4A 标记为“契约完成、正式验收暂不通过”。
 
-### 计划
+## [2.3.5-phase4b] - 2026-09-16
 
-- Phase 4B「标的目录与分类确认」：标的检索、候选与元数据缓存、资产类别/市场/币种预分类、用户确认与本地锁定、稳定标的 id（供多证券账户共同引用）。
+交付 Phase 4B「标的目录与分类确认」（ROADMAP 4B、ACCEPTANCE S4B.1）。本阶段**不创建持仓**：`POST /api/v1/portfolio-openings|security-events|market-data/refresh` 仍返回 `501`（属 4C/4D）。零数据库迁移、零真实网络请求。
+
+### 新增
+
+- **标的检索与服务端编排**（`server/instrument-catalog.js`）：本地已建标的与 provider 候选按去重键 `symbol@exchange` 合并成唯一候选列表；provider 整体失败时**仍返回本地命中**并显式报告 `provider.status`（"没搜到"与"这次调用失败"可区分）；冲突清单逐条附带 provider 候选值与 provenance。纯编排模块：不碰 HTTP、不读系统时钟（时间由 `ctx.now` 注入）、不发真实网络。
+- **标的参考数据契约**（`server/providers/contract.js` 纯新增）：`serializeSearchRequest` / `serializeMetadataRequest` 的产物键集合恒为 `{query}` / `{symbol}` —— 调用方即便传入对象或夹带私有字段也无法把账户名、数量、成本带进对外请求；新增 `instrumentResult`（字段严格按 D-037 映射，`asset_class` / `exposure_market` / 跟踪指数**不在契约内**）与 `makeProvenance`（`{provider, endpoint, sourceVersion, sourceRef, fetchedAt, payloadHash}` 六字段齐备、形状受限）；`isValidResult` 增加 `kind === 'instrument'` 分支，要求键集合精确匹配。
+- **离线参考数据 fixture**（`server/providers/fixture.js` 扩展）：新增 `CATALOG` 数据集（VOO / 0700.HK / 2800.HK / 510300.SS 覆盖美/港/A 三市场，另有上游字段全缺的 `MYSTERY.ETF`、币种非法的 `BADMETA.ETF`、鉴权与超时场景）与 `searchInstrument` / `getInstrumentMetadata`；`payloadHash` 对上游字段规范化序列化后取 sha256，**任何一条 provenance 都可被外部重算复核**；上游缺项一律 `null`，不用空串或猜测值冒充。
+- **稳定标的 id**：`inst-<sha1(symbol@exchange) 前 16 位>` 确定性派生 —— 同一标的重复检索/重复加入永远得到同一个 id，后续多个证券账户（4C）可直接引用，并在写入路径上保证"同一标的不重复创建事实"。
+- **用户判断字段词表**（`js/domain.js`）：`EXPOSURE_MARKETS = ['CN','HK','US','global','other']`；`USER_JUDGEMENT_FIELDS` 明示 `assetClass` / `exposureMarket` / `trackingIndex` 只能由用户填写；`diffInstrumentFields` 只比较同名字段（provider 未给的字段不构成冲突），`suggestFromProvider` 返回带依据的 `[{field, value, basis}]`。
+- **标的 API**（`server/api.js`）：`GET /api/v1/instruments/search?q=`（只读，只发送公开检索词）、`POST /api/v1/instruments`（默认从参考数据补全；`source=manual` 用于 provider 未覆盖的标的，币种必填）、`POST /api/v1/instrument-confirmations`（`asset_class` / `exposure_market` 必填）。错误码到 HTTP 状态集中映射（400 / 404 / 409 / 422 / 503）。
+- **资产页「标的目录」区块**（`js/app.js` + `js/store.js` 门面）：搜索框、候选列表（标出"已在目录中"）、目录列表（状态、来源、差异数）、确认弹层与手工建立弹层。前端不直接 `fetch`，一律走 `store.js`。
+- **测试**：`tests/providers-catalog.test.js`（26 项）、`tests/instrument-catalog.test.js`（33 项）、`tests/server-phase4b.test.js`（11 项），浏览器 wiring 新增 1 项从真实产品入口走完 S4B.1 全链路。
+
+### 修复
+
+- **`repository.upsertInstrument` 不再静默删除同去重键的其他行**：初版实现会 `DELETE` 同 `symbol@exchange` 的另一行 —— 那会连带丢掉已确认的 `confirmed` 分类。改为显式抛 `duplicate_instrument`，由调用方先用 `findInstrumentByKey` 解析既有标的后再写入（`server/instrument-catalog.js` 正是这么做的，并支持"先手工建标的、后由 provider 补全交易所"的退化匹配）。
+- **确认后的分类不再被一次"刷新"悄悄降级**：`createInstrument` 初版对所有记录统一写 `classificationStatus: 'suggested'`，用户在界面确认完再点一次"按参考数据刷新"就会退回未确认状态（违反 D-037 的本地锁定）。现在对 `confirmed` 记录显式保留 `classificationStatus` / `confirmedAt` 与全部本地值，只刷新来源留档与冲突提示，并在响应里以 `preserved: true` 明示。
+- **标的写入纳入事务**：单条标的写入是"先删同 id 再插入"，原先裸调 repository 存在中途失败丢行的窗口，现统一经 `writeInstrument()` 用事务包装。
+
+### 备注
+
+- `[Unreleased]` 中记录的 4A 契约二次补口（结果白名单落校验器、伪日期时间戳、空白 provider、T-002/4A 状态纠偏）与本版本共同构成当前代码状态；4A 仍为「契约完成、正式验收暂不通过」（行情端点待 4D 前过 D-038 门禁）。
+- 新增决策 **D-039**（标的目录口径：稳定 id 派生规则、`(symbol, exchange)` 去重键、用户判断字段与手工来源、冲突只提示不覆盖）。
+- 测试基线 `node --test` 274 → **344**（+26 +33 +11），浏览器 wiring 15 → **16**（连续两轮全绿）。
 
 ## [2.3.4-phase4a] - 2026-09-15
 
