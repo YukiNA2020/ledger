@@ -1,9 +1,35 @@
 # Phase 4B 验收缺口记录（独立复核）
 
-> 记录来源：独立复核 Agent 于 2026-09-16 对 Phase 4B（提交 `689743e`，基线 `node --test` 344/344、wiring 16/16）的复核结论。
-> 本文件规则：**原始复核结论原样保留作证据**，修复状态追加在文件顶部，不删改原始条目。
+> 记录来源：独立复核 Agent 于 2026-09-16 对 Phase 4B 的两轮复核结论 —— 第一轮针对提交 `689743e`（基线 `node --test` 344/344、wiring 16/16），第二轮针对补口提交 `147588e`（基线 357/357、wiring 16/16）。
+> 本文件规则：**原始复核结论原样保留作证据**（按轮次倒序，最新一轮状态在前），修复状态追加在对应轮次的状态节里，不删改原始条目。
 
-## 修复状态（2026-09-16，执行 Agent）
+## 第二轮修复状态（2026-09-16，执行 Agent）
+
+| 编号 | 级别 | 原始结论 | 修复状态 |
+|---|---|---|---|
+| G4B-5 | P1 | `PUT /state` 静默丢弃没有 id 的标的、把空白 `symbol` 写成空字符串（`writeInstruments` 先用 `.filter(i => i && i.id)` 过滤） | ✅ 已修：`repository.writeInstruments` 改为**两遍写入** —— 第一遍逐条验证并归一（id 必填且形状合法、`symbol` 去空白后必须符合公开证券代码形状、`currency` 必填且在白名单内、记录必须是对象），任一条不合格立即抛错；第二遍校验去重键后才插入。`writeState` 全程在一个事务内，抛错即整体回滚（不是"先清后写留下空库"）。`api.js` 领域错误码映射补 `invalid_instrument`，四条反例 HTTP 一律 **400**。真实 HTTP 反例：缺 id / 空白代码 / 币种非法 / 币种缺失各自 400 + `GET /state` 证明上一次状态（两条）逐条原样保留；合法写入照常 200 |
+| G4B-6 | P1 | `DROP INDEX uq_instruments_dedupe` 后 `validateBackupFile` 仍返回 `{"ok":true,"schemaVersion":4}`（只按版本查表，不查索引级不变量） | ✅ 已修：`backup.js` 新增**按 schema 版本维护的必需索引清单** `REQUIRED_INDEXES_BY_VERSION`（v4：`instruments.uq_instruments_dedupe` 必须存在**且为唯一索引**），`validateBackupFile` 在表校验后逐条校验；`server/db.js` 新增 `indexInfo()`（存在性 + 所属表 + 唯一属性；PRAGMA 读不到属性时按"不唯一"处理 —— 宁可拒绝，也不放过不变量缺失的库）。恢复通道本来就先走同一个校验函数，因此一并堵住 |
+| G4B-7 | P1 | 检索只按精确 `(symbol, exchange)` 合并，本地 `VOO@` 与 provider `VOO@NYSE` 会同时展示 | ✅ 已修：`searchCatalog` 抽出 `matchLocalRecord()`，与建立路径（`repository.findInstrumentByKey`）**同一套规则**：精确命中 → 同代码且一方缺交易所时唯一命中可安全合并 → 多命中或"同一条本地记录被两个市场认领"时报 `ambiguous_instrument` 且**不合并**。命中的本地记录被候选认领后不再单独成行；候选缺的展示字段只补空、不覆盖，且**不进入预分类建议**（建议依据必须仍指向 provider，本地值不得冒充） |
+
+**本轮补口测试证据：** 全量 `node --test` **367/367**（357 基线零回归 + 10 项新反例/不变量：`instrument-catalog` 40→44、`server-phase4b` 15→17、`server-backup` 16→19、`server-restore` 8→9）；浏览器 wiring **17/17**（新增 1 项真实 UI 闭环，干净环境连续两轮全绿）；零真实网络请求、零数据库迁移。
+
+**新增反例/不变量清单：**
+
+1. 全量写入：缺 id / 空白代码 / 含空格的代码 / 币种不在白名单 / 币种缺失 / 记录不是对象 → 一律抛错且**整体回滚**（拒绝后库里的行数与内容仍是上一次状态，不留半行）。
+2. 真实 HTTP：上述四条各自 400（稳定 `invalid_id` / `invalid_symbol` / `invalid_currency`），`GET /state` 证明原状态不变；合法写入照常 200。
+3. 必需索引：v4 库删掉 `uq_instruments_dedupe` → 校验拒绝并点名索引；把同名索引换成**非唯一**索引 → 同样拒绝（唯一性也是不变量）；活库丢索引时 `createBackup` 拒绝产出备份且不留残留文件。
+4. 恢复通道：候选备份缺索引 → 拒绝恢复、当前库逐字段不变、连"恢复前备份"都不产生（校验发生在切换之前）。
+5. 检索合并：本地缺交易所 + 参考数据有交易所 → 合成**一条** `local+provider` 候选；本地记录不被改写（检索只读）；建议依据仍全部来自 provider。
+6. 检索歧义：同代码本地多市场 + 参考数据未给交易所 → 报 `ambiguous_instrument` 且不合并；本地只有一条缺交易所记录时，第二个市场的候选同样报歧义（同一条本地记录不得被两个市场重复认领）。
+7. 浏览器闭环：手工建标（不填交易所）→ 检索 → 搜索卡片内只有 1 条候选、该候选不再提供"加入目录"入口、事实源中标的 id 与交易所都没变。
+
+**本轮未改动的边界（沿用第一轮结论）：** 全量 `/state` 与恢复通道仍原样还原既有 id（历史快照带 `ins-voo` 这类旧形状 id，强制"id 必须可复算"会把可用恢复路径变成拒绝恢复）；恢复通道的强约束是**去重键**（已强制）。本轮新增的逐条校验只约束 id / symbol / currency 的**合法性与存在性**，不要求 id 等于按当前交易所推导的值。
+
+**复核结论状态：** 本轮修复后 4B 状态为「第二轮补口完成，等待独立复核确认」。
+
+---
+
+## 第一轮修复状态（2026-09-16，执行 Agent）
 
 | 编号 | 级别 | 原始结论 | 修复状态 |
 |---|---|---|---|
@@ -33,7 +59,7 @@
 
 ---
 
-## 原始复核结论（原文保留，2026-09-16）
+## 原始复核结论·第一轮（原文保留，2026-09-16）
 
 4B **暂不通过验收，不建议进入 4C**。正常流程全部通过，但标的身份和去重边界存在 3 个可复现问题，而 4C 会直接依赖这些 ID。
 
@@ -110,3 +136,59 @@
 | P0 | `server/instrument-catalog.js` line 92–98 | 创建载荷允许客户端传入任意格式合法的 `id`，`createInstrument` 随后优先使用该值，绕过 D-039 的 `symbol@exchange` 确定性派生。创建 API 应拒绝或忽略 `id`，并始终由服务端生成。 |
 | P0 | `server/repository.js` line 352–371 | `writeInstruments` 直接插入数组，没有检查规范化后的 `symbol+exchange`；`PUT /state` 因而能同时写入 `VOO/NYSE` 和 `voo/nyse` 两行。应在事务内预校验重复键，并考虑增加数据库唯一约束。 |
 | P1 | `server/repository.js` line 428–438 | 当请求缺少 `exchange` 时，条件中的 `!exchange` 对所有同代码记录成立，`find` 会按行顺序返回第一条。若同代码同时存在 `NYSE`/`HKEX` 等多条记录，应返回 `ambiguous_instrument`，而不是静默选中其中一条。 |
+
+---
+
+## 原始复核结论·第二轮（原文保留，2026-09-16）
+
+本轮 **Phase 4B 暂不通过验收，不建议立即进入 4C**。之前的 3 个阻塞问题已经修复，但反向测试又发现 3 个边界缺口。
+
+**测试结果**
+
+- Phase 4B 定向测试：**97/97 通过**
+- 全量回归：**357/357 通过**
+- 浏览器端到端：**16/16 通过**
+- 工作区保持干净，临时服务已停止
+
+**剩余问题**
+
+1. **P1：`PUT /state` 会静默丢弃或接受非法标的。**
+   `repository.js`（line 357）先用 `.filter(i => i && i.id)` 删除没有 ID 的记录；空白 `symbol` 又会在写入时变成空字符串。
+
+   实测提交两条标的：
+
+   - `NO-ID` 因缺少 ID 被静默丢弃
+   - `blank-symbol` 的空白代码成功落库
+
+   修复要求：写入前逐条验证 `id`、`symbol`、`currency`，任意一条非法就整体拒绝并回滚。补真实 HTTP 用例，确认返回稳定 4xx 且原状态不变。
+
+2. **P1：v4 备份缺少唯一索引仍能通过校验。**
+   手工执行 `DROP INDEX uq_instruments_dedupe` 后：
+
+   ```text
+   validateBackupFile → {"ok":true,"schemaVersion":4}
+   ```
+
+   `backup.js`（line 164）只按版本检查表，没有检查 v4 引入的数据库不变量。恢复后迁移器看到版本已经是 v4，也不会重建索引。
+
+   修复要求：增加按 schema 版本维护的必需索引清单；v4 必须检查 `uq_instruments_dedupe` 存在且为唯一索引。补“删除索引后校验和恢复均拒绝”的测试。
+
+3. **P1：搜索合并仍会展示重复候选。**
+   先手工建立无交易所的 `VOO@`，再搜索 provider 的 `VOO@NYSE`，返回：
+
+   ```text
+   VOO@NYSE  origin=provider
+   VOO@      origin=local
+   ```
+
+   `instrument-catalog.js`（line 320）只按精确 `(symbol, exchange)` 合并，没有复用建立流程的安全退化匹配规则。
+
+   修复要求：同代码只有一条本地记录且一方缺交易所时合并为 `local+provider`；同代码存在多个市场时继续显式报告歧义。补无交易所合并和跨市场歧义两组检索测试。
+
+### 代码定位（复核给出的锚点）
+
+| 级别 | 位置 | 结论 |
+|---|---|---|
+| P1 | `server/repository.js` line 357–368 | 这里先过滤掉所有缺少 id 的标的，导致 `PUT /state` 或恢复载荷中的记录无错误地消失；后续还会把空白 symbol 写成空字符串。应先验证完整数组，遇到非法 id、symbol 或 currency 时整体拒绝并回滚。 |
+| P1 | `server/backup.js` line 164–166 | 校验目前只检查按版本要求的表。删除 `uq_instruments_dedupe` 后，`schemaVersion=4` 的数据库仍返回 ok；恢复时迁移器也不会重建已经标记为应用的 v4。应按版本验证必需索引及其唯一属性。 |
+| P1 | `server/instrument-catalog.js` line 320–329 | 搜索候选只按精确 `symbol@exchange` 合并，因此本地 `VOO@` 与 provider `VOO@NYSE` 会同时显示。应在唯一松散候选时安全合并；存在多个市场候选时返回或展示明确歧义，避免任选记录。 |

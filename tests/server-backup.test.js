@@ -366,3 +366,79 @@ test('P1-C 含换汇记录的备份可完整往返（创建 → 校验 → 恢�
     ctx.close();
   }
 });
+
+/* ---------- 第二轮复核反例（G4B-6）：必需索引也属于结构校验 ---------- */
+
+test('P1-D v4 库被删掉 uq_instruments_dedupe 后校验必须拒绝', async () => {
+  const ctx = setup('ledger-bak-idx-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+    assert.strictEqual(B.validateBackupFile(result.file).ok, true);
+
+    // 复核复现：DROP INDEX 后 schema_migrations 仍写着 v4，迁移器不会重建索引，
+    // 因此校验必须自己把关（不能只数表）。
+    assert.ok(M.LATEST_VERSION >= 4, '本用例前提：最新 schema 版本 ≥ 4');
+    const brokenFile = path.join(ctx.paths.backupDir, 'ledger-20260901-140000-noidx.db');
+    fs.copyFileSync(result.file, brokenFile);
+    const raw = new DatabaseSync(brokenFile);
+    raw.exec('DROP INDEX uq_instruments_dedupe');
+    raw.close();
+
+    const check = B.validateBackupFile(brokenFile);
+    assert.strictEqual(check.ok, false, '声称 v4 却丢掉去重唯一索引的库不得通过校验');
+    assert.ok(
+      String(check.reason).indexOf('uq_instruments_dedupe') >= 0,
+      '拒绝原因要点名缺失的索引：' + check.reason
+    );
+  } finally {
+    ctx.close();
+  }
+});
+
+test('P1-D 同名索引被换成非唯一索引同样拒绝（唯一性也是不变量）', async () => {
+  const ctx = setup('ledger-bak-idx2-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+
+    const swapped = path.join(ctx.paths.backupDir, 'ledger-20260901-150000-notuniq.db');
+    fs.copyFileSync(result.file, swapped);
+    const raw = new DatabaseSync(swapped);
+    raw.exec('DROP INDEX uq_instruments_dedupe');
+    // 名字一样、但不唯一：此时去重不变量已经名存实亡，不能再放行
+    raw.exec('CREATE INDEX uq_instruments_dedupe ON instruments(symbol)');
+    const info = dbm.indexInfo(raw, 'instruments', 'uq_instruments_dedupe');
+    assert.strictEqual(info.unique, false, '前提：这个索引确实是非唯一索引');
+    raw.close();
+
+    const check = B.validateBackupFile(swapped);
+    assert.strictEqual(check.ok, false, '非唯一索引不得冒充去重不变量');
+    assert.ok(String(check.reason).indexOf('不是唯一索引') >= 0, check.reason);
+
+    // 对照：正常备份仍然通过，且 dbm.indexInfo 能读出唯一属性
+    const okInfo = dbm.indexInfo(ctx.db, 'instruments', 'uq_instruments_dedupe');
+    assert.strictEqual(okInfo.unique, true);
+    assert.strictEqual(okInfo.table, 'instruments');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('P1-D 活库丢失去重索引时拒绝产出"看似合格"的备份，且不留残留文件', async () => {
+  const ctx = setup('ledger-bak-idx3-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    ctx.db.exec('DROP INDEX uq_instruments_dedupe');
+
+    await assert.rejects(
+      () => B.createBackup(ctx.db, ctx.paths, { reason: 'manual' }),
+      /备份校验失败/,
+      '不变量缺失的库不得产出备份'
+    );
+    const leftovers = fs.readdirSync(ctx.paths.backupDir).filter((n) => n.endsWith('.db'));
+    assert.deepStrictEqual(leftovers, [], '校验失败时不得留下可疑备份：' + leftovers.join(', '));
+  } finally {
+    ctx.close();
+  }
+});

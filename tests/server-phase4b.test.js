@@ -539,3 +539,98 @@ test('先手工建无交易所标的、后补交易所：HTTP 层 id 与 identit
   const state = await get(port, '/api/v1/state');
   assert.strictEqual(state.json.assets.instruments.length, 1, '补全交易所不得产生第二行事实');
 });
+
+/* ---------- 第二轮复核反例（G4B-5 / G4B-7）：全量写入校验与检索合并 ---------- */
+
+function emptyState() {
+  return {
+    accounts: [],
+    categories: [],
+    txns: [],
+    settings: {},
+    assets: {
+      schemaVersion: 1,
+      assetAccounts: [],
+      assetUnits: [],
+      assetTransfers: [],
+      liabilities: [],
+      entitlements: [],
+      instruments: [],
+      holdings: [],
+      quotes: [],
+      fxRates: []
+    }
+  };
+}
+
+test('/state 全量写入逐条校验：缺 id / 空白代码 / 非法币种一律稳定 4xx 且整体回滚', async (t) => {
+  const ctx = setup('ledger-p4b-stateval-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  // 基准状态（合法）
+  const seed = emptyState();
+  seed.assets.instruments = [
+    { id: 'inst-a', symbol: 'VOO', exchange: 'NYSE', currency: 'USD' },
+    { id: 'inst-b', symbol: '2800.HK', exchange: 'HKEX', currency: 'HKD' }
+  ];
+  const first = await request(port, 'PUT', '/api/v1/state', seed);
+  assert.strictEqual(first.status, 200);
+  const baseline = await get(port, '/api/v1/state');
+  assert.strictEqual(baseline.json.assets.instruments.length, 2);
+
+  // 复核反例原文：NO-ID 被静默丢弃、blank-symbol 的空白代码成功落库
+  const cases = [
+    ['缺 id 的标的被静默丢弃', { symbol: 'NO-ID', exchange: 'NYSE', currency: 'USD' }, 'invalid_id'],
+    ['空白代码被写成空字符串', { id: 'inst-blank', symbol: '     ', currency: 'USD' }, 'invalid_symbol'],
+    ['币种不在白名单内', { id: 'inst-badcur', symbol: 'BAD', exchange: 'NYSE', currency: 'XXX' }, 'invalid_currency'],
+    ['币种缺失', { id: 'inst-nocur', symbol: 'NOCUR', exchange: 'NYSE' }, 'invalid_currency']
+  ];
+  for (const [label, row, code] of cases) {
+    const payload = emptyState();
+    payload.assets.instruments = [seed.assets.instruments[0], row];
+    const res = await request(port, 'PUT', '/api/v1/state', payload);
+    assert.strictEqual(res.status, 400, label + ' 必须是可修正的 4xx，而不是静默成功/500');
+    assert.strictEqual(res.json.error.code, code, label);
+
+    // 原状态不变：两条都在，没有"少一行"也没有多出半行
+    const after = await get(port, '/api/v1/state');
+    assert.strictEqual(after.json.assets.instruments.length, 2, label + ' 被拒后状态必须原样保留');
+    assert.strictEqual(after.json.assets.instruments[1].symbol, '2800.HK', label);
+  }
+
+  // 合法写入照常成功（校验没有把正常路径堵住）
+  const ok = emptyState();
+  ok.assets.instruments = [{ id: 'inst-ok', symbol: 'VTI', exchange: 'NYSE', currency: 'USD' }];
+  const done = await request(port, 'PUT', '/api/v1/state', ok);
+  assert.strictEqual(done.status, 200);
+  const finalState = await get(port, '/api/v1/state');
+  assert.deepStrictEqual(
+    finalState.json.assets.instruments.map((r) => r.id),
+    ['inst-ok']
+  );
+});
+
+test('检索合并复用安全退化匹配：本地缺交易所的标的与参考数据合成一条候选', async (t) => {
+  const ctx = setup('ledger-p4b-merge-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  // 复核复现：手工建立无交易所的 VOO（本地 VOO@），再检索参考数据的 VOO@NYSE
+  const manual = await post(port, '/api/v1/instruments', { symbol: 'VOO', source: 'manual', currency: 'USD' });
+  assert.strictEqual(manual.status, 201);
+  assert.strictEqual(manual.json.item.exchange, null);
+
+  const res = await get(port, '/api/v1/instruments/search?q=VOO');
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.json.candidates.length, 1, '同一标的不得同时出现 provider 与 local 两条候选');
+  const cand = res.json.candidates[0];
+  assert.strictEqual(cand.symbol, 'VOO');
+  assert.strictEqual(cand.origin, 'local+provider');
+  assert.strictEqual(cand.exchange, 'NYSE');
+  assert.ok(cand.local && cand.local.id === manual.json.item.id, '候选要带出本地现有标的');
+  assert.deepStrictEqual(res.json.warnings, []);
+  assert.strictEqual(res.json.provider.status, 'ok');
+});

@@ -54,6 +54,27 @@ function tableExists(db, name) {
   return !!row;
 }
 
+// 索引信息：是否存在、属于哪张表、是否为唯一索引。
+// 备份校验不能只看"表齐不齐" —— 有些不变量是索引承载的（如 uq_instruments_dedupe）。
+// PRAGMA 不支持参数绑定，表名一律做标识符白名单过滤后再拼（本项目表名均为内置常量）。
+function indexInfo(db, table, name) {
+  if (!table || !name) return null;
+  const t = String(table).replace(/[^A-Za-z0-9_]/g, '');
+  const row = get(db, "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?", [name]);
+  if (!row) return null;
+  if (t && String(row.tbl_name) !== t) return null;
+  let unique = false;
+  try {
+    const list = all(db, 'PRAGMA index_list(' + t + ')');
+    const hit = list.filter((i) => i.name === name)[0];
+    unique = !!(hit && Number(hit.unique));
+  } catch (_) {
+    // 读不到索引属性时按"不唯一"处理：校验方宁可拒绝，也不放过不变量缺失的库
+    unique = false;
+  }
+  return { name: String(row.name), table: String(row.tbl_name), unique: unique };
+}
+
 function integrityCheck(db) {
   const row = get(db, 'PRAGMA integrity_check', []);
   return row ? Object.values(row)[0] : 'unknown';
@@ -80,6 +101,7 @@ module.exports = {
   get,
   run,
   tableExists,
+  indexInfo,
   integrityCheck,
   plain,
   closeQuietly

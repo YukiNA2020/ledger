@@ -52,12 +52,28 @@ const REQUIRED_TABLES_BY_VERSION = {
   3: ['asset_transfers']
 };
 
+// 必需**索引**随 schema 版本增长：有些不变量由索引承载，光看表齐不齐看不出来。
+// v4 把「同一 (symbol, exchange) 只有一行事实」变成数据库不变量（表达式唯一索引）——
+// 索引被手工删掉后，迁移器看到 v4 已应用不会重建，于是这个库会静默失去该不变量
+// （第二轮复核 G4B-6：DROP INDEX 后校验仍返回 ok）。
+const REQUIRED_INDEXES_BY_VERSION = {
+  4: [{ table: 'instruments', name: 'uq_instruments_dedupe', unique: true }]
+};
+
 function requiredTablesFor(version) {
   let tables = REQUIRED_TABLES_V1.slice();
   Object.keys(REQUIRED_TABLES_BY_VERSION).forEach((v) => {
     if (version >= Number(v)) tables = tables.concat(REQUIRED_TABLES_BY_VERSION[v]);
   });
   return tables;
+}
+
+function requiredIndexesFor(version) {
+  let list = [];
+  Object.keys(REQUIRED_INDEXES_BY_VERSION).forEach((v) => {
+    if (version >= Number(v)) list = list.concat(REQUIRED_INDEXES_BY_VERSION[v]);
+  });
+  return list;
 }
 
 // 当前程序（最新 schema 版本）要求的完整表集合：供迁移与备份测试断言「新库表齐备」
@@ -163,6 +179,16 @@ function validateBackupFile(file) {
     }
     const missing = requiredTablesFor(version).filter((t) => !dbm.tableExists(db, t));
     if (missing.length) return { ok: false, reason: '缺少必需表：' + missing.join(', ') };
+    // 表齐了还不够：按同一版本校验承载不变量的必需索引（存在 + 唯一属性）
+    for (const spec of requiredIndexesFor(version)) {
+      const info = dbm.indexInfo(db, spec.table, spec.name);
+      if (!info) {
+        return { ok: false, reason: '缺少必需索引：' + spec.name + '（表 ' + spec.table + '）' };
+      }
+      if (spec.unique && !info.unique) {
+        return { ok: false, reason: '必需索引不是唯一索引：' + spec.name };
+      }
+    }
     return { ok: true, schemaVersion: version };
   } catch (err) {
     return { ok: false, reason: '无法作为数据库打开：' + (err && err.message ? err.message : String(err)) };
@@ -416,6 +442,8 @@ async function restoreBackup(db, paths, backupPath, options) {
 module.exports = {
   REQUIRED_TABLES,
   REQUIRED_TABLES_V1,
+  REQUIRED_INDEXES_BY_VERSION,
+  requiredIndexesFor,
   requiredTablesFor,
   LAST_BACKUP_META,
   backupFileName,

@@ -7,7 +7,7 @@
 
 本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
 
-截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）与 Phase 4B（标的目录与分类确认）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块）；2026-09-16 完成独立复核补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`。**尚无**持仓账本与证券事件（4C）、自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
+截至 2026-09-16，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）与 Phase 4B（标的目录与分类确认）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块）；同日完成独立复核**两轮**补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`、全量写入逐条校验（非法记录整体拒绝而非静默丢行）、备份结构校验按版本覆盖必需索引（D-040）、检索合并与建立路径共用同一套退化匹配。**尚无**持仓账本与证券事件（4C）、自动行情与汇率抓取（4D）、下钻归因（4E），也没有风险问卷与决策状态机。
 
 ## 1. 架构原则
 
@@ -127,6 +127,8 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 
 - `id` **只能由服务端派生**：新建时按「首次创建时的 identity key」（`symbol@exchange`，大写与空白归一；交易所缺失则为 `symbol@`）派生 `inst-<sha1(identityKey) 前16位>` 一次，**此后永久不变** —— 补全交易所也不重算。`identity_key`（含 `source` / `country` / `exchange_timezone` / provider 候选与 provenance / 冲突提示）随记录存 `extra_json`，读回零丢失；外部用它离线复算 id。建立载荷里客户端指定的 `id` 一律拒绝（`client_id_forbidden`）；`PUT /state` 与备份恢复通道原样还原既有 id（历史快照带旧形状 id，强制派生会破坏备份往返保真），该通道的强约束是去重键。
 - 去重键 `(symbol, exchange)` 是**全路径**不变量：目录接口、单条 upsert、全量 `PUT /state` 都显式拒绝同键第二行（`duplicate_instrument` → 409 + 事务回滚，从不静默删行或丢行）；迁移 **v4** 的表达式唯一索引 `uq_instruments_dedupe` 在数据库层兜底（迁移遇到历史重复数据显式失败）。交易所缺失时的退化匹配**只在唯一命中时生效**，同代码跨市场存在多行时报 `ambiguous_instrument`（409）要求用户指明交易所，不按行顺序静默合并。
+- 全量写入**逐条校验**（第二轮复核 G4B-5）：`repository.writeInstruments` 先逐条验证并归一（id 必填且形状合法、`symbol` 去空白后必须符合公开证券代码形状、`currency` 必填且在白名单内、记录必须是对象），再校验去重键，任一条不合格即抛错并由 `writeState` 的事务整体回滚 —— 不允许"过滤掉非法行"式的静默丢数据（缺 id 的行会无声消失、空白代码会变形落库）。领域错误码统一映射为 **400**。
+- 检索合并与建立路径**共用同一套本地匹配规则**（第二轮复核 G4B-7，`instrument-catalog.matchLocalRecord` ↔ `repository.findInstrumentByKey`）：精确命中 → 同代码且一方缺交易所时唯一命中可安全合并 → 多命中报 `ambiguous_instrument` 且不合并。合并只补空的展示字段，**不进入 `suggestions`**（预分类依据必须仍指向 provider），检索保持只读、不改写本地事实。
 
 ### 5.3 结账与决策
 
@@ -287,7 +289,7 @@ Phase 1 可以直接开始，前提是旧 99 项测试持续通过。Phase 2 在
 - **不要用 `node:sqlite` 的在线 `backup()`**：实测在同一进程内第 1–2 次调用约 1ms，之后每次约 8 秒，且在本机测试运行器下会直接挂死。生产进程虽然每次写事务最多调用一次，但长期运行后每次保存都会出现秒级卡顿，不可接受。
 - **改用 SQLite 自身的 `VACUUM INTO`**：同步、结果确定、产物自包含（不带 `-wal/-shm`），实测稳定 0–1ms，且读的是含 WAL 未落盘内容的一致性视图。
 - **一致性前提**：单实例锁保证同一时刻只有一个写进程，且 `createBackup` 只在写事务之外调用（§9），因此快照期间不存在并发写入。若将来放开多写进程，必须重新评估该前提。
-- 校验（`integrity_check` + 必需表齐备 + schema 版本不高于已知版本）必须无副作用：只清理"本次打开新产生"的同伴文件，绝不删除调用前就存在的活跃库 `-wal`。
+- 校验（`integrity_check` + 必需表齐备 + **该 schema 版本的必需索引存在且唯一** + schema 版本不高于已知版本）必须无副作用：只清理"本次打开新产生"的同伴文件，绝不删除调用前就存在的活跃库 `-wal`。索引级不变量是必需的 —— 迁移器只在"版本未应用"时执行，索引被手工删掉后 `schema_migrations` 仍写着该版本，恢复时不会重建（D-040）。
 
 ### 13.3 事实源切换的落地方式（§9 的具体化）
 

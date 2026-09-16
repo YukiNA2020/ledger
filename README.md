@@ -9,7 +9,7 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 - **v3 Phase 2「本地服务与 SQLite」已完成并验收（2026-09-14，`v2.2.1-phase2`）**：只监听 `127.0.0.1` 的本地服务与 `/api/v1`、SQLite 事实源（迁移器 + repository）、本地版本备份与恢复（每日 ≥1 份、保留 30 份、覆盖前强制备份）、macOS 登录启动脚本、Keychain 适配器、前端存储门面 `js/store.js`。补充验收发现的三个阻塞缺陷（SW 旧令牌、保存失败误报成功、恢复前无备份）已修复。
 - **v3 Phase 3「账户、负债与月度结账」已完成并验收（2026-09-15，`v2.3.2-phase3`）**：机构—账户—币种子账户、换汇资产转移、负债与保障权益、青岛福利预设、手动汇率、月结快照与历史金额下钻、应急金覆盖均已落地。测试基线 `node --test` 230/230、浏览器 wiring 15/15。
 - **v3 Phase 4A「数据源决策与适配器契约」契约实现完成、正式验收暂不通过（2026-09-16）**：provider adapter 契约、固定时钟、离线 fixture 与数据源证据档均已落地；T-002 仅汇率源已定为 Frankfurter ECB 固定端点，行情端点仍待 4D 开始前通过 D-038 门禁后决定。门禁通过前自动行情关闭、使用手动补价。
-- **v3 Phase 4B「标的目录与分类确认」复核补口完成，等待独立复核确认（2026-09-16，`v2.3.6-phase4b`）**：标的检索与服务端编排（`server/instrument-catalog.js`）、候选与元数据缓存（离线 fixture `CATALOG` + D-037 的 provenance）、资产类别/市场/币种预分类、用户确认与本地锁定（`confirmed` 不被外部刷新覆盖，只作带 provenance 的冲突提示）、资产页「标的目录」区块与确认弹层。独立复核曾判定 4B 暂不通过（标的身份可被客户端指定、全量 `/state` 可绕过去重、跨市场同代码被静默合并），三项均已修复：**id 只能由服务端按首次创建时的 identity key 派生并永久锁定**（客户端指定的 `id` → 400 `client_id_forbidden`；记录持久化 `identityKey` 供离线复算）、**去重键在所有写入路径上强制**（`PUT /state` 重复 → 409 且事务回滚）+ 迁移 v4 唯一索引 `uq_instruments_dedupe` 兜底、**缺交易所时同代码跨市场报 409 `ambiguous_instrument`** 要求指明交易所。本阶段**不创建持仓**：`portfolio-openings` / `security-events` / `market-data/refresh` 仍返回 `501`。测试基线 `node --test` 357/357、浏览器 wiring 16/16；原始复核结论与逐条修复状态见 [PHASE4B_ACCEPTANCE_GAPS.md](./PHASE4B_ACCEPTANCE_GAPS.md)。
+- **v3 Phase 4B「标的目录与分类确认」两轮复核补口完成，等待独立复核确认（2026-09-16，`v2.3.7-phase4b`）**：标的检索与服务端编排（`server/instrument-catalog.js`）、候选与元数据缓存（离线 fixture `CATALOG` + D-037 的 provenance）、资产类别/市场/币种预分类、用户确认与本地锁定（`confirmed` 不被外部刷新覆盖，只作带 provenance 的冲突提示）、资产页「标的目录」区块与确认弹层。独立复核两轮判定 4B 暂不通过，六项问题均已修复：**id 只能由服务端按首次创建时的 identity key 派生并永久锁定**（客户端指定的 `id` → 400 `client_id_forbidden`；记录持久化 `identityKey` 供离线复算）、**去重键在所有写入路径上强制**（`PUT /state` 重复 → 409 且事务回滚）+ 迁移 v4 唯一索引 `uq_instruments_dedupe` 兜底、**缺交易所时同代码跨市场报 409 `ambiguous_instrument`** 要求指明交易所、**全量写入逐条校验**（缺 id / 空白代码 / 非法币种一律 400 且整体回滚，不静默丢行）、**备份结构校验按版本覆盖必需索引**（删掉去重唯一索引即拒绝校验与恢复，见 D-040）、**检索合并与建立路径共用同一套退化匹配**（缺交易所的本地标的与参考数据合成一条候选，多市场报歧义）。本阶段**不创建持仓**：`portfolio-openings` / `security-events` / `market-data/refresh` 仍返回 `501`。测试基线 `node --test` 367/367、浏览器 wiring 17/17；原始复核结论与逐条修复状态见 [PHASE4B_ACCEPTANCE_GAPS.md](./PHASE4B_ACCEPTANCE_GAPS.md)。
 - SQLite 已是唯一事实源；IndexedDB 不再承担 v3 事实源，服务不可达时前端进入只读降级，不做双写。
 - 本轮不从零重写：复用 `js/core.js` 中已经验证的解析、统计和账务口径。
 - 本仓库中的 v3 文档是交给后续执行 Agent 的唯一实施依据；下一阶段入口见 [NEXT_AGENT.md](./NEXT_AGENT.md)。
@@ -82,7 +82,7 @@ node server/main.js --no-open           # 不自动打开浏览器
 
 ```bash
 cd ledger
-node --test          # 357 项（2026-09-16 基线）
+node --test          # 367 项（2026-09-16 基线）
 
 # 浏览器接线验收必须先由本地服务托管，并使用临时数据目录：
 node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
@@ -93,4 +93,4 @@ node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
 
 ## 下一步
 
-Phase 4B「标的目录与分类确认」复核补口完成（`v2.3.6-phase4b`，基线 357/357 + wiring 16/16），等待独立复核确认：复核提出的 3 项阻塞问题（标的身份、去重边界、跨市场歧义）已修复并补真实 HTTP 反例，原始结论与逐条修复状态见 [PHASE4B_ACCEPTANCE_GAPS.md](./PHASE4B_ACCEPTANCE_GAPS.md)。**Phase 4A 的正式验收仍为待定**：契约代码与回归测试已完成，但 T-002 行情源尚未决定，原始结论与修复状态见 [PHASE4A_ACCEPTANCE_GAPS.md](./PHASE4A_ACCEPTANCE_GAPS.md)。按 [ROADMAP.md](./ROADMAP.md) 的明确例外，4C 不依赖真实行情，可在保留该缺口的前提下推进；进入 4D 前必须先完成行情源决策（D-038 门禁）。下一位执行 Agent 只实施 Phase 4C「持仓账本与证券事件」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)。
+Phase 4B「标的目录与分类确认」两轮复核补口完成（`v2.3.7-phase4b`，基线 367/367 + wiring 17/17），等待独立复核确认：两轮复核共提出的 6 项问题（标的身份、去重边界、跨市场歧义、全量写入校验、备份不变量覆盖、检索合并）已全部修复并补齐真实 HTTP / 真实 UI 反例，原始结论与逐条修复状态见 [PHASE4B_ACCEPTANCE_GAPS.md](./PHASE4B_ACCEPTANCE_GAPS.md)。**Phase 4A 的正式验收仍为待定**：契约代码与回归测试已完成，但 T-002 行情源尚未决定，原始结论与修复状态见 [PHASE4A_ACCEPTANCE_GAPS.md](./PHASE4A_ACCEPTANCE_GAPS.md)。按 [ROADMAP.md](./ROADMAP.md) 的明确例外，4C 不依赖真实行情，可在保留该缺口的前提下推进；进入 4D 前必须先完成行情源决策（D-038 门禁）。下一位执行 Agent 只实施 Phase 4C「持仓账本与证券事件」，入口与边界见 [NEXT_AGENT.md](./NEXT_AGENT.md)。

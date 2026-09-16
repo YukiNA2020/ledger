@@ -232,3 +232,38 @@ test('恢复前备份本身也是合法备份（可作为下一次恢复的源�
     ctx.close();
   }
 });
+
+test('P1-D 候选备份缺 v4 去重索引：拒绝恢复，当前库与备份目录都不受影响', async () => {
+  const ctx = setup('ledger-rst-idx-');
+  try {
+    // 当前库 = 版本二（可观察的既有状态）
+    R.writeState(ctx.db, versionTwo());
+    const before = R.readState(ctx.db);
+
+    // 造一个"迁移记录写着 v4、但去重唯一索引被删掉"的候选备份
+    const candidate = makeStandaloneBackup(
+      path.join(ctx.paths.backupDir, 'ledger-20260901-200000-noidx.db'),
+      loadFixtureState()
+    );
+    const raw = new DatabaseSync(candidate);
+    raw.exec('DROP INDEX uq_instruments_dedupe');
+    raw.close();
+    assert.strictEqual(B.validateBackupFile(candidate).ok, false, '前提：该候选备份已不合格');
+
+    const result = ctx.adopt(await B.restoreBackup(ctx.db, ctx.paths, candidate));
+    assert.strictEqual(result.ok, false, '缺索引的候选备份必须拒绝恢复');
+    assert.ok(
+      String(result.reason).indexOf('uq_instruments_dedupe') >= 0,
+      '拒绝原因要点名缺失的索引：' + result.reason
+    );
+
+    // 当前库原样保留（校验在切换之前失败，连"恢复前备份"都不该产生）
+    assert.deepStrictEqual(R.readState(ctx.db), before);
+    const names = fs.readdirSync(ctx.paths.backupDir).sort();
+    assert.deepStrictEqual(names, ['ledger-20260901-200000-noidx.db'], '被拒的恢复不得产生任何副作用文件');
+    const leftovers = fs.readdirSync(ctx.paths.backupDir).filter((n) => /\.restore-tmp$|\.replaced$/.test(n));
+    assert.deepStrictEqual(leftovers, [], '不得残留临时/替换文件');
+  } finally {
+    ctx.close();
+  }
+});

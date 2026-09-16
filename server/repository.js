@@ -37,6 +37,11 @@ const NUM = (v) => {
 };
 const BOOL = (v) => (v ? 1 : 0);
 
+// 标的 id / 代码的形状（与目录接口同一口径）。全量写入路径也必须满足 ——
+// 只靠"过滤掉不合法行"会让非法数据悄悄消失或变形（第二轮复核 G4B-5）。
+const INSTRUMENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const INSTRUMENT_SYMBOL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+
 function extraJson(obj, known) {
   const extra = {};
   Object.keys(obj || {}).forEach((k) => {
@@ -351,40 +356,71 @@ function readEntitlements(db) {
 
 // 全量写入（PUT /state、JSON 恢复、备份还原）必须与目录接口遵守同一条不变量：
 // 同一 (symbol, exchange) 只允许一行事实。
-// **整体拒绝**而不是静默丢行：静默丢弃会让用户以为数据已经存下了（S4B.1「同一标的不重复创建事实」）。
+//
+// **整体拒绝**而不是静默丢行（第二轮复核 G4B-5）：早期实现用 `.filter((i) => i && i.id)` 把没有 id
+// 的记录悄悄扔掉、把空白代码写成空字符串 —— 用户看不到任何错误，却少了数据。现在写入前逐条验证
+// id / symbol / currency，任一条不合格就抛错，由外层事务整体回滚（writeState 全程在一个事务内）。
 // 数据库侧另有 uq_instruments_dedupe 唯一索引兜底（迁移 v4）。
 function writeInstruments(db, list) {
-  const rows = (list || []).filter((i) => i && i.id);
-  const byKey = {};
+  const rows = Array.isArray(list) ? list : [];
   const byId = {};
-  rows.forEach((i) => {
-    const id = String(i.id);
+  const byKey = {};
+
+  // 第一遍：逐条验证并归一（不合格立即抛错 → 整体回滚，绝不静默丢行）
+  const normalized = rows.map((i, idx) => {
+    const at = '第 ' + (idx + 1) + ' 条';
+    if (!i || typeof i !== 'object' || Array.isArray(i)) {
+      throw Object.assign(new Error('标的记录必须是对象（' + at + '）'), { code: 'invalid_instrument' });
+    }
+    const id = i.id == null ? '' : String(i.id).trim();
+    if (!id) throw Object.assign(new Error('标的缺少 id（' + at + '）'), { code: 'invalid_id' });
+    if (!INSTRUMENT_ID_RE.test(id)) {
+      throw Object.assign(new Error('标的 id 不合法（' + at + '）'), { code: 'invalid_id' });
+    }
     if (byId[id]) {
       throw Object.assign(new Error('标的 id 重复写入：' + id), { code: 'duplicate_instrument' });
     }
     byId[id] = true;
-    // 与领域口径一致：symbol / exchange 去空白后大写，exchange 缺失按空串参与去重
-    const key = Domain.instrumentKey(i.symbol, i.exchange);
-    if (!key) return;
+
+    const symbol = i.symbol == null ? '' : String(i.symbol).trim();
+    if (!INSTRUMENT_SYMBOL_RE.test(symbol)) {
+      throw Object.assign(new Error('标的代码不合法（' + at + '）：需为公开证券代码形状'), {
+        code: 'invalid_symbol'
+      });
+    }
+
+    // 币种是估值必需字段：缺失或不在白名单一律拒绝，不用"默认 CNY"蒙过去
+    const currency = i.currency == null ? '' : String(i.currency).trim();
+    if (Domain.CURRENCIES.indexOf(currency) === -1) {
+      throw Object.assign(new Error('标的币种必须是 CNY/HKD/USD（' + at + '）'), { code: 'invalid_currency' });
+    }
+
+    return { raw: i, id: id, symbol: symbol, currency: currency };
+  });
+
+  // 第二遍：去重键（与领域口径一致：symbol / exchange 去空白后大写，缺交易所按空串参与）
+  normalized.forEach((n) => {
+    const key = Domain.instrumentKey(n.symbol, n.raw.exchange);
     if (byKey[key]) {
       throw Object.assign(
-        new Error('同一标的重复写入：' + key + '（' + byKey[key] + ' 与 ' + id + '）'),
+        new Error('同一标的重复写入：' + key + '（' + byKey[key] + ' 与 ' + n.id + '）'),
         { code: 'duplicate_instrument' }
       );
     }
-    byKey[key] = id;
+    byKey[key] = n.id;
   });
 
   const st = db.prepare(
     `INSERT INTO instruments (id, symbol, exchange, currency, name, instrument_type, asset_class, exposure_market, classification_status, extra_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  rows.forEach((i) => {
+  normalized.forEach((n) => {
+    const i = n.raw;
     st.run(
-      String(i.id),
-      STR(i.symbol) || '',
+      n.id,
+      n.symbol,
       STR(i.exchange),
-      STR(i.currency) || 'CNY',
+      n.currency,
       STR(i.name),
       STR(i.instrumentType),
       STR(i.assetClass),
@@ -489,9 +525,12 @@ function upsertInstrument(db, item, options) {
   const opts = options || {};
   if (!item || !item.id) throw Object.assign(new Error('缺少标的 id'), { code: 'invalid_id' });
   const id = String(item.id);
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw Object.assign(new Error('标的 id 不合法'), { code: 'invalid_id' });
+  if (!INSTRUMENT_ID_RE.test(id)) throw Object.assign(new Error('标的 id 不合法'), { code: 'invalid_id' });
   const symbol = STR(item.symbol || '').trim();
   if (!symbol) throw Object.assign(new Error('标的代码不能为空'), { code: 'invalid_symbol' });
+  if (!INSTRUMENT_SYMBOL_RE.test(symbol)) {
+    throw Object.assign(new Error('标的代码不合法：需为公开证券代码形状'), { code: 'invalid_symbol' });
+  }
   const currency = STR(item.currency);
   if (Domain.CURRENCIES.indexOf(currency) === -1) {
     throw Object.assign(new Error('标的币种必须是 CNY/HKD/USD'), { code: 'invalid_currency' });

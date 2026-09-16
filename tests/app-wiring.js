@@ -732,6 +732,54 @@
       equal(kept[0].trackingIndex, 'S&P 500', '刷新不得覆盖用户填写的跟踪指数');
     });
 
+    // 第二轮复核 G4B-7：本地缺交易所的标的 + 参考数据有交易所 → 界面上只能有一条候选
+    await check('标的目录：缺交易所的本地标的与参考数据合成一条候选（不重复展示）', async function () {
+      // 上一项结束时可能仍停在资产录入页（也可能已回到决策台），两种入口都要能进目录区块
+      if (!document.querySelector('#inst-q')) {
+        clickAction('#view [data-action="nav:assets"]');
+      }
+      await waitFor(function () { return document.querySelector('#inst-q'); }, 8000, '标的目录区块');
+
+      // 手工建立一个没有交易所的标的（用户手上只有代码）
+      clickAction('[data-action="inst:manual"]');
+      await waitFor(function () { return document.querySelector('#im-symbol'); }, 5000, '手工建立弹层');
+      document.querySelector('#im-symbol').value = '2800.HK';
+      document.querySelector('#im-currency').value = 'HKD';
+      document.querySelector('#im-exchange').value = '';
+      clickAction('[data-action="inst:saveManual"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.instruments || []).some(function (r) { return r.symbol === '2800.HK'; });
+      }, 8000, '手工标的写入事实源');
+
+      var manual = (await apiState()).assets.instruments.filter(function (r) { return r.symbol === '2800.HK'; });
+      equal(manual.length, 1, '手工建立后目录里应恰好一条 2800.HK');
+      equal(manual[0].exchange, undefined, '未填交易所时不得凭空补一个');
+      var manualId = manual[0].id;
+
+      // 检索：参考数据有 2800.HK@HKEX，本地是 2800.HK@（缺交易所）→ 必须合成一条候选
+      document.querySelector('#inst-q').value = '2800';
+      clickAction('[data-action="inst:search"]');
+      await waitFor(function () { return document.querySelector('#inst-q'); }, 5000, '检索完成');
+      await waitFor(function () {
+        var card = document.querySelector('#inst-q').closest('.card');
+        return card && card.querySelectorAll('.acc-card').length > 0;
+      }, 8000, '候选渲染');
+
+      var searchCard = document.querySelector('#inst-q').closest('.card');
+      var cards = searchCard.querySelectorAll('.acc-card');
+      equal(cards.length, 1, '同一标的只能有一条候选（本地 2800.HK@ 与参考数据 2800.HK@HKEX 不得各占一条）');
+      // 已被本地认领的候选不再提供"加入目录"按钮（重复加入的入口必须消失）
+      equal(cards[0].querySelectorAll('[data-action="inst:add"]').length, 0,
+        '本地已有的候选不得再显示"加入目录"');
+
+      // 事实源不变：本地记录仍是缺交易所那一条，检索只读、不得补写交易所
+      var after = (await apiState()).assets.instruments.filter(function (r) { return r.symbol === '2800.HK'; });
+      equal(after.length, 1, '检索不得新增第二行事实');
+      equal(after[0].id, manualId, '检索不得改动本地标的身份');
+      equal(after[0].exchange, undefined, '检索是只读的：不得把参考数据的交易所写进本地事实');
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();

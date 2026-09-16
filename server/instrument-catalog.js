@@ -236,6 +236,70 @@ function mergeCandidate(local, fields) {
 
 /* ------------------------------ 检索 ------------------------------ */
 
+function normSymbol(v) {
+  return String(v == null ? '' : v).trim().toUpperCase();
+}
+
+// 检索合并时的本地匹配：与建立流程（repository.findInstrumentByKey）**同一套规则**，
+// 否则会出现"本地 `VOO@`（缺交易所）与参考数据 `VOO@NYSE` 各显示一条"的重复候选
+// （第二轮复核 G4B-7）。
+//   ① 精确 (symbol, exchange) 命中；
+//   ② 同代码且一方缺交易所：本地只有一条时安全合并（"先手工建标、后由参考数据补全交易所"的常态）；
+//   ③ 同代码存在多个市场：报歧义，**绝不按行顺序任选一条**（那会把跨市场标的算成同一个）。
+// 返回 { record } / { record: null } / { ambiguous: [records] }。
+function matchLocalRecord(locals, symbol, exchange) {
+  const want = Domain.instrumentKey(symbol, exchange);
+  if (want) {
+    const exact = locals.filter((r) => Domain.instrumentKey(r.symbol, r.exchange) === want);
+    if (exact.length) return { record: exact[0] };
+  }
+  const sym = normSymbol(symbol);
+  if (!sym) return { record: null };
+  const loose = locals.filter((r) => normSymbol(r.symbol) === sym && (!r.exchange || !exchange));
+  if (loose.length === 1) return { record: loose[0] };
+  if (loose.length > 1) return { ambiguous: loose };
+  return { record: null };
+}
+
+// 候选里的本地对照（含已确认分类与冲突），供前端显示"已在目录中"。
+function localRefOf(rec) {
+  return {
+    id: rec.id,
+    symbol: rec.symbol,
+    exchange: rec.exchange == null ? null : rec.exchange,
+    classificationStatus: rec.classificationStatus,
+    assetClass: rec.assetClass == null ? null : rec.assetClass,
+    exposureMarket: rec.exposureMarket == null ? null : rec.exposureMarket,
+    name: rec.name == null ? null : rec.name,
+    currency: rec.currency,
+    conflicts: conflictsFor(rec)
+  };
+}
+
+// 候选缺的展示字段用本地记录补齐（**只补空、不覆盖**）。
+// 只改展示值，不动 suggestions —— 预分类建议必须只反映参考数据真有的值，
+// 本地值不能冒充 provider 依据（D-037）。
+function fillDisplayFromLocal(cand, rec) {
+  ['name', 'currency', 'exchange', 'country', 'instrumentType', 'exchangeTimezone'].forEach((f) => {
+    if ((cand[f] == null || cand[f] === '') && rec[f] != null && rec[f] !== '') cand[f] = rec[f];
+  });
+  return cand;
+}
+
+function ambiguityWarning(symbol, records, detail, providerId) {
+  return {
+    symbol: symbol,
+    code: 'ambiguous_instrument',
+    detail:
+      detail +
+      '（本地：' +
+      records.map((r) => (r.exchange ? String(r.exchange) : '未注明交易所')).join(' / ') +
+      '）',
+    retryable: false,
+    provider: providerId || null
+  };
+}
+
 function localMatches(db, query) {
   const needle = String(query || '').toLowerCase();
   if (!needle) return [];
@@ -313,9 +377,13 @@ function searchCatalog(db, provider, query, ctx) {
       });
     }
 
-    // 合并：同一去重键只出现一条候选；本地已有的附上本地记录（含已确认分类与冲突）。
+    // 合并：同一标的只出现一条候选；本地已有的附上本地记录（含已确认分类与冲突）。
+    // 匹配走 matchLocalRecord（与建立路径同一套规则），因此"本地缺交易所 + 参考数据有交易所"
+    // 会合成一条 local+provider，而不是两条重复候选。
     const merged = [];
     const byKey = {};
+    const consumed = {}; // 本地 id → 已被某条候选认领（避免同一条本地记录出现两次）
+    const claimedBy = {}; // 本地 id → 认领它的候选去重键（用于识别"同一本地记录被两个市场认领"）
     function push(candidate) {
       const key = Domain.instrumentKey(candidate.symbol, candidate.exchange);
       if (byKey[key]) {
@@ -327,6 +395,15 @@ function searchCatalog(db, provider, query, ctx) {
       }
       byKey[key] = candidate;
       merged.push(candidate);
+    }
+
+    function attachLocal(candidate, rec, key) {
+      candidate.local = localRefOf(rec);
+      candidate.origin = 'local+provider';
+      fillDisplayFromLocal(candidate, rec);
+      consumed[rec.id] = true;
+      claimedBy[rec.id] = key;
+      return candidate;
     }
 
     providerCandidates.forEach((r) => {
@@ -345,24 +422,45 @@ function searchCatalog(db, provider, query, ctx) {
       );
       cand.origin = 'provider';
       cand.local = null;
+      const key = Domain.instrumentKey(r.symbol, r.exchange);
+      const m = matchLocalRecord(locals, r.symbol, r.exchange);
+      if (m.ambiguous) {
+        // 检索是只读的：不能像建立流程那样拒绝，但必须**显式报告歧义**并保持两条事实分离，
+        // 绝不按行顺序把候选并到其中一条本地记录上。
+        warnings.push(
+          ambiguityWarning(r.symbol, m.ambiguous, '本地目录中该代码有多个交易所的记录，本次未与其中任何一条合并', providerId)
+        );
+      } else if (m.record) {
+        if (claimedBy[m.record.id] && claimedBy[m.record.id] !== key) {
+          // 同一条本地记录（缺交易所）被两个市场的候选同时认领：无法判断它属于哪一个，报歧义。
+          warnings.push(
+            ambiguityWarning(
+              r.symbol,
+              [m.record],
+              '本地只有一条未注明交易所的记录，参考数据同时返回了多个市场，无法判断它属于哪一个，本次未合并',
+              providerId
+            )
+          );
+        } else {
+          attachLocal(cand, m.record, key);
+        }
+      }
       push(cand);
     });
 
     locals.forEach((rec) => {
+      if (consumed[rec.id]) return;
       const key = Domain.instrumentKey(rec.symbol, rec.exchange);
-      const existing = byKey[key];
-      const localRef = {
-        id: rec.id,
-        classificationStatus: rec.classificationStatus,
-        assetClass: rec.assetClass == null ? null : rec.assetClass,
-        exposureMarket: rec.exposureMarket == null ? null : rec.exposureMarket,
-        name: rec.name == null ? null : rec.name,
-        currency: rec.currency,
-        conflicts: conflictsFor(rec)
-      };
-      if (existing) {
-        existing.local = localRef;
-        existing.origin = 'local+provider';
+      const localRef = localRefOf(rec);
+      // 兜底：同一去重键已有候选（例如 provider 也在精确键上命中过）时，只补上本地对照。
+      if (byKey[key]) {
+        const prev = byKey[key];
+        if (!prev.local) {
+          prev.local = localRef;
+          prev.origin = 'local+provider';
+          fillDisplayFromLocal(prev, rec);
+        }
+        consumed[rec.id] = true;
         return;
       }
       const cand = buildCandidate(
@@ -380,6 +478,7 @@ function searchCatalog(db, provider, query, ctx) {
       );
       cand.origin = 'local';
       cand.local = localRef;
+      consumed[rec.id] = true;
       push(cand);
     });
 

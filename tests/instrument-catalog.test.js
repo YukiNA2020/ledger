@@ -830,3 +830,205 @@ function assertCrossExchangesCoexist(ctx) {
   const rows = R.readInstrumentRecords(ctx.db).filter((r) => r.symbol === 'CROSS');
   assert.strictEqual(rows.length, 2, '同一代码的不同交易所必须能共存');
 }
+
+/* ============ 第二轮复核反例：检索合并的退化匹配与歧义（G4B-7） ============ */
+
+const PROV = {
+  provider: 'stub',
+  endpoint: '/symbol_search',
+  sourceVersion: 'stub-v1',
+  sourceRef: 'CROSS@NYSE@ARCX',
+  fetchedAt: NOW,
+  payloadHash: 'b'.repeat(64)
+};
+
+// 固定返回给定候选列表的 provider（用于构造 fixture 没有的跨市场/缺交易所场景）
+function stubCatalogProvider(list) {
+  return {
+    PROVIDER_ID: 'stub',
+    searchInstrument() {
+      return Promise.resolve(list);
+    },
+    getInstrumentMetadata() {
+      return Promise.resolve(
+        Contract.errorResult({ subject: null, code: Contract.ERRORS.NOT_FOUND, detail: '未收录该代码' })
+      );
+    }
+  };
+}
+
+test('检索合并：本地缺交易所 + 参考数据有交易所 → 合成一条候选，不再重复展示', async () => {
+  const ctx = setup('ledger-4b-merge-loose-');
+  try {
+    // 复核复现：先手工建立无交易所的 VOO（用户手上只有代码、provider 也未覆盖）
+    const manual = await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'VOO', source: 'manual', currency: 'USD' },
+      CTX
+    );
+    assert.strictEqual(manual.ok, true, JSON.stringify(manual));
+    assert.strictEqual(manual.item.exchange, null);
+
+    const res = await Catalog.searchCatalog(ctx.db, Fixture, 'VOO', CTX);
+    assert.strictEqual(res.candidates.length, 1, '同一标的不得出现两条候选（本地 VOO@ 与 VOO@NYSE）');
+    const c = res.candidates[0];
+    assert.strictEqual(c.origin, 'local+provider');
+    assert.strictEqual(c.symbol, 'VOO');
+    assert.strictEqual(c.exchange, 'NYSE', '参考数据给出的交易所用于展示');
+    assert.ok(c.local && c.local.id === manual.item.id, '候选要带出本地记录');
+    assert.strictEqual(c.local.exchange, null, '本地记录本身没变（仍是未注明交易所）');
+    assert.deepStrictEqual(res.warnings, [], '唯一松散候选不是歧义，不应报警告');
+    // 预分类建议仍然只来自参考数据：合并展示不得把本地值冒充成 provider 依据
+    assert.ok(
+      c.suggestions.every((s) => String(s.basis).indexOf('provider.') === 0),
+      '建议依据必须仍指向 provider：' + JSON.stringify(c.suggestions)
+    );
+  } finally {
+    ctx.close();
+  }
+});
+
+test('检索歧义：同代码本地有多个市场 + 参考数据未给交易所 → 报歧义且不合并', async () => {
+  const ctx = setup('ledger-4b-merge-ambig-');
+  try {
+    await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'CROSS', source: 'manual', currency: 'USD', exchange: 'NYSE' },
+      CTX
+    );
+    await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'CROSS', source: 'manual', currency: 'HKD', exchange: 'HKEX' },
+      CTX
+    );
+
+    // 参考数据返回"这个代码存在、但没给交易所"的候选
+    const provider = stubCatalogProvider([
+      Contract.instrumentResult({
+        symbol: 'CROSS',
+        currency: 'USD',
+        exchange: null,
+        name: 'Cross Listed Co',
+        instrumentType: 'Common Stock',
+        country: 'US',
+        provenance: PROV
+      })
+    ]);
+    const res = await Catalog.searchCatalog(ctx.db, provider, 'CROSS', CTX);
+    assert.strictEqual(res.ok, true);
+
+    const providerCand = res.candidates.filter((c) => c.origin === 'provider');
+    assert.strictEqual(providerCand.length, 1, '歧义时不得把候选并到任意一条本地记录上');
+    assert.strictEqual(providerCand[0].local, null, '未合并：候选不带本地对照');
+
+    const warn = res.warnings.filter((w) => w.code === 'ambiguous_instrument');
+    assert.strictEqual(warn.length, 1, '必须显式报告歧义：' + JSON.stringify(res.warnings));
+    assert.strictEqual(warn[0].symbol, 'CROSS');
+    assert.ok(warn[0].detail.indexOf('NYSE') !== -1 && warn[0].detail.indexOf('HKEX') !== -1, warn[0].detail);
+    // 两条本地事实都还在，没有被"任选一条"或删除
+    assert.strictEqual(instrumentsOf(ctx.db, 'CROSS').length, 2);
+    assert.strictEqual(res.candidates.filter((c) => c.origin === 'local').length, 2);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('检索歧义：本地只有一条缺交易所记录 + 参考数据给出多个市场 → 报歧义且不重复挂同一条本地记录', async () => {
+  const ctx = setup('ledger-4b-merge-ambig2-');
+  try {
+    const manual = await Catalog.createInstrument(
+      ctx.db,
+      Fixture,
+      { symbol: 'DUAL', source: 'manual', currency: 'USD' },
+      CTX
+    );
+    assert.strictEqual(manual.ok, true, JSON.stringify(manual));
+
+    const provider = stubCatalogProvider([
+      Contract.instrumentResult({
+        symbol: 'DUAL',
+        currency: 'USD',
+        exchange: 'NYSE',
+        name: 'Dual Listed A',
+        provenance: PROV
+      }),
+      Contract.instrumentResult({
+        symbol: 'DUAL',
+        currency: 'HKD',
+        exchange: 'HKEX',
+        name: 'Dual Listed B',
+        provenance: PROV
+      })
+    ]);
+    const res = await Catalog.searchCatalog(ctx.db, provider, 'DUAL', CTX);
+    assert.strictEqual(res.ok, true);
+
+    // 第一条候选可以安全合并（本地只有一条、且本地缺交易所）
+    const merged = res.candidates.filter((c) => c.origin === 'local+provider');
+    assert.strictEqual(merged.length, 1, '只有一条本地记录，最多只能被一个市场认领');
+    assert.strictEqual(merged[0].local.id, manual.item.id);
+
+    // 第二个市场无法判断是否同一条本地记录 → 报歧义且不合并
+    const warn = res.warnings.filter((w) => w.code === 'ambiguous_instrument');
+    assert.strictEqual(warn.length, 1, '第二个市场必须报歧义：' + JSON.stringify(res.warnings));
+    const other = res.candidates.filter((c) => c.origin === 'provider');
+    assert.strictEqual(other.length, 1);
+    assert.strictEqual(other[0].local, null);
+    assert.strictEqual(instrumentsOf(ctx.db, 'DUAL').length, 1, '检索是只读的：不得新增/删除本地事实');
+  } finally {
+    ctx.close();
+  }
+});
+
+/* ============ 第二轮复核反例：全量写入逐条校验（G4B-5） ============ */
+
+test('全量写入逐条校验：缺 id / 空白代码 / 非法币种一律抛错，不静默丢行也不变形落库', () => {
+  const ctx = setup('ledger-4b-write-val-');
+  try {
+    const empty = { assetAccounts: [], assetUnits: [], assetTransfers: [], liabilities: [], entitlements: [], holdings: [], quotes: [], fxRates: [] };
+    const withInstruments = (instruments) =>
+      Object.assign({ settings: {} }, { assets: Object.assign({}, empty, { instruments: instruments }) });
+
+    const cases = [
+      ['缺 id 的标的', { symbol: 'NO-ID', exchange: 'NYSE', currency: 'USD' }, 'invalid_id'],
+      ['空白代码', { id: 'inst-blank', symbol: '   ', currency: 'USD' }, 'invalid_symbol'],
+      ['代码不是证券代码形状（含空格）', { id: 'inst-space', symbol: 'VOO NYSE', currency: 'USD' }, 'invalid_symbol'],
+      ['币种不在白名单', { id: 'inst-badcur', symbol: 'BAD', exchange: 'NYSE', currency: 'XXX' }, 'invalid_currency'],
+      ['币种缺失', { id: 'inst-nocur', symbol: 'NOCUR', exchange: 'NYSE' }, 'invalid_currency'],
+      ['标的不是对象', 'VOO/NYSE', 'invalid_instrument']
+    ];
+    for (const [label, row, code] of cases) {
+      assert.throws(
+        () => R.writeState(ctx.db, withInstruments([row])),
+        (e) => e && e.code === code,
+        label + ' 必须以 ' + code + ' 拒绝'
+      );
+      // 拒绝即整体回滚：库里的标的数不因这次失败而变化
+      assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 0, label + ' 被拒后不得留下半行数据');
+    }
+
+    // 合法行照常写入（校验没有把正常路径堵死）
+    R.writeState(ctx.db, withInstruments([{ id: 'inst-ok', symbol: 'VTI', exchange: 'NYSE', currency: 'USD' }]));
+    assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 1);
+
+    // 与单个接口同一口径：非法行不会挤掉既有数据（整体回滚，而不是"先清后写"留下空库）
+    assert.throws(
+      () =>
+        R.writeState(
+          ctx.db,
+          withInstruments([
+            { id: 'inst-ok2', symbol: 'QQQ', exchange: 'NASDAQ', currency: 'USD' },
+            { id: 'inst-bad', symbol: '  ', currency: 'USD' }
+          ])
+        ),
+      (e) => e && e.code === 'invalid_symbol'
+    );
+    assert.strictEqual(R.readInstrumentRecords(ctx.db).length, 1, '被拒写入必须回滚到上一次状态');
+    assert.strictEqual(R.getInstrument(ctx.db, 'inst-ok2'), null);
+  } finally {
+    ctx.close();
+  }
+});

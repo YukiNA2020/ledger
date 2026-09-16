@@ -250,6 +250,7 @@ const DOMAIN_ERROR_STATUS = {
   invalid_state: 400,
   invalid_id: 400,
   invalid_symbol: 400,
+  invalid_instrument: 400,
   invalid_currency: 400,
   invalid_exchange: 400,
   payload_too_large: 413,
