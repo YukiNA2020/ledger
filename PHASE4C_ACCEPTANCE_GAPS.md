@@ -8,7 +8,20 @@
 
 ## 第 1 轮修复状态
 
-（修复完成后在此追加逐条修复状态表，原始结论保留在下方不动。）
+> 修复轮：2026-09-17 晚，目标版本 `2.3.9-phase4c`（实现提交 `ce76caf`）
+> 修复前基线：397/397 + wiring 18/18；修复后：**407/407**（新增反例 10 项）+ wiring **18/18 × 2 轮**，schema 版本 v5 → **v6**。
+> 措辞：本轮为**补口完成，等待独立复核确认**；复核前结论为「暂不通过」。
+
+| 编号 | 级别 | 原始结论 | 修复状态 | 处理方式与证据 |
+|---|---|---|---|---|
+| G4C-1 | P0 | 买卖事件没有影响券商现金，与 S4C.1「买卖影响现金」不符 | ✅ **边界化收口**（复核者认可的选项二，用户确认采纳） | D-042④ 本已冻结「现金由余额单元人工核对（D-034）」，是 S4C.1 措辞与之矛盾。**修订 S4C.1 措辞**为「现金侧按人工核对（D-034/D-042④），证券事件不自动改写现金余额单元」，不实现现金腿。新增测试 `G4C-1 边界固化`（真实 HTTP）：事件写入后现金余额单元保持 2,000,000 不变、txns 保持为空，防止未来无意引入自动改写 |
+| G4C-2 | P0 | 修改期初可制造矛盾账本（期初 10→5 后卖出 8 变矛盾事实） | ✅ 已修复 | `upsertPortfolioOpening` 写入后（新建与更新同路径）**在同一事务内 strict 全时间线重放**，失败抛 `insufficient_holdings` 随事务回滚。反例测试（真实 HTTP）：期初 10 → 卖 8 → 更新期初为 5 → 409，回滚后期初仍 10、推导仍 2、`oversellEvents` 为空 |
+| G4C-3 | P0 | `PUT /state` 绕过期初唯一性和逐条校验（同键二期初 stored:2；缺 id 静默丢弃） | ✅ 已修复（应用层 + 数据库双保险） | ① 抽出 `validateOpeningRow` 共享校验，`writeOpenings` 改**两遍写入**：逐条验证归一（缺 id → 400 `invalid_id` 拒绝、绝不静默丢行）、同 id 与同 (账户, 标的) 第一遍即拒；② 迁移 **v6** 建唯一索引 `uq_portfolio_openings_dedupe(account_id, instrument_id)`，迁移前查重复数据、发现即抛错。反例测试（真实 HTTP）×2：同键二期初 → 409 `duplicate_opening` 整体回滚零残留；缺 id → 400 `invalid_id` 零残留。连带：`DOMAIN_ERROR_STATUS` 补 `unknown_account`/`unknown_instrument`/`invalid_amount`，全量写入路径不再误报 500 |
+| G4C-4 | P1 | 期初日期之前的事件重复计入（期初 09-06 数量 10 + 09-01 买入 2 = 12） | ✅ 已修复（口径见下方说明） | `deriveHoldings` 冻结日期边界：`occurredAt` **严格早于**期初 `asOf` 的事件视为已含在快照内，不叠加、不进 counts / 活动时间戳，记入 `holding.boundarySkippedEvents` 留痕（`readHoldings` 透传）。**口径说明**：期初快照数量 = 期初日**日初**数量，期初日**当天**及以后的事件正常叠加——「今天录期初、今天再记账」不受影响（复核者给的两个选项中的日期边界方案，同日歧义按此口径确定性消解，提请复核确认）。反例测试：真实 HTTP 1 项（09-01 买入不叠加 → 10；同日与次日买入叠加 → 14）+ 领域 3 项（含「早于期初的卖出不参与 strict 重放」） |
+| G4C-5 | P1 | 不存在的日历日期（2026-02-30）可以入库 | ✅ 已修复 | `isDateStr` 升级为真实日历日校验（与 `providers/contract.isDateString` 同口径：月 1–12、日回读一致），期初与事件同一道闸。反例测试（真实 HTTP）：`2026-02-30` 事件 → 400 `invalid_event_date`、期初 → 400 `invalid_date` |
+| G4C-6 | P1 | 损坏的 v5 备份（缺 `security_events.amount_minor`）通过校验 | ✅ 已修复 | `backup.js` 新增**按版本必需列**校验 `REQUIRED_COLUMNS_BY_VERSION`（v5+ 要求 `security_events.amount_minor`），复用 `db.js` 新增的 `columnNames`（PRAGMA table_info，读不到按缺失处理）；v6 索引登记进 `REQUIRED_INDEXES_BY_VERSION`。反例测试：v5 库 `DROP COLUMN amount_minor` 后校验拒绝且原因点名缺失列 |
+
+**明确不采纳 / 边界说明**：无（G4C-1 按复核者提供的第二选项「正式修改验收标准」收口，已由用户确认；其余 5 项全部按建议修复）。
 
 ---
 

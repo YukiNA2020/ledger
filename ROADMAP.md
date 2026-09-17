@@ -186,9 +186,9 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 - 领域层：`SECURITY_EVENT_TYPES` 词表、定点数量比较/求和/相减助手（整数运算，不过浮点）、`deriveHoldings` 唯一推导实现（期初 + Σ买入 − Σ卖出；分红/费用不改数量；买入可无期初；按 `occurred_at` 升序重放，宽松模式跳过超额卖出并留痕，strict 模式抛 `insufficient_holdings`）；`computeOverview` / `computeCloseChecklist` 在有事件时改用推导数量（无事件零回归）；
 - 服务端：`readSecurityEvents` / `upsertSecurityEvent`（同 id 409 `duplicate_event`、未知引用 422、写入前 strict 全量重放）/ `writeSecurityEvents`（全量路径同一套校验 + strict 重放，整体回滚）/ `upsertPortfolioOpening`（同键第二行 409 `duplicate_opening`）；`readHoldings` 升级为推导视图（含 `openingId` / `eventCounts` / `lastEventAt` 等追溯字段）；`readState` / `writeState` 带上 `securityEvents` 键（备份往返无损）；
 - API：`POST /api/v1/portfolio-openings`、`POST /api/v1/security-events`（支持 `Idempotency-Key` 回放）、`GET /api/v1/security-events`；`DEFERRED_WRITES` 移除两键，`market-data/refresh` 仍 501（4D 且受 D-038 门禁）；错误码集中归位（409/422/400 各就各位）；
-- 前端：资产页新增「持仓与证券事件」区块（期初快照弹层、事件弹层、推导持仓卡片、事件流水），每次写入后 `refreshAssets()` 重拉全量状态；`APP_VERSION` 与 SW 缓存键升至 `2.3.8-phase4c`。
+- 前端：资产页新增「持仓与证券事件」区块（期初快照弹层、事件弹层、推导持仓卡片、事件流水），每次写入后 `refreshAssets()` 重拉全量状态；`APP_VERSION` 与 SW 缓存键升至 `2.3.8-phase4c`（复核补口轮升至 `2.3.9-phase4c`）。
 
-退出证据：全量 `node --test` **397/397**（371 基线零回归 + 领域 16 项 + 真实 HTTP 10 项）；浏览器 wiring **18/18**（连续两轮全绿，新增持仓场景覆盖"期初+买入−卖出=11、事件不进现金流、全量写回不抹掉"）；迁移停在 **v5**；零真实网络请求。详见 `ACCEPTANCE.md` S4C.1 与 `TEST.md`。
+退出证据（第 1 轮复核补口后更新）：全量 `node --test` **407/407**（397 基线零回归 + 复核反例 10 项）；浏览器 wiring **18/18**（连续两轮全绿，新增持仓场景覆盖"期初+买入−卖出=11、事件不进现金流、全量写回不抹掉"）；迁移停在 **v6**；零真实网络请求。第 1 轮独立复核（3 P0 + 3 P1）已按 `PHASE4C_ACCEPTANCE_GAPS.md` 逐条闭合：期初修改后同事务 strict 重放（G4C-2）、期初唯一性与逐条校验全路径生效 + v6 唯一索引兜底（G4C-3）、期初日期边界冻结（G4C-4，D-042 ⑦）、真实日历日校验（G4C-5）、备份必需列校验（G4C-6）、S4C.1 现金措辞按 D-042④ 修订（G4C-1）。详见 `ACCEPTANCE.md` S4C.1 与 `TEST.md`。
 
 ### Phase 4D｜日终行情、汇率与失败兜底
 

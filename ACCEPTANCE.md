@@ -209,11 +209,13 @@ Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的�
 
 **Given** 用户首次录入 10 份 ETF。
 **When** 后续记录买入 2 份、卖出 1 份和一笔分红。
-**Then** 当前数量为 11 份；买卖影响持仓和现金但不重复计入收入支出；分红单独记录。
+**Then** 当前数量为 11 份；买卖影响持仓且不重复计入收入支出，**现金侧按人工核对口径（D-034/D-042④：证券事件不自动改写现金余额单元）**；分红单独记录。  
+（措辞修订说明：原文"买卖影响持仓和现金"与 D-042④ 矛盾，经第 1 轮独立复核提出、用户确认，按"现金人工核对"收口、不实现自动现金腿——G4C-1 边界化收口，见 `PHASE4C_ACCEPTANCE_GAPS.md`。）
 
 | 验收点 | 结论 | 证据 |
 |---|---|---|
 | S4C.1 主链路：期初 10 → 买 2 → 卖 1 = 11 | ✅ 通过 | `tests/server-phase4c.test.js`：真实 HTTP 全链路（建账户 → manual 标的 → confirm → 期初 → 买 → 卖 → 分红），`GET /holdings` 推导 `quantity='11'`，`eventCounts` 精确；领域侧同链路见 `tests/domain-phase4c.test.js` |
+| 现金侧人工核对、事件不自动改写现金（G4C-1 修订口径） | ✅ 通过 | 真实 HTTP `G4C-1 边界固化`：注入 USD 余额单元 2,000,000 → 期初 + 买 2×$5000 + 手续费 100 + 分红后，余额单元**保持 2,000,000**、`txns` 保持为空——现金余额仍由用户人工核对（D-034） |
 | 分红/费用可单独追溯、不改数量 | ✅ 通过 | 分红事件落 `amount_minor`（v5 列），`quantity` 为 null；`deriveHoldings` 后数量不变；事件流水（`GET /security-events`）带币种（由标的推导）、日期与 id 可溯源 |
 | 买卖不重复计入收入支出 | ✅ 通过 | 事件写入后 `GET /state` 的 `txns` 保持为空；浏览器 wiring 场景断言事件前后现金流交易数不变 |
 | 同 id 重放明确拒绝 | ✅ 通过 | 同 id 二次 POST → 409 `duplicate_event`，不产生第二行；`Idempotency-Key` 重放返回首次响应（200 + `X-Ledger-Idempotent: replay`）且不重复写入 |
@@ -226,8 +228,13 @@ Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的�
 | `PUT /state` 全量路径同口径 | ✅ 通过 | 全量写入带非法事件类型 → 400 整体回滚、事件零残留；合法往返后事件与推导数量无损 |
 | 备份恢复往返无损 | ✅ 通过 | 手动备份 → 再写 2 条事件 → 恢复后事件回到 1 条、推导数量回到 12 |
 | 浏览器最小闭环（wiring） | ✅ 通过 | `tests/app-wiring.js` 新场景：页面录入期初/买/卖 → 事实源推导 11 → 持仓卡片与事件流水渲染 → 全量写回（记账路径）后事件与期初仍在 |
+| 修改期初触发越界 → 拒绝回滚（G4C-2） | ✅ 通过 | 真实 HTTP：期初 10 → 卖 8 → 更新期初为 5 → 409 `insufficient_holdings`；回滚后期初仍 10、推导仍 2、`oversellEvents` 为空（写入后在同一事务 strict 全时间线重放） |
+| `PUT /state` 同键二期初 / 缺 id 期初（G4C-3） | ✅ 通过 | 真实 HTTP ×2：同（账户, 标的）两条期初 → 409 `duplicate_opening` 整体回滚零残留（曾实测 stored:2）；缺 id → 400 `invalid_id`，不静默丢弃。数据库侧 v6 唯一索引 `uq_portfolio_openings_dedupe` 兜底 |
+| 期初日期边界（G4C-4，D-042 ⑦） | ✅ 通过 | 真实 HTTP：期初 10（asOf 09-06）+ 09-01 买 2 → 推导仍 10、`boundarySkippedEvents` 留痕 1 条；同日与次日买入正常叠加 → 14。领域侧 3 项（含"早于期初的卖出不参与 strict 重放"） |
+| 真实日历日校验（G4C-5） | ✅ 通过 | 真实 HTTP：`2026-02-30` 事件 → 400 `invalid_event_date`；同期初 → 400 `invalid_date` |
+| 备份必需列校验（G4C-6） | ✅ 通过 | v5 库删除 `security_events.amount_minor` 后 `validateBackupFile` 拒绝且原因点名缺失列（曾返回 `{"ok":true,"schemaVersion":5}`） |
 
-Phase 4C 退出证据：全量 `node --test` **397/397**（371 基线零回归 + 领域 **16** 项 + 真实 HTTP **10** 项）；浏览器 wiring **18/18**（连续两轮全绿）；数据库迁移停在 **v5**；`market-data/refresh` 仍 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-042。
+Phase 4C 退出证据（第 1 轮复核补口后更新）：全量 `node --test` **407/407**（397 基线零回归 + 复核反例 **10** 项：领域 3 + 真实 HTTP 6 + 备份 1；领域现 **19** 项、真实 HTTP 现 **16** 项）；浏览器 wiring **18/18**（连续两轮全绿）；数据库迁移停在 **v6**；`market-data/refresh` 仍 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-042（⑦ 日期边界 / ⑧ 期初全路径唯一性为本轮新增）；复核缺口与修复状态见 `PHASE4C_ACCEPTANCE_GAPS.md`。
 
 ### S4D.1 自动更新成功
 
