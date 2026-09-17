@@ -192,6 +192,8 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4D｜日终行情、汇率与失败兜底
 
+状态：**实现与自验完成（2026-09-17），等待独立复核确认**。口径冻结见 `DECISIONS.md` D-044，门禁复核证据见 `server/providers/SOURCES.md` §8。
+
 **前置门禁（D-038，未通过不得开启自动抓取）：** 4D 在接入任何自动行情源之前，必须逐条补齐并写入 `server/providers/SOURCES.md`：官方条款链接（含自动化使用授权）、可复核的 API 版本与文档、调用限额（日/分钟）、认证方式、市场覆盖的明确声明、失败语义到五类错误码的映射；门禁未通过时保持自动抓取默认关闭，行情以手动补价 + 本地缓存为唯一事实来源。
 
 范围：
@@ -202,6 +204,18 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 4. 保留 Phase 3 手动汇率，并增加手动价格兜底；失败保留最后有效值并标记 stale。
 
 退出条件：成功、断网、超时、限额、缺标的、节假日和手动覆盖全部由 fixture 测试覆盖；错误响应不能覆盖最后有效值；自动测试不访问公网。
+
+已交付：
+
+- **门禁复核结论（D-038，2026-09-17 实测）**：逐条复测候选行情源并写入 `server/providers/SOURCES.md` §8（含原始输出与六条门禁对照表）——Frankfurter（pin ECB 端点）通过全部门禁；Stooq / Yahoo / Twelve Data demo / FMP / EODHD / Polygon / Finnhub 均因条款、授权或覆盖不达标被否；腾讯/东财接口可达但无自动化授权与稳定条款，同样不达标。结论：**行情自动抓取默认关闭**，汇率自动更新开启；
+- **迁移 v7** `phase4d-quote-source-symbol`：`quotes` 加 `source_symbol` 列承载 provider 返回的原始代码（追溯要求）。**只加列、不加索引**：报价的「(标的, 价格日) 元素键」由写入路径强制，不提升为数据库唯一索引（v1 的 `uq_quotes_dedupe` 允许同一价格日不同 provider 并存，收紧会拒绝合法历史状态，见 v7 迁移内注释）；`backup.js` 的按版本必需列清单同步登记；
+- **领域层（单一实现，D-025）**：`js/domain.js` 纯扩展——`MANUAL_PROVIDER`、`MARKET_SCOPES`、`marketElementKey` / `marketGroupKey` / `marketRowDate`、`planMarketMerge`（元素键替换 + 手动值冻结：同组内 ≤ 手动行数据日的观测一律 `manual_locked`）、`requiredQuoteSymbols` / `requiredFxPairs`（只按事实推导更新目标，不猜测）；
+- **仓储层**：`validateQuoteRow` / `validateFxRow` 两条单条路径与全量路径共用同一套校验（币种一律由标的推导，拒绝载荷覆盖；错误码 `invalid_instrument_id` / `invalid_price` / `invalid_price_date` / `currency_mismatch` / `invalid_provider`）；`upsertManualQuote`（来源固定 `manual`）、`upsertProviderQuote` / `upsertProviderFxRate`（拒绝冒充 `manual`，同组手动值冻结）、`replaceQuoteRows`；`readQuotes` 透传 `source_symbol`；
+- **编排层**：`server/market-data.js`（`refreshMarketData` 逐作用域报告 + `MAX_ATTEMPTS=2` 有限重试，**只在整批失败且至少一个错误可重试时**整批重发；每次结果先过 `contract.assertValidResult` 再落库；任何失败不改动任何已有行，只报告）、`server/providers/frankfurter.js`（**pin ECB 端点 `/v2/providers/ecb/rates`**，D-036；五类错误码映射 + 超时中止）、`server/providers/keychain-key.js`（惰性读 Key、只返回布尔状态、密钥不进响应与日志）；
+- **API**：`POST /api/v1/quotes`（手动补价兜底）、`POST /api/v1/market-data/refresh`（`DEFERRED_WRITES` 移除，不再是 501）。响应语义是「一次刷新尝试的报告」：外部失败返回 200 + `ok:false` + 逐作用域 `errors`（含 `retryable`），不把外部不可达伪装成客户端错误。自动行情开关**只从服务端 settings 读取，不信任请求体**；
+- **前端**：资产页新增「行情（收盘价）」区块（逐标的卡片：价格/价格日/来源/新鲜度、手动补价入口、启动时自动更新汇率开关、刷新入口），手动补价弹层走 `js/store.js` 门面；`APP_VERSION` 与 SW 缓存键升至 `2.3.10-phase4d`。
+
+退出证据：全量 `node --test` **441/441**（411 基线零回归 + 4D 新增 30 项：编排层 fixture **22/22**、真实 HTTP **7/7**、Keychain 行情 Key 路径 1 项）；浏览器 wiring **21/21**（干净环境连续两轮全绿，新增 3 项）；迁移停在 **v7**；自动测试**零真实网络请求**（真实网络只用于人工取证，结论记入 SOURCES.md §8）。详见 `ACCEPTANCE.md` S4D.1/S4D.2 与 `TEST.md`。
 
 ### Phase 4E｜估值下钻与收益归因
 

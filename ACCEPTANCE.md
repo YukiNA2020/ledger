@@ -251,7 +251,31 @@ Phase 4C 退出证据（完整性补口后更新）：全量 `node --test` **411
 **When** 更新失败。  
 **Then** 保留最后有效值并标记 stale，允许手动补价，阻止正式建议但不阻止查看估算。
 
-Phase 4D 退出证据：provider 使用固定 fixture 自动测试；成功、断网、超时、限额、缺标的、节假日、错误响应不覆盖旧值、Keychain 与手动覆盖均有用例。
+**验收结论（2026-09-17）：✅ 代码验收通过（实现与自验完成，等待独立复核确认）。**
+
+| 场景要点 | 结论 | 证据 |
+|---|---|---|
+| S4D.1 汇率自动更新成功 | ✅ 通过 | `tests/providers-marketdata.test.js` S4D.1 + `tests/server-phase4d.test.js` 真实 HTTP：写入 `rate_date` / `fetched_at`（来自服务端注入的 `now`，不用内部时钟）/ `provider`；`GET /fx-rates` 可直读同一行。汇率源 = Frankfurter 且 **pin ECB 端点 `/v2/providers/ecb/rates`**（D-036）；注入离线 provider 时 `provider` 以实际写入行为准、`endpoint` 为 `null`（不冒充 Frankfurter 端点） |
+| S4D.1 行情自动更新成功 | ✅ 通过 | 同一批用例：保存价格日、抓取时间、provider 与 **provider 原始代码 `sourceSymbol`**（迁移 v7 列）；自动更新的 provider 不得冒充 `manual` 来源（写入被拒 `invalid_provider`） |
+| S4D.1 外部请求不含账户名/数量/成本/余额（D-020） | ✅ 通过 | 编排层用例断言 provider 只收到 `['VOO']` 与 `{now, asOf}` 两个键，请求产物 JSON 内不含 `accountId` / `accountName` / `quantity` / `costMinor` / `balanceMinor`；真实 HTTP 用例断言刷新报告 JSON 内不含账户名、余额、数量与成本 |
+| S4D.2 自动抓取默认关闭（D-038 门禁） | ✅ 通过 | 真实 HTTP：请求体携带 `autoQuotesEnabled` / `autoQuotes` / `marketDataAutoQuotes` / `quotesFetch` 仍返回 `skipped(auto_fetch_disabled)`，provider 调用计数为 **0**、库中零报价；开关**只从服务端 settings 读取**，不信任请求体。门禁复核结论与原始输出见 `server/providers/SOURCES.md` §8 |
+| S4D.2 断网 | ✅ 通过 | provider 抛异常（DNS/连接失败）按暂时性失败处理为 `timeout`：不写库、不抛到上层，HTTP 200 + `ok:false` |
+| S4D.2 超时 | ✅ 通过 | `timeout` 可重试 → 用满有限重试 `MAX_ATTEMPTS=2` 后如实报告，最后有效值（5000）不被覆盖 |
+| S4D.2 限额 | ✅ 通过 | `rate_limit` 可重试，重试用尽后如实报告且不覆盖旧值（4800） |
+| S4D.2 缺标的 | ✅ 通过 | `not_found` 不写入，`retryable:false` → `attempts:1`（不可重试的错误不重复请求） |
+| S4D.2 节假日 | ✅ 通过 | fixture 中休市标的在 09-14/09-15 无数据，`asOf=2026-09-15` 回退到最近交易日 09-11；断言返回值绝**不晚于** `asOf`；`asOf` 早于数据起始日 → `not_found` 且零写入 |
+| S4D.2 不可入账数据一律拒绝落库 | ✅ 通过 | 负价格 / 汇率 `'0'` → `invalid_payload`；provider 返回**非数组**同样判 `invalid_payload`（不当成空结果）；provider 返回**未请求的标的**显式拒绝写入（不得张冠李戴） |
+| S4D.2 手动补价兜底 | ✅ 通过 | 真实 HTTP `POST /api/v1/quotes` → 201 + `source:'manual'`（来源固定，拒绝调用方绕过）；同一元素键再次补价**替换**而不是并存，不同价格日各留一行；缺标的 400 `invalid_instrument_id`、非法价格 400 `invalid_price`、非法日期 400 `invalid_price_date`、币种冲突 422 `currency_mismatch`、未知引用 422 `unknown_instrument`，且被拒的写入零残留 |
+| S4D.2 手动值不被自动值覆盖（D-044 ②） | ✅ 通过 | 报价与汇率**同一口径**：手动值所在数据日**及更早**的自动观测一律 `manual_locked`（不是只看同一天）；更新的数据日仍可写入，手动值不会被永久挡住 |
+| S4D.2 元素键替换（D-044 ③） | ✅ 通过 | 同一（标的, 价格日）连续两次写入只保留 **1** 行，且取值是后写入的那一行（不依赖数据库行序）；跨 provider 一起替换。该不变量由写入路径强制，**不**提升为数据库唯一索引（理由见迁移 v7 注释） |
+| S4D.2 失败不覆盖旧值 + 备份往返 | ✅ 通过 | 真实 HTTP：手动补价 + 自动汇率 → 手动备份 → 改动两条事实 → 恢复后报价回到 4992、汇率回到 7.1900，`provider` 来源标记随备份往返不丢 |
+| S4D.2 Keychain 读取路径 | ✅ 通过 | `tests/server-keychain.test.js`：`readProviderKey` 真实写入→回读逐字节一致；`providerKeyStatus` 只返回 `{configured, service, error}` 且响应内**不含密钥内容**；未配置时降级为 `null` / `configured:false`（不抛错）。读取是**惰性**的：门禁关闭时一次都不读 |
+| S4D.2 开关打开但 provider 未配置 | ✅ 通过 | 真实 HTTP：`settings.marketDataAutoQuotes=true` 且无可用 provider → `skipped(provider_not_configured)`，`attempts:0`，只报告 Key 是否配置，库中零写入 |
+| 参数与错误语义 | ✅ 通过 | `scopes` 非数组 / 未知作用域 → 400 `invalid_scope`；`asOf` 非真实日历日（`2026-13-01` / `2026-09-31`）→ 400 `invalid_date`；请求体非对象 → 400 `invalid_json`。外部不可达一律 200 + `ok:false` + 逐作用域 `errors`（含 `retryable`），不伪装成客户端错误 |
+| 浏览器最小闭环（wiring） | ✅ 通过 | `tests/app-wiring.js` 新增 3 项：① 行情区块默认不自动抓取、手动补价写入事实源并渲染价格/价格日/来源；② 启动时自动更新汇率开关默认关闭、切换可写入 `settings` 并回读；③ 刷新报告逐作用域如实提示（成功报数量、门禁未通过报原因），且不改动已登记的手动价格 |
+| 离线运行 | ✅ 通过 | 4D 全部自动测试使用固定 fixture 与注入时钟，**零真实网络请求**；真实网络仅用于人工门禁取证（结论记入 `SOURCES.md` §8） |
+
+Phase 4D 退出证据：全量 `node --test` **441/441**（411 基线零回归 + 4D 新增 30 项）；4D 编排层 fixture **22/22**、真实 HTTP **7/7**、Keychain 行情 Key 路径 1 项；浏览器 wiring **21/21**（干净环境连续两轮全绿）；数据库迁移停在 **v7**；`market-data/refresh` 不再是 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-044，门禁证据见 `server/providers/SOURCES.md` §8。
 
 ### S4E.1 估值下钻与收益归因
 
