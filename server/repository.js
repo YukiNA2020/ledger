@@ -36,7 +36,17 @@ const NUM = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 const BOOL = (v) => (v ? 1 : 0);
-const isDateStr = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+// 真实存在的日历日（与 providers/contract.isDateString 同口径，复核 G4C-5）：
+// 光有形状正则会接受 '2026-02-30'、'2026-13-01' —— 事件排序和期初边界会建立在非法时间上。
+const isDateStr = (s) => {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(5, 7));
+  const d = Number(s.slice(8, 10));
+  if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+};
 
 // 标的 id / 代码的形状（与目录接口同一口径）。全量写入路径也必须满足 ——
 // 只靠"过滤掉不合法行"会让非法数据悄悄消失或变形（第二轮复核 G4B-5）。
@@ -676,22 +686,87 @@ function upsertInstrument(db, item, options) {
   return hydrateInstrument(get(db, 'SELECT * FROM instruments WHERE id = ?', [id]));
 }
 
-function writeOpenings(db, list) {  const st = db.prepare(
+// 期初快照逐字段校验（单条 upsert 与全量写入**共用同一套口径**，复核 G4C-3——
+// 两条路径校验分叉是 4B 已踩过的坑：当初单条要求 currency、全量却 || 'CNY' 兜底）：
+//   - 必须是对象；id 必填且符合形状；
+//   - accountId / instrumentId 必填且真实存在（unknown_account / unknown_instrument）；
+//   - quantity 必须为正定点数；costMinor 可选非负整数；asOf 可选真实日历日。
+// 返回归一化后的行（quantity 去空白、asOf 归一为字符串或 null），非法即抛领域错误。
+function validateOpeningRow(db, o, at) {
+  const where = at || '该期初快照';
+  if (!o || typeof o !== 'object' || Array.isArray(o)) {
+    throw Object.assign(new Error('期初快照必须是对象（' + where + '）'), { code: 'invalid_opening' });
+  }
+  const id = o.id == null ? '' : String(o.id).trim();
+  if (!id || !OPENING_ID_RE.test(id)) {
+    throw Object.assign(new Error('期初快照 id 不合法（' + where + '）'), { code: 'invalid_id' });
+  }
+  if (!o.accountId || !o.instrumentId) {
+    throw Object.assign(new Error('期初快照必须同时指向账户与标的（' + where + '）'), { code: 'invalid_opening' });
+  }
+  if (!get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [String(o.accountId)])) {
+    throw Object.assign(new Error('期初快照关联的账户不存在（' + where + '）'), { code: 'unknown_account' });
+  }
+  if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [String(o.instrumentId)])) {
+    throw Object.assign(new Error('期初快照关联的标的不存在（' + where + '）'), { code: 'unknown_instrument' });
+  }
+  const q = Domain.parseDecimal(o.quantity);
+  if (!q || !(q.v > 0)) {
+    throw Object.assign(new Error('期初数量必须为正定点数（' + where + '）'), { code: 'invalid_quantity' });
+  }
+  if (o.costMinor != null && (!Number.isSafeInteger(o.costMinor) || o.costMinor < 0)) {
+    throw Object.assign(new Error('期初成本必须是非负整数（最小货币单位）（' + where + '）'), { code: 'invalid_amount' });
+  }
+  if (o.asOf != null && !isDateStr(o.asOf)) {
+    throw Object.assign(new Error('期初核对日期必须是真实存在的 YYYY-MM-DD（' + where + '）'), { code: 'invalid_date' });
+  }
+  return {
+    id: id,
+    accountId: String(o.accountId),
+    instrumentId: String(o.instrumentId),
+    quantity: String(o.quantity).trim(),
+    costMinor: o.costMinor == null ? null : o.costMinor,
+    asOf: o.asOf == null ? null : String(o.asOf),
+    extra: extraJson(o, KNOWN.holdings)
+  };
+}
+
+function insertOpeningRow(db, row) {
+  run(
+    db,
     `INSERT INTO portfolio_openings (id, account_id, instrument_id, quantity, cost_minor, as_of, extra_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [row.id, row.accountId, row.instrumentId, row.quantity, row.costMinor, row.asOf, row.extra]
   );
-  (list || []).forEach((h) => {
-    if (!h || !h.id) return;
-    st.run(
-      String(h.id),
-      String(h.accountId),
-      String(h.instrumentId),
-      STR(h.quantity) || '0',
-      NUM(h.costMinor),
-      STR(h.asOf),
-      extraJson(h, KNOWN.holdings)
-    );
+}
+
+// 全量写入路径（PUT /state、JSON 恢复、备份还原）：与单条 upsert 同一套校验（G4C-3）。
+// 两遍写入：第一遍逐条验证归一（缺 id / 非法数量 / 未知引用一律抛错，绝不静默丢行或
+// 变形落库），同 id 与同 (账户, 标的) 键在第一遍即拒绝；第二遍才插入，由调用方事务
+// 整体回滚。数据库层另有 v6 唯一索引 uq_portfolio_openings_dedupe 兜底。
+function writeOpenings(db, list) {
+  const rows = Array.isArray(list) ? list : [];
+  const seenId = {};
+  const seenKey = {};
+  const normalized = rows.map((o, idx) => {
+    const row = validateOpeningRow(db, o, '第 ' + (idx + 1) + ' 条');
+    if (seenId[row.id]) {
+      throw Object.assign(new Error('期初快照 id 重复写入：' + row.id + '（第 ' + (idx + 1) + ' 条）'), {
+        code: 'duplicate_opening'
+      });
+    }
+    seenId[row.id] = true;
+    const key = row.accountId + '|' + row.instrumentId;
+    if (seenKey[key]) {
+      throw Object.assign(
+        new Error('同一账户下同一标的只能有一行期初快照：' + row.accountId + ' / ' + row.instrumentId + '（第 ' + (idx + 1) + ' 条）'),
+        { code: 'duplicate_opening' }
+      );
+    }
+    seenKey[key] = true;
+    return row;
   });
+  normalized.forEach((row) => insertOpeningRow(db, row));
 }
 
 function readOpenings(db) {
@@ -851,39 +926,18 @@ function getSecurityEvent(db, id) {
   return readSecurityEvents(db).find((e) => e.id === String(id)) || null;
 }
 
-// 期初快照单条写入（POST /api/v1/portfolio-openings）：
-//   - 同 id 幂等更新；同一 (accountId, instrumentId) 出现第二行 → duplicate_opening（409）。
+// 期初快照单条写入（POST /api/v1/portfolio-openings，调用方负责 transaction）：
+//   - 同 id 幂等更新；同一 (accountId, instrumentId) 出现第二行 → duplicate_opening（409）；
+//   - 逐字段校验与全量写入共用 validateOpeningRow（G4C-3）；
+//   - 写入后（新建或更新都一样）在同一事务内做 strict 全时间线重放（G4C-2）：
+//     降低期初数量可能让既有卖出变成超额事件、移动 asOf 会改变日期边界——
+//     任何导致矛盾账本的期初修改都在这里被拒绝并随事务回滚，绝不落库。
 function upsertPortfolioOpening(db, o) {
-  if (!o || typeof o !== 'object' || Array.isArray(o)) {
-    throw Object.assign(new Error('期初快照必须是对象'), { code: 'invalid_opening' });
-  }
-  const id = o.id == null ? '' : String(o.id).trim();
-  if (!id || !OPENING_ID_RE.test(id)) {
-    throw Object.assign(new Error('期初快照 id 不合法'), { code: 'invalid_id' });
-  }
-  if (!o.accountId || !o.instrumentId) {
-    throw Object.assign(new Error('期初快照必须同时指向账户与标的'), { code: 'invalid_opening' });
-  }
-  if (!get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [String(o.accountId)])) {
-    throw Object.assign(new Error('期初快照关联的账户不存在'), { code: 'unknown_account' });
-  }
-  if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [String(o.instrumentId)])) {
-    throw Object.assign(new Error('期初快照关联的标的不存在'), { code: 'unknown_instrument' });
-  }
-  const q = Domain.parseDecimal(o.quantity);
-  if (!q || !(q.v > 0)) {
-    throw Object.assign(new Error('期初数量必须为正定点数'), { code: 'invalid_quantity' });
-  }
-  if (o.costMinor != null && (!Number.isSafeInteger(o.costMinor) || o.costMinor < 0)) {
-    throw Object.assign(new Error('期初成本必须是非负整数（最小货币单位）'), { code: 'invalid_amount' });
-  }
-  if (o.asOf != null && !isDateStr(o.asOf)) {
-    throw Object.assign(new Error('期初核对日期必须是 YYYY-MM-DD'), { code: 'invalid_date' });
-  }
+  const row = validateOpeningRow(db, o);
   const clash = get(
     db,
     'SELECT id FROM portfolio_openings WHERE account_id = ? AND instrument_id = ? AND id <> ?',
-    [String(o.accountId), String(o.instrumentId), id]
+    [row.accountId, row.instrumentId, row.id]
   );
   if (clash) {
     throw Object.assign(
@@ -902,17 +956,11 @@ function upsertPortfolioOpening(db, o) {
        cost_minor = excluded.cost_minor,
        as_of = excluded.as_of,
        extra_json = excluded.extra_json`,
-    [
-      id,
-      String(o.accountId),
-      String(o.instrumentId),
-      String(o.quantity).trim(),
-      o.costMinor == null ? null : o.costMinor,
-      o.asOf == null ? null : String(o.asOf),
-      extraJson(o, KNOWN.holdings)
-    ]
+    [row.id, row.accountId, row.instrumentId, row.quantity, row.costMinor, row.asOf, row.extra]
   );
-  return readOpenings(db).find((h) => h.id === id) || null;
+  // strict 重放（D-042 ①/D-025）：唯一推导实现 + 卖出不越界，失败抛错由事务整体回滚
+  Domain.deriveHoldings(readOpenings(db), readSecurityEvents(db), { strict: true });
+  return readOpenings(db).find((h) => h.id === row.id) || null;
 }
 
 // 全量写入路径（PUT /state、JSON 恢复、备份还原）：与单条写入同一套校验口径，
@@ -1320,7 +1368,8 @@ function readHoldings(db) {
       firstActivityAt: h.firstActivityAt,
       lastEventAt: h.lastEventAt,
       eventCounts: h.counts,
-      oversellEvents: h.oversellEvents
+      oversellEvents: h.oversellEvents,
+      boundarySkippedEvents: h.boundarySkippedEvents
     }));
   } else {
     rows = openings;

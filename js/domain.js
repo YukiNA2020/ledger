@@ -136,6 +136,8 @@
   // deriveHoldings(openings, events, options) — 持有数量的**唯一推导实现**：
   //   数量 = 期初快照数量 + Σ买入 − Σ卖出（分红/费用不改数量；买入可以没有期初快照，从 0 起算）。
   //   事件按 occurred_at 升序重放（同日按传入顺序，保证确定性）；
+  //   日期边界（G4C-4）：occurredAt 严格早于期初快照 asOf 的事件视为已含在快照内，
+  //   不再叠加也不进 counts（跳过的事件记入 holding.boundarySkippedEvents 供追溯）。
   //   任一 (accountId, instrumentId) 至多一行期初：同键多行时取 asOf 最新一行（接口路径不允许出现，
   //   这里只对历史/手工数据的形状做确定性防御）。
   // options.strict = true：卖出超过当时推导数量 → 抛 {code:'insufficient_holdings'}（服务端写前校验用）；
@@ -170,7 +172,8 @@
           firstActivityAt: null,
           lastEventAt: null,
           counts: { buy: 0, sell: 0, dividend: 0, fee: 0 },
-          oversellEvents: []
+          oversellEvents: [],
+          boundarySkippedEvents: []
         };
         order.push(key);
       }
@@ -217,6 +220,19 @@
         if (!qty || !(qty.v > 0)) { invalidEvents.push(e.id || null); return; }
       }
       var h = holdingFor(e.accountId, e.instrumentId);
+      // 日期边界（D-042 ①，复核 G4C-4）：occurredAt **严格早于**期初快照 asOf 的事件视为
+      // 已包含在快照数量内，不再叠加，也不进 counts / 活动时间戳——否则"期初 10（09-06）
+      // + 09-01 买入 2"会重复计成 12。期初快照数量口径 = 期初日日初数量，期初日**当天**及
+      // 之后的事件正常计入（"今天录期初、今天再记账"不受影响）。跳过的事件记入
+      // boundarySkippedEvents 供追溯，绝不静默。
+      if (
+        h.openingAsOf != null &&
+        e.occurredAt &&
+        String(e.occurredAt) < String(h.openingAsOf)
+      ) {
+        h.boundarySkippedEvents.push(e.id || null);
+        return;
+      }
       if (type === 'buy') {
         h.quantity = sumQuantities([h.quantity, e.quantity]);
         h.counts.buy += 1;

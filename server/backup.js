@@ -57,7 +57,15 @@ const REQUIRED_TABLES_BY_VERSION = {
 // 索引被手工删掉后，迁移器看到 v4 已应用不会重建，于是这个库会静默失去该不变量
 // （第二轮复核 G4B-6：DROP INDEX 后校验仍返回 ok）。
 const REQUIRED_INDEXES_BY_VERSION = {
-  4: [{ table: 'instruments', name: 'uq_instruments_dedupe', unique: true }]
+  4: [{ table: 'instruments', name: 'uq_instruments_dedupe', unique: true }],
+  6: [{ table: 'portfolio_openings', name: 'uq_portfolio_openings_dedupe', unique: true }]
+};
+
+// 必需**列**随 schema 版本增长（复核 G4C-6）：有些事实承载在列上，光看表齐不齐看不出来。
+// v5 的 amount_minor 承载分红/费用事件总额——缺列的 v5 库恢复后迁移器不会补列
+// （版本已应用），读取事件时才炸。校验必须把这类库挡在切换之前。
+const REQUIRED_COLUMNS_BY_VERSION = {
+  5: [{ table: 'security_events', name: 'amount_minor' }]
 };
 
 function requiredTablesFor(version) {
@@ -72,6 +80,14 @@ function requiredIndexesFor(version) {
   let list = [];
   Object.keys(REQUIRED_INDEXES_BY_VERSION).forEach((v) => {
     if (version >= Number(v)) list = list.concat(REQUIRED_INDEXES_BY_VERSION[v]);
+  });
+  return list;
+}
+
+function requiredColumnsFor(version) {
+  let list = [];
+  Object.keys(REQUIRED_COLUMNS_BY_VERSION).forEach((v) => {
+    if (version >= Number(v)) list = list.concat(REQUIRED_COLUMNS_BY_VERSION[v]);
   });
   return list;
 }
@@ -187,6 +203,13 @@ function validateBackupFile(file) {
       }
       if (spec.unique && !info.unique) {
         return { ok: false, reason: '必需索引不是唯一索引：' + spec.name };
+      }
+    }
+    // 索引之外还有承载事实的必需列（复核 G4C-6）：缺列的库恢复后迁移器不会补列，
+    // 读取时会才炸——同样挡在切换之前。
+    for (const col of requiredColumnsFor(version)) {
+      if (dbm.columnNames(db, col.table).indexOf(col.name) === -1) {
+        return { ok: false, reason: '缺少必需列：' + col.table + '.' + col.name };
       }
     }
     return { ok: true, schemaVersion: version };

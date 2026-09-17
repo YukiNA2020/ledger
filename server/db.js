@@ -75,6 +75,19 @@ function indexInfo(db, table, name) {
   return { name: String(row.name), table: String(row.tbl_name), unique: unique };
 }
 
+// 表的列名集合：备份校验按版本核对必需列（如 v5 的 security_events.amount_minor）——
+// 有些事实承载在列上，光看表齐不齐看不出来（迁移器只在"版本未应用"时执行，
+// 已应用版本的库被手工删列不会自愈）。PRAGMA 不支持参数绑定，表名做标识符过滤后拼接。
+function columnNames(db, table) {
+  const t = String(table || '').replace(/[^A-Za-z0-9_]/g, '');
+  if (!t) return [];
+  try {
+    return all(db, 'PRAGMA table_info(' + t + ')').map((c) => String(c.name));
+  } catch (_) {
+    return []; // 读不到列信息时返回空：校验方宁可拒绝，也不放过事实列缺失的库
+  }
+}
+
 function integrityCheck(db) {
   const row = get(db, 'PRAGMA integrity_check', []);
   return row ? Object.values(row)[0] : 'unknown';
@@ -102,6 +115,7 @@ module.exports = {
   run,
   tableExists,
   indexInfo,
+  columnNames,
   integrityCheck,
   plain,
   closeQuietly

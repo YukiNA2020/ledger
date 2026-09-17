@@ -262,7 +262,12 @@ const DOMAIN_ERROR_STATUS = {
   invalid_event_amount: 400,
   invalid_quantity: 400,
   invalid_opening: 400,
+  invalid_amount: 400,
   invalid_date: 400,
+  // 全量写入路径（PUT /state / 恢复）的 catch 只查本表：期初/事件校验可能抛出的
+  // 未知引用码也必须归位 4xx，否则"引用了不存在账户"会被误报成 500（G4C-3 连带）
+  unknown_account: 422,
+  unknown_instrument: 422,
   payload_too_large: 413,
   duplicate_instrument: 409,
   ambiguous_instrument: 409,

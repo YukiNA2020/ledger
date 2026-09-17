@@ -442,3 +442,32 @@ test('P1-D 活库丢失去重索引时拒绝产出"看似合格"的备份，且�
     ctx.close();
   }
 });
+
+/* ---------- 第 1 轮复核反例（G4C-6）：必需列也属于结构校验 ---------- */
+
+test('G4C-6 v5 库缺 security_events.amount_minor 列时校验必须拒绝', async () => {
+  const ctx = setup('ledger-bak-col-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+    assert.strictEqual(B.validateBackupFile(result.file).ok, true);
+
+    // 复核复现：删列后 schema_migrations 仍写着 v5，迁移器只在"版本未应用"时执行，
+    // 恢复后不会补列，读取分红/费用事件时才炸——校验必须自己把关。
+    assert.ok(M.LATEST_VERSION >= 5, '本用例前提：最新 schema 版本 ≥ 5');
+    const brokenFile = path.join(ctx.paths.backupDir, 'ledger-20260901-160000-nocol.db');
+    fs.copyFileSync(result.file, brokenFile);
+    const raw = new DatabaseSync(brokenFile);
+    raw.exec('ALTER TABLE security_events DROP COLUMN amount_minor');
+    raw.close();
+
+    const check = B.validateBackupFile(brokenFile);
+    assert.strictEqual(check.ok, false, '声称 v5 却缺 amount_minor 列的库不得通过校验');
+    assert.ok(
+      String(check.reason).indexOf('amount_minor') >= 0,
+      '拒绝原因要点名缺失的列：' + check.reason
+    );
+  } finally {
+    ctx.close();
+  }
+});

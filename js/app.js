@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.8-phase4c';
+  var APP_VERSION = '2.3.9-phase4c';
 
   /* ================= 状态 ================= */
   var state = {

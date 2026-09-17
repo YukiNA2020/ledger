@@ -11,13 +11,13 @@ const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1–v5：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1–v6：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 5);
+    assert.strictEqual(rows.length, 6);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
     assert.strictEqual(rows[1].version, 2);
@@ -28,6 +28,8 @@ test('迁移 v1–v5：schema_migrations 记录版本并建齐必需表', () => 
     assert.strictEqual(rows[3].name, 'phase4b-instrument-dedupe');
     assert.strictEqual(rows[4].version, 5);
     assert.strictEqual(rows[4].name, 'phase4c-security-event-amounts');
+    assert.strictEqual(rows[5].version, 6);
+    assert.strictEqual(rows[5].name, 'phase4c-opening-dedupe');
     assert.strictEqual(tableExists(ctx.db, 'asset_transfers'), true, 'v3 应建立换汇事实表');
     assert.ok(
       get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'uq_instruments_dedupe'"),
@@ -39,6 +41,11 @@ test('迁移 v1–v5：schema_migrations 记录版本并建齐必需表', () => 
     assert.ok(
       get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_account_instrument'"),
       'v5 应建立事件重放索引'
+    );
+    // v6：期初快照 (账户, 标的) 唯一去重索引（G4C-3 数据库兜底）
+    assert.ok(
+      get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'uq_portfolio_openings_dedupe'"),
+      'v6 应建立期初快照去重唯一索引'
     );
 
     const missing = REQUIRED_TABLES.filter((t) => !tableExists(ctx.db, t));
@@ -57,7 +64,7 @@ test('已发布 v2 库前向迁移到最新版本：保留账户与余额并新�
     db.exec("INSERT INTO account_units (id,account_id,currency,balance_minor,as_of) VALUES ('u1','a1','HKD',123456,'2026-09-15')");
 
     const migrated = M.migrate(db);
-    assert.deepStrictEqual(migrated.applied, [3, 4, 5]);
+    assert.deepStrictEqual(migrated.applied, [3, 4, 5, 6]);
     assert.strictEqual(tableExists(db, 'asset_transfers'), true);
     assert.strictEqual(get(db, 'SELECT balance_minor FROM account_units WHERE id = ?', ['u1']).balance_minor, 123456);
   } finally {

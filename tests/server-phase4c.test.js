@@ -494,3 +494,177 @@ test('全量 PUT /state 带非法事件时整体拒绝（与单条写入同一�
   const after = await get(port, '/api/v1/state');
   assert.strictEqual(after.json.assets.securityEvents.length, 0);
 });
+
+/* ==================== 第 1 轮复核反例（G4C，见 PHASE4C_ACCEPTANCE_GAPS.md） ==================== */
+
+// G4C-1（边界化收口）：D-042④ 冻结「证券事件绝不写 txns，现金由余额单元人工核对（D-034）」，
+// 复核确认后按此修订 S4C.1 措辞。这里固化边界：事件写入后现金余额单元保持人工核对值，
+// 不被买入/卖出/分红/费用自动改写（防止未来无意引入自动扣款）。
+test('G4C-1 边界固化：证券事件后现金余额单元保持人工核对值不变', async (t) => {
+  const ctx = setup('ledger-p4c-g4c1-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  // 注入 USD 现金余额单元：2,000,000（复核反例的原始数字）
+  const st0 = (await get(port, '/api/v1/state')).json;
+  st0.assets.assetUnits.push({
+    id: 'u-cash-usd',
+    accountId: accountId,
+    currency: 'USD',
+    balanceMinor: 2000000,
+    asOf: '2026-09-15',
+    sourceType: 'manual'
+  });
+  const seed = await put(port, '/api/v1/state', { state: st0 });
+  assert.strictEqual(seed.status, 200);
+
+  // 期初 10 + 买入 2 × $5000 + 手续费 100（现金腿若存在应为 2,000,000 − 2×500,000 − 100 = 999,900）
+  await post(port, '/api/v1/portfolio-openings', {
+    accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-09-01'
+  });
+  await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId,
+    quantity: '2', priceMinor: 500000, feeMinor: 100, occurredAt: '2026-09-05'
+  });
+  await post(port, '/api/v1/security-events', {
+    eventType: 'dividend', accountId: accountId, instrumentId: instrumentId, amountMinor: 1500, occurredAt: '2026-09-08'
+  });
+
+  // 边界：现金余额单元保持人工核对值，不被事件自动改写；事件不进 txns
+  const st = (await get(port, '/api/v1/state')).json;
+  const unit = st.assets.assetUnits.find((u) => u.id === 'u-cash-usd');
+  assert.strictEqual(unit.balanceMinor, 2000000, '现金余额保持人工核对值，不随事件自动变动');
+  assert.strictEqual(st.txns.length, 0, '事件绝不写 txns');
+});
+
+// G4C-2：修改期初可制造矛盾账本 → 更新后期初必须在同一事务 strict 重放，失败回滚
+test('G4C-2 更新期初导致超额卖出 → 409 且期初与推导保持原值', async (t) => {
+  const ctx = setup('ledger-p4c-g4c2-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  const opening = await post(port, '/api/v1/portfolio-openings', {
+    accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-09-01'
+  });
+  const openingId = opening.json.item.id;
+  await post(port, '/api/v1/security-events', {
+    eventType: 'sell', accountId: accountId, instrumentId: instrumentId, quantity: '8', occurredAt: '2026-09-05'
+  });
+  let holdings = await get(port, '/api/v1/holdings');
+  assert.strictEqual(holdings.json.items[0].quantity, '2');
+
+  // 复核复现：把同一份期初从 10 改成 5——卖出 8 立即越界，必须拒绝
+  const upd = await post(port, '/api/v1/portfolio-openings', {
+    id: openingId, accountId: accountId, instrumentId: instrumentId, quantity: '5', asOf: '2026-09-01'
+  });
+  assert.strictEqual(upd.status, 409);
+  assert.strictEqual(upd.json.error.code, 'insufficient_holdings');
+
+  // 回滚后期初与推导都不变（不留矛盾账本）
+  const st = (await get(port, '/api/v1/state')).json;
+  assert.strictEqual(st.assets.holdings.length, 1);
+  assert.strictEqual(st.assets.holdings[0].quantity, '10');
+  holdings = await get(port, '/api/v1/holdings');
+  assert.strictEqual(holdings.json.items[0].quantity, '2');
+  assert.strictEqual(holdings.json.items[0].oversellEvents.length, 0);
+});
+
+// G4C-3a：PUT /state 同键二期初 → 409 整体拒绝（应用层 + 数据库唯一索引双保险）
+test('G4C-3a PUT /state 同 (账户, 标的) 两条期初 → 409 duplicate_opening 整体回滚', async (t) => {
+  const ctx = setup('ledger-p4c-g4c3a-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  const st = (await get(port, '/api/v1/state')).json;
+  st.assets.holdings = [
+    { id: 'open-a', accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-09-01' },
+    { id: 'open-b', accountId: accountId, instrumentId: instrumentId, quantity: '20', asOf: '2026-09-02' }
+  ];
+  const res = await put(port, '/api/v1/state', { state: st });
+  assert.strictEqual(res.status, 409);
+  assert.strictEqual(res.json.error.code, 'duplicate_opening');
+
+  // 回滚后期初零残留（复核实测曾 stored:2）
+  const after = (await get(port, '/api/v1/state')).json;
+  assert.strictEqual(after.assets.holdings.length, 0);
+});
+
+// G4C-3b：PUT /state 缺 id 的期初 → 400 拒绝（绝不静默丢行）
+test('G4C-3b PUT /state 缺 id 的期初 → 400 invalid_id，不静默丢弃', async (t) => {
+  const ctx = setup('ledger-p4c-g4c3b-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  const st = (await get(port, '/api/v1/state')).json;
+  st.assets.holdings = [
+    { accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-09-01' }
+  ];
+  const res = await put(port, '/api/v1/state', { state: st });
+  assert.strictEqual(res.status, 400);
+  assert.strictEqual(res.json.error.code, 'invalid_id');
+
+  const after = (await get(port, '/api/v1/state')).json;
+  assert.strictEqual(after.assets.holdings.length, 0, '缺 id 的期初不得被静默丢弃或变形落库');
+});
+
+// G4C-4：期初日期边界——早于期初 asOf 的事件视为已含在快照内，不重复叠加；同日事件正常计入
+test('G4C-4 早于期初的事件不重复计入；同日与之后的事件正常叠加', async (t) => {
+  const ctx = setup('ledger-p4c-g4c4-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  await post(port, '/api/v1/portfolio-openings', {
+    accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-09-06'
+  });
+  // 复核复现：期初 10（asOf 09-06）+ 09-01 买入 2 → 不得算成 12
+  const early = await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: '2', occurredAt: '2026-09-01'
+  });
+  assert.strictEqual(early.status, 201, '历史事件允许录入（快照已含历史），但不参与叠加');
+  let holdings = await get(port, '/api/v1/holdings');
+  assert.strictEqual(holdings.json.items[0].quantity, '10');
+  assert.strictEqual(holdings.json.items[0].eventCounts.buy, 0);
+  assert.strictEqual(holdings.json.items[0].boundarySkippedEvents.length, 1, '跳过的事件留痕可追溯');
+
+  // 期初日当天的事件正常叠加（"今天录期初、今天再记账"不受影响）
+  await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: '3', occurredAt: '2026-09-06'
+  });
+  await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: '1', occurredAt: '2026-09-07'
+  });
+  holdings = await get(port, '/api/v1/holdings');
+  assert.strictEqual(holdings.json.items[0].quantity, '14');
+  assert.strictEqual(holdings.json.items[0].eventCounts.buy, 2);
+});
+
+// G4C-5：不存在的日历日期一律拒绝（期初与证券事件同一口径）
+test('G4C-5 非真实日历日（2026-02-30）期初与事件均拒绝', async (t) => {
+  const ctx = setup('ledger-p4c-g4c5-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  const badEvent = await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: '2', occurredAt: '2026-02-30'
+  });
+  assert.strictEqual(badEvent.status, 400);
+  assert.strictEqual(badEvent.json.error.code, 'invalid_event_date');
+
+  const badOpening = await post(port, '/api/v1/portfolio-openings', {
+    accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-02-30'
+  });
+  assert.strictEqual(badOpening.status, 400);
+  assert.strictEqual(badOpening.json.error.code, 'invalid_date');
+});

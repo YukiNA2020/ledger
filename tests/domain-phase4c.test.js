@@ -184,9 +184,10 @@ test('同键多行期初取 asOf 最新一行（对历史数据的确定性防�
 
 test('有证券事件时总览估值使用推导数量（11 × $50 × 7.2）', () => {
   const withEvents = fixtureAssets((a) => {
+    // 事件日期必须晚于期初 asOf（REF=09-06，D-042 日期边界）：早于期初的事件视为已含在快照内
     a.securityEvents = [
-      { id: 'e1', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy', quantity: '2', occurredAt: '2026-09-03' },
-      { id: 'e2', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'sell', quantity: '1', occurredAt: '2026-09-04' }
+      { id: 'e1', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy', quantity: '2', occurredAt: '2026-09-07' },
+      { id: 'e2', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'sell', quantity: '1', occurredAt: '2026-09-08' }
     ];
   });
   const o = overviewOf(withEvents);
@@ -226,7 +227,8 @@ test('事件把数量减到 0 时估值贡献为 0（买入可以无期初，卖
 test('computeCloseChecklist 的持仓事实展示推导数量', () => {
   const a = fixtureAssets((mod) => {
     mod.securityEvents = [
-      { id: 'e1', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy', quantity: '2', occurredAt: '2026-09-03' }
+      // 晚于期初 asOf（REF=09-06）的事件才叠加进推导数量
+      { id: 'e1', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy', quantity: '2', occurredAt: '2026-09-07' }
     ];
   });
   const cl = Domain.computeCloseChecklist(a, { now: REF });
@@ -239,11 +241,52 @@ test('未确认分类标的的事件照常推导（§10 只产生阻塞标记）
   const a = fixtureAssets((mod) => {
     mod.instruments[0].classificationStatus = 'suggested';
     mod.securityEvents = [
-      { id: 'e1', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy', quantity: '1', occurredAt: '2026-09-03' }
+      // 晚于期初 asOf（REF=09-06）的事件才叠加进推导数量
+      { id: 'e1', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy', quantity: '1', occurredAt: '2026-09-07' }
     ];
   });
   const o = overviewOf(a);
   assert.strictEqual(o.totalAssetsMinor, 3000000 + 11 * 5000 * 7.2); // 照常估值
   assert.ok(o.blockers.some((b) => b.code === 'classification_unconfirmed')); // 但标出未确认
   assert.strictEqual(o.valuationStatus, 'estimate');
+});
+
+/* ---------------------- 期初日期边界（G4C-4，D-042 ①） ---------------------- */
+
+test('G4C-4 早于期初 asOf 的事件视为已含在快照内，不重复叠加', () => {
+  // 复核复现：期初 10（asOf 09-06）+ 09-01 买入 2 → 不得算成 12
+  const r = Domain.deriveHoldings(
+    [{ id: 'o1', accountId: 'a1', instrumentId: 'i1', quantity: '10', asOf: '2026-09-06' }],
+    [{ id: 'b1', accountId: 'a1', instrumentId: 'i1', eventType: 'buy', quantity: '2', occurredAt: '2026-09-01' }]
+  );
+  const h = r.holdings[0];
+  assert.strictEqual(h.quantity, '10');
+  assert.strictEqual(h.counts.buy, 0);
+  assert.deepStrictEqual(h.boundarySkippedEvents, ['b1'], '跳过的事件留痕可追溯');
+  assert.strictEqual(h.firstActivityAt, null, '被跳过的事件不参与活动时间戳');
+  assert.strictEqual(h.lastEventAt, null);
+});
+
+test('G4C-4 期初日当天与之后的事件正常叠加（同日录入流程不受影响）', () => {
+  const r = Domain.deriveHoldings(
+    [{ id: 'o1', accountId: 'a1', instrumentId: 'i1', quantity: '10', asOf: '2026-09-06' }],
+    [
+      { id: 'b1', accountId: 'a1', instrumentId: 'i1', eventType: 'buy', quantity: '2', occurredAt: '2026-09-06' },
+      { id: 'b2', accountId: 'a1', instrumentId: 'i1', eventType: 'buy', quantity: '3', occurredAt: '2026-09-07' }
+    ]
+  );
+  const h = r.holdings[0];
+  assert.strictEqual(h.quantity, '15');
+  assert.strictEqual(h.counts.buy, 2);
+  assert.deepStrictEqual(h.boundarySkippedEvents, []);
+  assert.strictEqual(h.lastEventAt, '2026-09-07');
+});
+
+test('G4C-4 早于期初的卖出不参与 strict 重放（历史已含在快照内）', () => {
+  const r = Domain.deriveHoldings(
+    [{ id: 'o1', accountId: 'a1', instrumentId: 'i1', quantity: '10', asOf: '2026-09-06' }],
+    [{ id: 's1', accountId: 'a1', instrumentId: 'i1', eventType: 'sell', quantity: '99', occurredAt: '2026-09-01' }],
+    { strict: true }
+  );
+  assert.strictEqual(r.holdings[0].quantity, '10');
 });

@@ -17,6 +17,9 @@
  *     风险评估、目标配置与决策表仍留给 Phase 5/6，不预建空表（避免猜测未冻结的语义）。
  *   - v4（Phase 4B 复核补口）只给 instruments 加一条表达式唯一索引，把「同一标的只有一行事实」
  *     从应用层检查提升为数据库不变量；不新增表，旧版本代码忽略该索引仍可工作。
+ *   - v5（Phase 4C）给 security_events 加 amount_minor 列（分红/费用总额落点）与事件重放索引。
+ *   - v6（Phase 4C 复核补口）给 portfolio_openings 加 (account_id, instrument_id) 唯一索引，
+ *     把「同一持仓只有一行期初事实」提升为数据库不变量（G4C-3）。
  *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
 'use strict';
@@ -361,6 +364,32 @@ const MIGRATIONS = [
         ALTER TABLE security_events ADD COLUMN amount_minor INTEGER;
         CREATE INDEX idx_events_account_instrument
           ON security_events(account_id, instrument_id, occurred_at);
+      `);
+    }
+  },
+  {
+    version: 6,
+    name: 'phase4c-opening-dedupe',
+    up(db) {
+      /* Phase 4C 复核补口（G4C-3）：同一 (账户, 标的) 只能有一行期初快照此前只在应用层
+       * 检查（单条 upsert 的 duplicate_opening），全量写入路径（PUT /state、JSON 恢复）
+       * 曾绕过它写入两行。这里把该键提升为数据库不变量，与 v4 的 instruments 去重同纪律。 */
+      const dups = all(
+        db,
+        `SELECT account_id, instrument_id, COUNT(*) AS n
+           FROM portfolio_openings GROUP BY account_id, instrument_id HAVING n > 1`
+      );
+      // 历史数据里已经有重复时**显式失败**，不替用户挑选要保留哪一行（不静默丢数据）。
+      if (dups.length) {
+        const keys = dups.map((d) => d.account_id + '/' + d.instrument_id).join('、');
+        throw Object.assign(
+          new Error('portfolio_openings 存在重复期初快照，无法建立唯一索引：' + keys + '（请先人工核对后合并）'),
+          { code: 'duplicate_opening' }
+        );
+      }
+      db.exec(`
+        CREATE UNIQUE INDEX uq_portfolio_openings_dedupe
+          ON portfolio_openings(account_id, instrument_id);
       `);
     }
   }
