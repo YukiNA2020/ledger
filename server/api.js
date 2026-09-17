@@ -268,13 +268,29 @@ const DOMAIN_ERROR_STATUS = {
   // 未知引用码也必须归位 4xx，否则"引用了不存在账户"会被误报成 500（G4C-3 连带）
   unknown_account: 422,
   unknown_instrument: 422,
+  invalid_account_type: 422,
   payload_too_large: 413,
   duplicate_instrument: 409,
   ambiguous_instrument: 409,
   duplicate_event: 409,
   duplicate_opening: 409,
+  idempotency_conflict: 409,
   insufficient_holdings: 409
 };
+
+// 幂等键必须绑定“同一路径的同一份请求语义”，不能让同一个 key 悄悄吞掉另一笔事件。
+// 对象键排序后再哈希，避免 JSON 字段顺序不同被误判为不同请求。
+function canonicalJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+function requestFingerprint(value) {
+  return crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
 
 function catalogFail(res, result) {
   const status = CATALOG_ERROR_STATUS[result.code] || 500;
@@ -449,9 +465,12 @@ function createHandler(ctx) {
     let status;
     if (code === 'unknown_account' || code === 'unknown_unit' || code === 'unknown_instrument') {
       status = 422;
-    } else if (code === 'internal_error') {
-      status = 500;
+    } else if (code === 'internal_error' || /^(?:ERR_)?SQLITE_/.test(code)) {
+      // SQLite 约束/执行错误与无 code 的编程异常属于未预期服务端失败，
+      // 不能伪装成“请求字段不合法”，也不能把底层错误码/SQL 细节回显给客户端。
+      return fail(res, 500, 'internal_error', '写入失败', false);
     } else {
+      // 历史领域错误（如 same_unit / same_currency）尚未全部进入集中表，仍按 400 兼容。
       status = DOMAIN_ERROR_STATUS[code] || 400;
     }
     return fail(res, status, code, err && err.message ? err.message : '写入失败', false);
@@ -820,9 +839,19 @@ function createHandler(ctx) {
   api['POST /api/v1/security-events'] = async (req, res) => {
     const body = await readBody(req);
     const idemKey = req.headers['idempotency-key'];
+    const fingerprint = requestFingerprint(body);
     if (idemKey) {
       const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/security-events');
-      if (cached) return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      if (cached) {
+        // 新格式把请求指纹与响应一起保存；旧数据库中的直接响应仍可兼容回放。
+        if (cached.__requestFingerprint) {
+          if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+            return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于不同的证券事件', false);
+          }
+          return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+        }
+        return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      }
     }
     const payload = body && typeof body === 'object' ? body : {};
     const clientId = typeof payload.id === 'string' ? payload.id.trim() : '';
@@ -831,14 +860,24 @@ function createHandler(ctx) {
       return fail(res, 400, 'invalid_id', '事件 id 不合法', false);
     }
     try {
-      const item = dbm.transaction(ctx.db, () => R.upsertSecurityEvent(ctx.db, payload));
-      const ins = R.getInstrument(ctx.db, payload.instrumentId);
-      const response = {
-        ok: true,
-        item: item,
-        warning: ins && ins.classificationStatus !== 'confirmed' ? 'classification_unconfirmed' : null
-      };
-      if (idemKey) R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/security-events', response);
+      // 事件事实与幂等记录必须在同一个事务提交：任一写入失败都整体回滚，
+      // 避免“事件已落库、幂等键没记住”导致重试产生第二笔事实。
+      const response = dbm.transaction(ctx.db, () => {
+        const item = R.upsertSecurityEvent(ctx.db, payload);
+        const ins = R.getInstrument(ctx.db, payload.instrumentId);
+        const result = {
+          ok: true,
+          item: item,
+          warning: ins && ins.classificationStatus !== 'confirmed' ? 'classification_unconfirmed' : null
+        };
+        if (idemKey) {
+          R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/security-events', {
+            __requestFingerprint: fingerprint,
+            response: result
+          });
+        }
+        return result;
+      });
       return sendJson(res, 201, response);
     } catch (err) {
       return upsertFail(res, err);

@@ -792,13 +792,32 @@
       var st0 = await apiState();
       var voo = (st0.assets.instruments || []).filter(function (r) { return r.symbol === 'VOO'; })[0];
       assert(voo && voo.classificationStatus === 'confirmed', '前置：VOO 应已确认（4B 场景产物）');
-      var acc = (st0.assets.assetAccounts || [])[0];
-      assert(acc, '前置：应已有账户');
       var txnsBefore = (st0.txns || []).length;
+
+      // 持仓只能关联证券账户（D-043）：创建独立券商账户，不能复用前一场景的银行账户。
+      clickAction('[data-action="asset:acc"]');
+      await waitFor(function () { return document.querySelector('#aa-name'); }, 5000, '券商账户表单');
+      document.querySelector('#aa-name').value = '布线测试券商';
+      document.querySelector('#aa-kind').value = 'broker';
+      document.querySelector('#aa-pool').value = 'investable';
+      clickAction('[data-action="asset:saveAcc"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.assetAccounts || []).some(function (a) { return a.kind === 'broker'; });
+      }, 8000, '券商账户写入事实源');
+      st0 = await apiState();
+      var acc = (st0.assets.assetAccounts || []).filter(function (a) { return a.kind === 'broker'; })[0];
+      assert(acc, '前置：应已有证券账户');
 
       // 1) 期初快照：VOO × 10
       clickAction('[data-action="holding:opening"]');
       await waitFor(function () { return document.querySelector('#ho-qty'); }, 5000, '期初弹层');
+      var openingAccountOptions = Array.prototype.slice.call(document.querySelectorAll('#ho-acc option'));
+      equal(openingAccountOptions.length, (st0.assets.assetAccounts || []).filter(function (a) { return a.kind === 'broker'; }).length,
+        '期初弹层只能列出证券账户');
+      var nonBrokerIds = (st0.assets.assetAccounts || []).filter(function (a) { return a.kind !== 'broker'; }).map(function (a) { return a.id; });
+      assert(openingAccountOptions.every(function (o) { return nonBrokerIds.indexOf(o.value) < 0; }),
+        '普通银行账户不得出现在期初选择器');
       document.querySelector('#ho-acc').value = acc.id;
       document.querySelector('#ho-inst').value = voo.id;
       document.querySelector('#ho-qty').value = '10';
@@ -812,6 +831,9 @@
       // 2) 事件：买入 2
       clickAction('[data-action="holding:event"]');
       await waitFor(function () { return document.querySelector('#he-type'); }, 5000, '事件弹层');
+      equal(document.querySelectorAll('#he-acc option').length,
+        (st0.assets.assetAccounts || []).filter(function (a) { return a.kind === 'broker'; }).length,
+        '事件弹层只能列出证券账户');
       document.querySelector('#he-type').value = 'buy';
       document.querySelector('#he-acc').value = acc.id;
       document.querySelector('#he-inst').value = voo.id;

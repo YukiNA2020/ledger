@@ -740,9 +740,10 @@
 
   function holdingOpeningSheet() {
     var a = Domain.normalizeAssets(state.assets);
-    if (!a.assetAccounts.length) { toast('请先创建账户', 'warn'); return; }
+    var brokerAccounts = a.assetAccounts.filter(function (acc) { return acc.kind === 'broker'; });
+    if (!brokerAccounts.length) { toast('请先创建证券账户（账户类型选择券商）', 'warn'); return; }
     if (!a.instruments.length) { toast('请先在标的目录建立标的', 'warn'); return; }
-    var accOpts = a.assetAccounts.map(function (acc) {
+    var accOpts = brokerAccounts.map(function (acc) {
       return '<option value="' + esc(acc.id) + '">' + esc(acc.name) + '</option>';
     }).join('');
     var instOpts = a.instruments.map(function (ins) {
@@ -763,9 +764,10 @@
 
   function holdingEventSheet() {
     var a = Domain.normalizeAssets(state.assets);
-    if (!a.assetAccounts.length) { toast('请先创建账户', 'warn'); return; }
+    var brokerAccounts = a.assetAccounts.filter(function (acc) { return acc.kind === 'broker'; });
+    if (!brokerAccounts.length) { toast('请先创建证券账户（账户类型选择券商）', 'warn'); return; }
     if (!a.instruments.length) { toast('请先在标的目录建立标的', 'warn'); return; }
-    var accOpts = a.assetAccounts.map(function (acc) {
+    var accOpts = brokerAccounts.map(function (acc) {
       return '<option value="' + esc(acc.id) + '">' + esc(acc.name) + '</option>';
     }).join('');
     var instOpts = a.instruments.map(function (ins) {

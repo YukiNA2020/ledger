@@ -286,6 +286,52 @@ test('Idempotency-Key：同一 key 重放返回首次响应，不重复写入', 
   assert.strictEqual(events.json.items.length, 1, '幂等重放不得产生第二行');
 });
 
+test('G4C-7 Idempotency-Key 绑定请求体，复用到不同事件 → 409 且不新增事实', async (t) => {
+  const ctx = setup('ledger-p4c-idem-conflict-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+  const headers = { 'Idempotency-Key': 'idem-4c-conflict' };
+
+  const first = await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId,
+    quantity: '2', occurredAt: '2026-09-05'
+  }, { headers: headers });
+  assert.strictEqual(first.status, 201);
+
+  const conflict = await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId,
+    quantity: '3', occurredAt: '2026-09-05'
+  }, { headers: headers });
+  assert.strictEqual(conflict.status, 409);
+  assert.strictEqual(conflict.json.error.code, 'idempotency_conflict');
+
+  const events = await get(port, '/api/v1/security-events');
+  assert.strictEqual(events.json.items.length, 1);
+  assert.strictEqual(events.json.items[0].quantity, '2');
+});
+
+test('G4C-7 事件与幂等记录同事务：幂等记录写失败时事件整体回滚', async (t) => {
+  const ctx = setup('ledger-p4c-idem-atomic-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  ctx.db.exec(`CREATE TRIGGER reject_4c_idempotency
+    BEFORE INSERT ON idempotency_keys
+    BEGIN SELECT RAISE(ABORT, 'forced idempotency failure'); END`);
+  const failed = await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: accountId, instrumentId: instrumentId,
+    quantity: '2', occurredAt: '2026-09-05'
+  }, { headers: { 'Idempotency-Key': 'idem-4c-atomic' } });
+  assert.strictEqual(failed.status, 500, JSON.stringify(failed.json));
+
+  const events = await get(port, '/api/v1/security-events');
+  assert.strictEqual(events.json.items.length, 0, '幂等记录失败不得留下已提交事件');
+});
+
 test('超额卖出 → 409 insufficient_holdings，事务整体回滚不留下半个事件', async (t) => {
   const ctx = setup('ledger-p4c-over-');
   const srv = await startServer(ctx);
@@ -347,6 +393,7 @@ test('未知引用 → 422；非法字段 → 400（事件类型/数量/日期/�
     [{ eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: 'abc', occurredAt: '2026-09-05' }, 400, 'invalid_quantity'],
     [{ eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: '1', occurredAt: '2026/09/05' }, 400, 'invalid_event_date'],
     [{ eventType: 'dividend', accountId: accountId, instrumentId: instrumentId, occurredAt: '2026-09-05' }, 400, 'invalid_event_amount'],
+    [{ eventType: 'dividend', accountId: accountId, instrumentId: instrumentId, quantity: '-1', amountMinor: 100, occurredAt: '2026-09-05' }, 400, 'invalid_quantity'],
     [{ eventType: 'buy', accountId: accountId, instrumentId: instrumentId, quantity: '1', amountMinor: 100, occurredAt: '2026-09-05' }, 400, 'invalid_event_amount']
   ];
   for (const [body, expectStatus, expectCode] of cases) {
@@ -493,6 +540,72 @@ test('全量 PUT /state 带非法事件时整体拒绝（与单条写入同一�
   // 回滚后事件不得残留
   const after = await get(port, '/api/v1/state');
   assert.strictEqual(after.json.assets.securityEvents.length, 0);
+});
+
+test('G4C-8 持仓只允许证券账户；单条与全量路径均以 422 拒绝普通账户', async (t) => {
+  const ctx = setup('ledger-p4c-account-kind-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const seeded = await seedAccountAndInstrument(port);
+  const bank = await post(port, '/api/v1/accounts', { name: '测试银行', kind: 'bank', pool: 'safety' });
+  assert.strictEqual(bank.status, 201);
+  const bankId = bank.json.item.id;
+
+  const opening = await post(port, '/api/v1/portfolio-openings', {
+    accountId: bankId, instrumentId: seeded.instrumentId, quantity: '1', asOf: '2026-09-01'
+  });
+  assert.strictEqual(opening.status, 422);
+  assert.strictEqual(opening.json.error.code, 'invalid_account_type');
+
+  const event = await post(port, '/api/v1/security-events', {
+    eventType: 'buy', accountId: bankId, instrumentId: seeded.instrumentId,
+    quantity: '1', occurredAt: '2026-09-02'
+  });
+  assert.strictEqual(event.status, 422);
+  assert.strictEqual(event.json.error.code, 'invalid_account_type');
+
+  const st = (await get(port, '/api/v1/state')).json;
+  st.assets.securityEvents = [{
+    id: 'ev-bank', eventType: 'buy', accountId: bankId, instrumentId: seeded.instrumentId,
+    quantity: '1', occurredAt: '2026-09-02'
+  }];
+  const full = await put(port, '/api/v1/state', { state: st });
+  assert.strictEqual(full.status, 422);
+  assert.strictEqual(full.json.error.code, 'invalid_account_type');
+  assert.strictEqual((await get(port, '/api/v1/security-events')).json.items.length, 0);
+});
+
+test('G4C-9 事件扩展字段无损、冗余币种不采信、分红可选数量被保留但不改持仓', async (t) => {
+  const ctx = setup('ledger-p4c-event-fidelity-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+
+  await post(port, '/api/v1/portfolio-openings', {
+    accountId: accountId, instrumentId: instrumentId, quantity: '10', asOf: '2026-09-01'
+  });
+  const dividend = await post(port, '/api/v1/security-events', {
+    id: 'ev-div-extra', eventType: 'dividend', accountId: accountId, instrumentId: instrumentId,
+    quantity: '10', amountMinor: 1500, currency: 'HKD', occurredAt: '2026-09-08',
+    sourceRef: 'broker-note-1'
+  });
+  assert.strictEqual(dividend.status, 201);
+  assert.strictEqual(dividend.json.item.quantity, '10');
+  assert.strictEqual(dividend.json.item.currency, 'USD', '币种必须从标的推导');
+  assert.strictEqual(dividend.json.item.sourceRef, 'broker-note-1', '未知扩展字段必须保留');
+
+  let holdings = await get(port, '/api/v1/holdings');
+  assert.strictEqual(holdings.json.items[0].quantity, '10', '分红携带的可选数量不得改变持仓');
+
+  const st = (await get(port, '/api/v1/state')).json;
+  const roundtrip = await put(port, '/api/v1/state', { state: st });
+  assert.strictEqual(roundtrip.status, 200);
+  const events = await get(port, '/api/v1/security-events');
+  assert.strictEqual(events.json.items[0].currency, 'USD');
+  assert.strictEqual(events.json.items[0].quantity, '10');
+  assert.strictEqual(events.json.items[0].sourceRef, 'broker-note-1');
 });
 
 /* ==================== 第 1 轮复核反例（G4C，见 PHASE4C_ACCEPTANCE_GAPS.md） ==================== */

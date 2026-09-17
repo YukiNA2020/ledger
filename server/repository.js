@@ -125,6 +125,7 @@ const KNOWN = {
     'priceMinor',
     'feeMinor',
     'amountMinor',
+    'currency',
     'occurredAt'
   ],
   quotes: ['instrumentId', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status'],
@@ -704,8 +705,14 @@ function validateOpeningRow(db, o, at) {
   if (!o.accountId || !o.instrumentId) {
     throw Object.assign(new Error('期初快照必须同时指向账户与标的（' + where + '）'), { code: 'invalid_opening' });
   }
-  if (!get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [String(o.accountId)])) {
+  const account = get(db, 'SELECT id, kind FROM asset_accounts WHERE id = ?', [String(o.accountId)]);
+  if (!account) {
     throw Object.assign(new Error('期初快照关联的账户不存在（' + where + '）'), { code: 'unknown_account' });
+  }
+  if (account.kind !== 'broker') {
+    throw Object.assign(new Error('期初持仓只能关联证券账户（kind=broker）（' + where + '）'), {
+      code: 'invalid_account_type'
+    });
   }
   if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [String(o.instrumentId)])) {
     throw Object.assign(new Error('期初快照关联的标的不存在（' + where + '）'), { code: 'unknown_instrument' });
@@ -826,6 +833,18 @@ function validateEventRow(db, e, at) {
   if (!e.accountId || !e.instrumentId) {
     throw Object.assign(new Error('证券事件必须同时指向账户与标的（' + where + '）'), { code: 'invalid_event' });
   }
+  const account = get(db, 'SELECT id, kind FROM asset_accounts WHERE id = ?', [String(e.accountId)]);
+  if (!account) {
+    throw Object.assign(new Error('事件关联的账户不存在（' + where + '）'), { code: 'unknown_account' });
+  }
+  if (account.kind !== 'broker') {
+    throw Object.assign(new Error('证券事件只能关联证券账户（kind=broker）（' + where + '）'), {
+      code: 'invalid_account_type'
+    });
+  }
+  if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [String(e.instrumentId)])) {
+    throw Object.assign(new Error('事件关联的标的不存在（' + where + '）'), { code: 'unknown_instrument' });
+  }
   const eventType = String(e.eventType || '').trim();
   if (Domain.SECURITY_EVENT_TYPES.indexOf(eventType) === -1) {
     throw Object.assign(new Error('证券事件类型不在词表内：' + eventType + '（' + where + '）'), {
@@ -853,6 +872,15 @@ function validateEventRow(db, e, at) {
         code: 'invalid_event_amount'
       });
     }
+    if (e.quantity != null && String(e.quantity).trim() !== '') {
+      const q = Domain.parseDecimal(e.quantity);
+      if (!q || !(q.v > 0)) {
+        throw Object.assign(new Error('分红/费用事件携带数量时必须为正定点数（' + where + '）'), {
+          code: 'invalid_quantity'
+        });
+      }
+      quantity = String(e.quantity).trim();
+    }
   }
   if (e.priceMinor != null && (!Number.isSafeInteger(e.priceMinor) || e.priceMinor < 0)) {
     throw Object.assign(new Error('每股价格必须是非负整数（' + where + '）'), { code: 'invalid_amount' });
@@ -869,7 +897,10 @@ function validateEventRow(db, e, at) {
     priceMinor: e.priceMinor == null ? null : e.priceMinor,
     feeMinor: e.feeMinor == null ? null : e.feeMinor,
     amountMinor: eventType === 'buy' || eventType === 'sell' ? null : e.amountMinor,
-    occurredAt: String(e.occurredAt)
+    occurredAt: String(e.occurredAt),
+    // 未知扩展字段必须随全量写入/备份往返保留；currency 属于可推导冗余字段，
+    // 已列入 KNOWN，绝不进入 extra_json 覆盖数据库从标的推导出的币种。
+    extra: extraJson(e, KNOWN.securityEvents)
   };
 }
 
@@ -892,7 +923,7 @@ function insertEventRow(db, ev) {
       ev.amountMinor,
       ins ? ins.currency : null,
       ev.occurredAt,
-      extraJson(ev, KNOWN.securityEvents)
+      ev.extra
     ]
   );
 }
@@ -907,12 +938,6 @@ function upsertSecurityEvent(db, e) {
     throw Object.assign(new Error('证券事件已存在：' + ev.id + '（同一事件不得重复提交）'), {
       code: 'duplicate_event'
     });
-  }
-  if (!get(db, 'SELECT id FROM asset_accounts WHERE id = ?', [ev.accountId])) {
-    throw Object.assign(new Error('事件关联的账户不存在'), { code: 'unknown_account' });
-  }
-  if (!get(db, 'SELECT id FROM instruments WHERE id = ?', [ev.instrumentId])) {
-    throw Object.assign(new Error('事件关联的标的不存在'), { code: 'unknown_instrument' });
   }
   insertEventRow(db, ev);
   // 全量重放校验：唯一推导实现 + strict 卖出检查（D-025），不合格即抛错回滚
