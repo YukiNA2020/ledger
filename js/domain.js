@@ -396,6 +396,197 @@
     };
   }
 
+  /* ------------------------------ Phase 4D：行情写入规则（D-044） ------------------------------ */
+
+  // 手动兜底来源：用户显式录入的报价/汇率（Phase 3 的手动汇率、4D 的手动补价）。
+  // 它不是"又一个 provider"，而是用户判断：自动更新不得覆盖它（与 D-037 的 confirmed 锁定同纪律）。
+  var MANUAL_PROVIDER = 'manual';
+
+  // 自动更新的两个作用域（4D）：汇率与报价各有独立的启用开关与成败语义。
+  var MARKET_SCOPES = ['fx', 'quotes'];
+
+  // 元素键：同一元素键上只应存在一行事实（写入路径先按该键替换再插入）。
+  //   quotes   → (标的, 价格日)
+  //   fxRates  → (币对, 汇率日)
+  // 注意：数据库 v1 的唯一索引 uq_quotes_dedupe 带 provider，即「同一价格日可不同 provider 并存」
+  // （被 tests/server-migration.test.js 冻结为既有口径），所以"元素键唯一"是**写入路径**的不变量，
+  // 不是数据库不变量；理由与取舍见 migrations v7 注释与 DECISIONS D-044。
+  function marketElementKey(kind, row) {
+    if (!row) return null;
+    function part(v) {
+      return v == null ? '' : String(v).trim();
+    }
+    if (kind === 'quotes') {
+      var iid = part(row.instrumentId);
+      var pd = part(row.priceDate);
+      if (!iid || !pd) return null;
+      return iid + '|' + pd;
+    }
+    if (kind === 'fx') {
+      var b = part(row.base);
+      var q = part(row.quote);
+      var rd = part(row.rateDate);
+      if (!b || !q || !rd) return null;
+      return b + '|' + q + '|' + rd;
+    }
+    return null;
+  }
+
+  // 一次行情写入的合并计划（纯函数、无 IO）：把"能不能覆盖"从仓储层抽出来，
+  // 让单条写入、全量写入与今后的其他入口共用同一套规则（D-025 单一实现）。
+  // 返回 { write, skip, replaced }：
+  //   write    —— 允许落库的 incoming 行（保持传入顺序）
+  //   skip     —— 被拒绝的 incoming 行，带原因（manual_locked / invalid_row）与对应既有行
+  //   replaced —— 将被 write 覆盖掉的既有行（供响应报告"已更新"）
+  // 规则（D-044）：① manual 行是用户显式事实，总是写入；
+  //               ② 自动源不得覆盖同一元素键上已存在的 manual 行（跳过并留痕，只提示差异）；
+  //               ③ 其余情况按元素键替换（同键后到的覆盖先到的，结果与传入顺序一致）。
+  // 手动锁的分组键与数据日：锁定按「一个标的」/「一个币对」整组判定，而不是只看单个元素键 ——
+  // 用户手动补一天的价，语义是"这个标的那一天的价由我确认"，所以自动源不得再写**同一天或更早**的观测；
+  // 但更新的数据日仍可写入（新交易日的新事实不该被历史手动值永久挡住）。
+  function marketGroupKey(kind, row) {
+    if (!row) return null;
+    if (kind === 'quotes') {
+      var iid = row.instrumentId == null ? '' : String(row.instrumentId).trim();
+      return iid || null;
+    }
+    if (kind === 'fx') {
+      var b = row.base == null ? '' : String(row.base).trim();
+      var q = row.quote == null ? '' : String(row.quote).trim();
+      return b && q ? b + '/' + q : null;
+    }
+    return null;
+  }
+
+  function marketRowDate(kind, row) {
+    if (!row) return null;
+    if (kind === 'quotes') return row.priceDate == null ? null : String(row.priceDate).trim() || null;
+    if (kind === 'fx') return row.rateDate == null ? null : String(row.rateDate).trim() || null;
+    return null;
+  }
+
+  function planMarketMerge(kind, existingRows, incomingRows) {
+    var byKey = {};
+    var manualMaxDate = {};
+    var allExisting = [];
+    (existingRows || []).forEach(function (r) {
+      var k = marketElementKey(kind, r);
+      if (!k) return;
+      allExisting.push({ key: k, row: r });
+      if (!byKey[k]) byKey[k] = r;
+      if (String((r && r.provider) || '') === MANUAL_PROVIDER) {
+        var g = marketGroupKey(kind, r);
+        var d = marketRowDate(kind, r);
+        if (g && d && (!manualMaxDate[g] || d > manualMaxDate[g])) manualMaxDate[g] = d;
+      }
+    });
+    var write = [];
+    var skip = [];
+    var writeKeys = {};
+    (incomingRows || []).forEach(function (r) {
+      var k = marketElementKey(kind, r);
+      if (!k) {
+        skip.push({ row: r, reason: 'invalid_row', existing: null });
+        return;
+      }
+      var isManual = String((r && r.provider) || '') === MANUAL_PROVIDER;
+      var g = marketGroupKey(kind, r);
+      var d = marketRowDate(kind, r);
+      // 手动事实的冻结范围：同组内 ≤ 手动行数据日的观测一律不写。判定用**全部**既有行，
+      // 而不是只看第一个同键行 —— 历史库允许同一价格日并存不同 provider 的两行，
+      // 只看一条可能漏掉 manual 行，于是自动更新会连带删掉用户的手动事实。
+      if (!isManual && g && d && manualMaxDate[g] && !(d > manualMaxDate[g])) {
+        skip.push({ row: r, reason: 'manual_locked', existing: byKey[k] || null });
+        return;
+      }
+      write.push(r);
+      writeKeys[k] = true;
+    });
+    var replaced = allExisting
+      .filter(function (e) {
+        return writeKeys[e.key];
+      })
+      .map(function (e) {
+        return e.row;
+      });
+    return { write: write, skip: skip, replaced: replaced };
+  }
+
+  // 需要更新行情的标的（4D）：有持仓事实的标的（期初或证券事件）或已有报价的标的。
+  // 只按事实判断，不按"用户可能想看什么"猜测；输出按 symbol 排序，保证相同输入得到相同顺序。
+  function requiredQuoteSymbols(assets) {
+    var a = assets || {};
+    var held = {};
+    (a.holdings || []).forEach(function (h) {
+      if (h && h.instrumentId) held[h.instrumentId] = true;
+    });
+    (a.securityEvents || []).forEach(function (e) {
+      if (e && e.instrumentId) held[e.instrumentId] = true;
+    });
+    (a.quotes || []).forEach(function (q) {
+      if (q && q.instrumentId) held[q.instrumentId] = true;
+    });
+    var byId = {};
+    (a.instruments || []).forEach(function (i) {
+      if (i && i.id) byId[i.id] = i;
+    });
+    return Object.keys(held)
+      .map(function (id) {
+        var ins = byId[id];
+        if (!ins) return null;
+        return {
+          instrumentId: id,
+          symbol: ins.symbol == null ? '' : String(ins.symbol),
+          exchange: ins.exchange == null ? null : String(ins.exchange)
+        };
+      })
+      .filter(function (x) {
+        return !!x;
+      })
+      .sort(function (x, y) {
+        return x.instrumentId < y.instrumentId ? -1 : x.instrumentId > y.instrumentId ? 1 : 0;
+      });
+  }
+
+  // 需要更新汇率的币对（4D）：账上出现过的非 CNY 币种（余额单元、负债、权益、标的、报价）
+  // 各自对 CNY 折算，外加用户已登记过的币对本来的方向。
+  // 汇总币种是 CNY（D-008），因此"对 CNY"是唯一的自动更新目标；反向币对不自动登记。
+  function requiredFxPairs(assets) {
+    var a = assets || {};
+    var pairs = {};
+    function addCurrency(c) {
+      var v = c == null ? '' : String(c).trim().toUpperCase();
+      if (!v || v === 'CNY') return;
+      if (CURRENCIES.indexOf(v) === -1) return;
+      pairs[v + '/CNY'] = { base: v, quote: 'CNY' };
+    }
+    (a.assetUnits || []).forEach(function (u) {
+      if (u) addCurrency(u.currency);
+    });
+    (a.liabilities || []).forEach(function (l) {
+      if (l) addCurrency(l.currency);
+    });
+    (a.entitlements || []).forEach(function (e) {
+      if (e) addCurrency(e.currency);
+    });
+    (a.instruments || []).forEach(function (i) {
+      if (i) addCurrency(i.currency);
+    });
+    (a.quotes || []).forEach(function (q) {
+      if (q) addCurrency(q.currency);
+    });
+    (a.fxRates || []).forEach(function (r) {
+      if (!r || !r.base || !r.quote || r.base === r.quote) return;
+      if (CURRENCIES.indexOf(r.base) === -1 || CURRENCIES.indexOf(r.quote) === -1) return;
+      pairs[r.base + '/' + r.quote] = { base: r.base, quote: r.quote };
+    });
+    return Object.keys(pairs)
+      .sort()
+      .map(function (k) {
+        return pairs[k];
+      });
+  }
+
   /* ------------------------------ 领域对象默认值 ------------------------------ */
 
   function emptyAssets() {
@@ -718,6 +909,12 @@
     RISK_CLASSES: RISK_CLASSES,
     EXPOSURE_MARKETS: EXPOSURE_MARKETS,
     SECURITY_EVENT_TYPES: SECURITY_EVENT_TYPES,
+    MANUAL_PROVIDER: MANUAL_PROVIDER,
+    MARKET_SCOPES: MARKET_SCOPES,
+    marketElementKey: marketElementKey,
+    planMarketMerge: planMarketMerge,
+    requiredQuoteSymbols: requiredQuoteSymbols,
+    requiredFxPairs: requiredFxPairs,
     ASSET_KEYS: ASSET_KEYS,
     MAX_STALE_DAYS: MAX_STALE_DAYS,
     isAssetClass: isAssetClass,

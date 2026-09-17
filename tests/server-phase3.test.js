@@ -320,13 +320,13 @@ test('S3.3 应急金覆盖月数由服务端按必要支出重算', async () => 
   }
 });
 
-test('未实现的 Phase 4/5 写接口仍返回 501 并说明所属阶段', async () => {
+test('未实现的 Phase 5 写接口仍返回 501 并说明所属阶段', async () => {
   const ctx = setup('ledger-p3-');
   const srv = await startServer(ctx);
   try {
     const cases = [
-      // portfolio-openings 已在 Phase 4C 实现（D-042），不再是 501
-      ['/api/v1/market-data/refresh', 'Phase 4'],
+      // portfolio-openings 已在 Phase 4C 实现（D-042）；market-data/refresh 已在 Phase 4D 实现（D-044），
+      // 两者都不再是 501 —— 4D 的行情刷新语义见 tests/server-phase4d.test.js。
       ['/api/v1/risk-assessments', 'Phase 5'],
       ['/api/v1/recommendations', 'Phase 5']
     ];

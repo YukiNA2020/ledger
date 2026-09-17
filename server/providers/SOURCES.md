@@ -219,3 +219,103 @@ curl -sS -m 15 "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.51
 
 **核心结论：** 截至 2026-09-15，**"免费 + 无 key + 有官方条款 + 覆盖 A/H/US ETF 日终"的行情源不存在**。
 因此 D-036 的行情部分不冻结端点，改为冻结**启用门禁**（D-038）；门禁未通过前，自动抓取默认关闭，行情以**手动补价 + 本地缓存**为唯一事实来源。
+
+## 8. 行情门禁复核（Phase 4D 开工前，2026-09-17）
+
+> 复核目的：D-038 规定 4D 接入任何自动行情源前必须逐条满足六条门禁。本节是 **4D 开工前的强制复测**，用于判定 4D 的行情侧是「启用自动抓取」还是「保持默认关闭」。
+> 复现环境：macOS（本机），`curl -sS -m 20`，未带任何 API key（`demo` 字样者为候选方文档公开的体验 key）。**本节命令全部为人工取证，不属于自动测试**；`node --test` 仍保持零公网访问。
+
+### 8.1 汇率：Frankfurter（固定 ECB 端点）—— 复核通过
+
+```bash
+curl -sS -o /tmp/fx1.json -w "HTTP=%{http_code} type=%{content_type} size=%{size_download}\n" \
+  "https://api.frankfurter.dev/v2/providers/ecb/rates?base=USD&quotes=CNY,HKD"
+# → HTTP=200 type=application/json; charset=utf-8 size=127
+# → [{"date":"2026-09-16","base":"USD","quote":"CNY","rate":6.7071},
+#    {"date":"2026-09-16","base":"USD","quote":"HKD","rate":7.8449}]
+
+curl -sS -o /tmp/fx2.json -w "HTTP=%{http_code} type=%{content_type} size=%{size_download}\n" \
+  "https://api.frankfurter.dev/v2/rates?base=USD&quotes=CNY,HKD"
+# → HTTP=200 type=application/json; charset=utf-8 size=127
+# → [{"date":"2026-09-17","base":"USD","quote":"CNY","rate":6.7065},
+#    {"date":"2026-09-17","base":"USD","quote":"HKD","rate":7.8519}]
+```
+
+- **再次印证 D-036 必须 pin provider 端点**：同一时刻，pin ECB 端点给出 `date=2026-09-16`（ECB 前一工作日参考汇率），默认端点给出 `date=2026-09-17` 且**数值不同**（USD/CNY 6.7071 vs 6.7065，USD/HKD 7.8449 vs 7.8519）。默认端点仍是多来源混合值，不满足"ECB 参考汇率"口径。
+- 条款与限额：`https://frankfurter.dev/`（2026-09-17 抓取）—— 页面明示 **"No API key"**（无 key）、**"open source"**（开源可自托管）；免费、无 key、无需注册。
+- 结论：**4D 汇率侧可直接接入自动更新**（唯一通过门禁的源，D-036）。
+
+### 8.2 行情候选逐一复测（全部不通过）
+
+```bash
+# Stooq：单标的报价 CSV
+curl -sS -m 20 "https://stooq.com/q/l/?s=voo.us&f=sd2t2ohlcv&h&e=csv"
+# → HTTP=404 type=text/html size=271
+# Stooq：日线 CSV
+curl -sS -m 20 "https://stooq.com/q/d/l/?s=voo.us&i=d"
+# → HTTP=200 type=text/html; charset=utf-8 size=796
+#   （仍是 "This site requires JavaScript to verify your browser." 挑战页，非 CSV）
+
+# Yahoo chart
+curl -sS -m 20 "https://query1.finance.yahoo.com/v8/finance/chart/VOO?range=5d&interval=1d"
+# → HTTP=429 type=text/html size=23
+
+# Twelve Data：港股日线（文档公开的 demo key）
+curl -sS -m 20 "https://api.twelvedata.com/time_series?symbol=2800&exchange=HKEX&interval=1day&outputsize=2&apikey=demo"
+# → HTTP=401 type=application/json; charset=utf-8 size=298
+
+# Alpha Vantage（demo key，仅美股）
+curl -sS -m 20 "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=IBM&apikey=demo"
+# → HTTP=200 type=application/json size=21307（仍可用，但 A/H 覆盖与限额见 §5）
+
+# Financial Modeling Prep
+curl -sS -m 20 "https://financialmodelingprep.com/api/v3/quote-share?symbol=VOO&apikey=demo"
+# → HTTP=401 type=application/json; charset=utf-8 size=184
+
+# EODHD
+curl -sS -m 20 "https://eodhd.com/api/eod/VOO.US?api_token=demo&fmt=json"
+# → HTTP=403 type=text/html; charset=utf-8 size=9
+
+# Polygon.io（无 key）
+curl -sS -m 20 "https://api.polygon.io/v2/aggs/ticker/VOO/prev?apiKey="
+# → HTTP=401 type=application/json size=101
+
+# Finnhub（demo token）
+curl -sS -m 20 "https://finnhub.io/api/v1/quote?symbol=AAPL&token=demo"
+# → HTTP=401 type=application/json; charset=utf-8 size=28
+```
+
+与 2026-09-15 相比的变化：Yahoo 由 `403` 变为 `429`（同样不可用）；其余候选结论不变。**新增复测的 FMP / EODHD / Polygon / Finnhub 四家在不携带真实 key 时全部 401/403，且均为「需 key + A/H 日终属付费层或覆盖不足」的同一形态。**
+
+### 8.3 降级通道候选（腾讯 / 东方财富）—— 仍可达，仍不冻结
+
+```bash
+curl -sS -m 20 "https://qt.gtimg.cn/q=sh510300,hk00700,usVOO"
+# → HTTP=200 type=text/html; charset=GBK size=1304
+# → v_sh510300="1~沪深300ETF华泰柏瑞~510300~4.532~4.550~4.539~...~20260917161444~-0.018~-0.40~..."
+
+curl -sS -m 20 "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.510300&fields1=f1,f2,f3&fields2=f51,f52,f53&klt=101&fqt=1&end=20500101&lmt=3"
+# → HTTP=200 type=application/json; charset=UTF-8 size=226
+# → {"rc":0,...,"data":{"code":"510300","name":"沪深300ETF华泰柏瑞",
+#    "klines":["2026-09-15,4.541,4.523","2026-09-16,4.522,4.550","2026-09-17,4.539,4.532"]}}
+```
+
+- 覆盖（A 股 / 港股 / 美股）、无 key、可返回当日与历史日线 —— 实测仍全部可达，**但依赖"无文档、无 ToS、无限额、无 SLA"的公开端点**。
+- 结论不变：**不满足 D-038 门禁，不得作为已确认主源**；仅保留为"需用户显式接受非官方风险"的降级通道候选（4D 未启用，D-044）。
+
+### 8.4 六条门禁逐条对照（2026-09-17 复测结论）
+
+| 候选 | ①官方条款含自动化授权 | ②API 版本与文档 | ③限额 | ④认证方式 | ⑤市场覆盖声明（A/H/US ETF 日终） | ⑥失败语义映射 | 是否通过 |
+|---|---|---|---|---|---|---|---|
+| Frankfurter（pin ECB） | ✅（`frankfurter.dev`） | ✅ `/v2/providers/ecb/rates` | ✅ 无配额（仅防滥用） | ✅ 无 key | 不适用（汇率） | ✅ §1.3 | **✅ 仅汇率** |
+| Stooq | ❌ | ❌ | ❌ | — | ❌（接口实测失效） | ❌ | ❌ |
+| Yahoo chart | ❌ | ❌（非公开 API） | ❌ | ❌ | ❌（429） | ❌ | ❌ |
+| Twelve Data Basic | ✅ | ✅ | ✅ 8/分、800/天 | ✅ apikey | ❌ 仅 3 市场（A/H 属 Grow $29/月） | ✅ | ❌ |
+| Alpha Vantage | ✅ | ✅ | ⚠️ 25/天 | ✅ apikey | ❌ 以美股为主 | ✅ | ❌ |
+| FMP / EODHD / Polygon / Finnhub | 部分 ✅ | ✅ | 各不同 | ✅ apikey | ❌（免费层不含 A/H 日终） | 未逐一取证 | ❌ |
+| 腾讯 / 东方财富 | ❌ 无 | ❌ 无 | ❌ 未公开 | ✅ 无 key | 是 | ❌ | ❌ |
+
+**4D 门禁结论（2026-09-17）：仍无任何候选同时通过六条门禁。**
+→ 因此 4D **不启用自动行情抓取**（产品内开关默认 `off`）；行情继续保持「手动补价 + 本地缓存」为唯一事实来源，未覆盖/失败标的走手动补价。
+→ 4D **启用汇率自动更新**（Frankfurter pin ECB，D-036），并保留 Phase 3 的手动汇率登记兜底。
+→ 若今后要启用自动抓取，必须先把本节 §8.1–§8.3 的证据补齐到某候选满足六条门禁，再以新决策条目替换 D-038 的对应结论；**不得以"免费能用就行"静默接入无条款端点**。

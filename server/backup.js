@@ -64,8 +64,10 @@ const REQUIRED_INDEXES_BY_VERSION = {
 // 必需**列**随 schema 版本增长（复核 G4C-6）：有些事实承载在列上，光看表齐不齐看不出来。
 // v5 的 amount_minor 承载分红/费用事件总额——缺列的 v5 库恢复后迁移器不会补列
 // （版本已应用），读取事件时才炸。校验必须把这类库挡在切换之前。
+// v7 的 quotes.source_symbol 承载行情 provider 返回的原始代码（Phase 4D 追溯要求）。
 const REQUIRED_COLUMNS_BY_VERSION = {
-  5: [{ table: 'security_events', name: 'amount_minor' }]
+  5: [{ table: 'security_events', name: 'amount_minor' }],
+  7: [{ table: 'quotes', name: 'source_symbol' }]
 };
 
 function requiredTablesFor(version) {

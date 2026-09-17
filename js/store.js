@@ -408,6 +408,24 @@
     });
   }
 
+  /* ------------------------- Phase 4D：行情与汇率 ------------------------- */
+
+  // 手动补价：行情源不可用/未覆盖时的兜底入口（服务端固定 provider='manual'）。
+  function saveQuote(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/quotes', { method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey });
+    });
+  }
+
+  // 刷新行情与汇率。服务端返回的是一次"刷新尝试的报告"（ok / 逐作用域 status），
+  // 外部 provider 失败不会抛错，因此这里按普通响应处理，由页面决定怎么提示。
+  function refreshMarketData(payload) {
+    return requireWriteMode().then(function () {
+      return apiFetch('/market-data/refresh', { method: 'POST', body: payload || {} });
+    });
+  }
+
   return {
     MODE_UNKNOWN: MODE_UNKNOWN,
     MODE_API: MODE_API,
@@ -432,6 +450,8 @@
     createInstrument: createInstrument,
     confirmInstrument: confirmInstrument,
     listHoldings: listHoldings,
-    listSecurityEvents: listSecurityEvents
+    listSecurityEvents: listSecurityEvents,
+    saveQuote: saveQuote,
+    refreshMarketData: refreshMarketData
   };
 });

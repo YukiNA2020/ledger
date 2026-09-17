@@ -344,7 +344,7 @@ test('确认接口：冲突提示带 provider 候选值与 provenance，本地�
 
 /* ============================== 边界：不碰 4C/4D ============================== */
 
-test('4C 起持仓与事件写入已实现，行情刷新仍返回 501', async (t) => {
+test('4C 起持仓与事件写入已实现，行情刷新由 4D 接管且保持自动抓取关闭', async (t) => {
   const ctx = setup('ledger-p4b-scope-');
   const srv = await startServer(ctx);
   t.after(() => srv.close().then(() => ctx.close()));
@@ -356,10 +356,13 @@ test('4C 起持仓与事件写入已实现，行情刷新仍返回 501', async (
   const events = await post(port, '/api/v1/security-events', {});
   assert.strictEqual(events.status, 400);
 
-  // 行情刷新仍属 4D（且要过 D-038 门禁），保持 501
+  // market-data/refresh 属 Phase 4D，已在 4D 实现（不再是 501）；
+  // D-038 门禁未通过 → 行情作用域 200 + skipped(auto_fetch_disabled)，不发起任何请求。
   const res = await post(port, '/api/v1/market-data/refresh', {});
-  assert.strictEqual(res.status, 501, 'market-data/refresh 应为 501（属 4D，且受 D-038 门禁）');
-  assert.ok(res.json.error && res.json.error.message, '应说明所属阶段');
+  assert.strictEqual(res.status, 200, 'market-data/refresh 已在 4D 实现');
+  const quoteScope = res.json.scopes.filter((s) => s.scope === 'quotes')[0];
+  assert.strictEqual(quoteScope.status, 'skipped');
+  assert.strictEqual(quoteScope.reason, 'auto_fetch_disabled', 'D-038 门禁未通过时自动抓取必须默认关闭');
 });
 
 test('标的目录接口不夹带账户/持仓字段，也不把私有文本写进响应', async (t) => {

@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.9-phase4c';
+  var APP_VERSION = '2.3.10-phase4d';
 
   /* ================= 状态 ================= */
   var state = {
@@ -233,12 +233,42 @@
       try { navigator.serviceWorker.register('sw.js').catch(function () {}); } catch (e) { /* 忽略 */ }
     }
     runRecurringOnBoot();
+    autoRefreshMarketDataOnBoot();
     renderServiceBanner();
     renderTabbar();
     route(location.hash.replace('#', '') || 'home');
     window.addEventListener('hashchange', function () {
       route(location.hash.replace('#', '') || 'home');
     });
+  }
+
+  // Phase 4D 启动时尝试一次汇率自动更新（触发方式：手动按钮 + 启动时尝试一次）。
+  // 只在「确实有需要更新的目标」时才发请求（有币对缺失汇率或已过期），因此不会每次打开页面都打网络；
+  // 一旦更新成功，汇率日变成今天，后续启动自然不再触发。失败**静默** —— 行情区块会把过期状态显示出来，
+  // 用户还可以手动补价；启动期的网络问题不该打断记账入口。
+  var marketAutoRefreshTried = false;
+  function autoRefreshMarketDataOnBoot() {
+    if (marketAutoRefreshTried) return;
+    marketAutoRefreshTried = true;
+    if (Store.info().mode !== Store.MODE_API) return;
+    // 默认关闭：只有用户在资产页显式打开「启动时自动更新汇率」才尝试。
+    // 这与 D-038「自动抓取默认关闭」同纪律，也符合"先手动验证、再考虑自动化"的推进方式。
+    if (state.settings.marketDataAutoRefresh !== true) return;
+    var a = Domain.normalizeAssets(state.assets);
+    var today = todayDateStr();
+    var needFx = Domain.requiredFxPairs(a).some(function (p) {
+      var r = Domain.findFxRate(a.fxRates, p.base, p.quote, today);
+      return !r || r.status === 'fx_stale';
+    });
+    if (!needFx) return;
+    Store.refreshMarketData({ scopes: ['fx'] }).then(function (r) {
+      var fx = ((r && r.scopes) || []).filter(function (s) { return s.scope === 'fx'; })[0];
+      if (fx && fx.updated > 0) {
+        toast('汇率已自动更新 ' + fx.updated + ' 项（ECB 参考汇率）');
+        return refreshAssets();
+      }
+      return null;
+    }).catch(function () { /* 静默：启动期失败不打扰用户 */ });
   }
 
   // V2.3.3 启动时处理周期账：自动模式静默生成；预览模式首页横幅提醒
@@ -658,17 +688,24 @@
     }).join('');
     var presetSection = '<div class="sec-head"><b>福利预设（青岛）</b></div>' + presetRows;
 
-    /* 汇率维护：Phase 3 用手动汇率让外币余额可正式折算；自动行情属于 Phase 4 */
+    /* 汇率维护：Phase 3 手动登记 + Phase 4D 自动更新（ECB 参考汇率）。
+       自动更新不得覆盖用户在**同一天或更早**手动确认过的值（D-044）。 */
+    var fxToday = todayDateStr();
     var fxRows = a.fxRates.map(function (r) {
-      return '<div class="todo-item small">· ' + esc(r.base) + '→' + esc(r.quote) + ' ' + esc(r.rateDecimal) +
-        '<span class="muted"> 汇率日 ' + esc(r.rateDate || '—') + ' · ' + esc(r.status || 'manual') + '</span></div>';
+      var fresh = Domain.findFxRate([r], r.base, r.quote, fxToday);
+      var stale = fresh && fresh.status === 'fx_stale';
+      return '<div class="todo-item small" data-fx="' + esc(r.base + '/' + r.quote) + '">· ' + esc(r.base) + '→' + esc(r.quote) + ' ' + esc(r.rateDecimal) +
+        '<span class="muted"> 汇率日 ' + esc(r.rateDate || '—') + ' · 来源 ' + esc(r.provider || '未标注') +
+        (stale ? ' · 已过期（>' + Domain.MAX_STALE_DAYS + ' 天）' : '') + '</span></div>';
     }).join('');
     var fxSection = '<div class="sec-head"><b>汇率</b>' +
-      '<button class="link small" data-action="asset:fx">＋登记汇率</button></div>' +
-      '<div class="card">' + (fxRows || '<div class="small muted">暂无手动汇率；外币余额缺汇率时不计入汇总，且会阻塞正式结账</div>') +
-      '<div class="small muted" style="margin-top:6px">自动行情将在后续版本接入；在此登记的是「币对 + 汇率 + 汇率日」这一条事实。</div></div>';
+      '<span class="small"><button class="link" data-action="market:refresh" data-scope="fx">↻ 更新汇率</button> ' +
+      '<button class="link" data-action="asset:fx">＋登记汇率</button></span></div>' +
+      '<div class="card">' + (fxRows || '<div class="small muted">暂无汇率；外币余额缺汇率时不计入汇总，且会阻塞正式结账</div>') +
+      '<div class="small muted" style="margin-top:6px">自动更新走 ECB 参考汇率（固定 provider 端点），' +
+      '只补非 CNY 币种对 CNY 的币对；你在同一天或更早手动登记过的币对不会被自动值覆盖。</div></div>';
 
-    return html + accountSection + transferSection + liabSection + entSection + presetSection + catalogSection() + holdingsSection() + fxSection +
+    return html + accountSection + transferSection + liabSection + entSection + presetSection + catalogSection() + holdingsSection() + quoteSection() + fxSection +
       '<div class="small muted" style="margin-top:12px">说明：权益只展示状态与备注，不计入任何资产合计；' +
       '外币余额按估值日汇率折算，缺汇率时该项不计入；换汇只记为资产转移，不计收入或支出；' +
       '标的分类由你确认后锁定，参考数据变化只提示差异。</div>';
@@ -736,6 +773,77 @@
     return section +
       (holdingRows ? '<div class="card">' + holdingRows + '</div>' : '') +
       (eventRows ? '<div class="sec-head"><b>事件流水</b></div><div class="card">' + eventRows + '</div>' : '');
+  }
+
+  /* ---------- 行情与汇率（Phase 4D，D-044）----------
+     自动抓取的可用状态与新鲜度**只在服务端事实源上判定**（Domain.findQuote / findFxRate），
+     页面只做展示与手动兜底入口。D-038 门禁未通过 → 自动行情默认关闭：
+     页面如实说明这一点，且不提供开启开关（门禁通过后才加），避免"看起来能自动更新"的误导。 */
+  function quoteFreshnessLabel(status) {
+    if (status === 'ok') return '<span class="small" style="color:var(--ok,#1a7f37)">新鲜</span>';
+    if (status === 'quote_stale') return '<span class="small" style="color:var(--warn,#b45309)">已过期（>' + Domain.MAX_STALE_DAYS + ' 天）</span>';
+    return '<span class="small muted">缺失</span>';
+  }
+
+  function quoteSection() {
+    var a = Domain.normalizeAssets(state.assets);
+    var today = todayDateStr();
+    var instMap = {};
+    a.instruments.forEach(function (x) { instMap[x.id] = x; });
+    var targets = Domain.requiredQuoteSymbols(a);
+
+    var rows = targets.map(function (t) {
+      var q = Domain.findQuote(a.quotes, t.instrumentId, today);
+      var ins = instMap[t.instrumentId] || {};
+      var price = q ? Core.fmtMoney(q.priceMinor) + ' ' + esc(q.currency || ins.currency || '') : '—';
+      var meta = q
+        ? '价格日 ' + esc(q.priceDate || '—') + ' · 来源 ' + esc(q.provider || '未标注')
+        : '尚未登记任何报价';
+      return '<div class="acc-card" data-quote="' + esc(t.instrumentId) + '">' +
+        '<div class="row"><b>' + esc(t.symbol || t.instrumentId) + '</b>' +
+        '<span class="small muted" style="margin-left:auto">' + price + '</span></div>' +
+        '<div class="small muted">' + meta + ' · ' + (q ? quoteFreshnessLabel(q.status) : quoteFreshnessLabel('missing')) + '</div>' +
+        '<button class="btn ghost small" data-action="asset:quote" data-id="' + esc(t.instrumentId) + '">手动补价</button>' +
+        '</div>';
+    }).join('');
+
+    var note = '自动行情抓取（D-038 门禁）当前<b>默认关闭</b>：一轮复核仍未找到同时满足' +
+      '「免费 / 有官方条款与自动化授权 / 覆盖 A+H+US ETF 日终」的来源，因此行情以「手动补价 + 本地缓存」' +
+      '为唯一事实来源；汇率侧可自动更新（ECB 参考汇率）。刷新只会在成功时写入新值，' +
+      '失败会保留上一次的有效值并在这里显示为过期，不会把上次的值抹掉。';
+
+    var autoOn = state.settings && state.settings.marketDataAutoRefresh === true;
+    var autoRow = '<div class="row" style="margin-top:8px">' +
+      '<span class="small">启动时自动更新汇率' + (autoOn ? '：已开启' : '：已关闭（默认）') + '</span>' +
+      '<button class="btn ghost small" style="margin-left:auto" data-action="market:toggleAuto">' +
+      (autoOn ? '关闭' : '开启') + '</button></div>';
+
+    var section = '<div class="sec-head"><b>行情（收盘价）</b>' +
+      '<span class="small"><button class="link" data-action="market:refresh">↻ 更新行情与汇率</button></span></div>' +
+      '<div class="card">' +
+      (rows || '<div class="small muted">暂无需要估值的标的（有持仓或已登记报价的标的会出现在这里）</div>') +
+      autoRow +
+      '<div class="small muted" style="margin-top:6px">' + note + '</div></div>';
+    return section;
+  }
+
+  function assetQuoteSheet(instrumentId) {
+    var a = Domain.normalizeAssets(state.assets);
+    if (!a.instruments.length) { toast('请先在标的目录建立标的', 'warn'); return; }
+    var instOpts = a.instruments.map(function (ins) {
+      var sel = ins.id === instrumentId ? ' selected' : '';
+      return '<option value="' + esc(ins.id) + '"' + sel + '>' + esc(ins.symbol) +
+        (ins.exchange ? ' · ' + esc(ins.exchange) : '') + '</option>';
+    }).join('');
+    openSheet('手动补价（收盘价）',
+      '<div class="form-row">' +
+      formItem('标的', '<select id="q-inst">' + instOpts + '</select>') +
+      formItem('收盘价（按标的币种）', '<input id="q-price" type="number" min="0" step="0.01" placeholder="如 4.53">') +
+      formItem('价格日', '<input id="q-date" type="date" value="' + todayDateStr() + '">') +
+      '</div>' +
+      '<div class="small muted" style="padding:0 4px 8px">手动补价记为来源「manual」；同一标的同一价格日只保留一条报价，' +
+      '自动更新不会覆盖你在同一天或更早手动确认过的价格（D-044）。</div>' +
+      '<button class="btn primary block" data-action="asset:saveQuote">保存价格</button>');
   }
 
   function holdingOpeningSheet() {
@@ -3416,6 +3524,49 @@
         return refreshAssets();
       }).catch(resourceFail);
     },
+    /* ---------- Phase 4D：行情（手动补价）与汇率自动更新 ---------- */
+
+    'asset:quote': function (el) {
+      assetQuoteSheet(el && el.dataset ? el.dataset.id : '');
+    },
+    'asset:saveQuote': function () {
+      var instrumentId = $('#q-inst').value;
+      var priceText = $('#q-price').value.trim();
+      var priceMinor = Math.round(parseFloat(priceText) * 100);
+      if (!priceText || !isFinite(priceMinor) || priceMinor <= 0) { toast('请输入大于 0 的收盘价', 'warn'); return; }
+      var priceDate = $('#q-date').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(priceDate)) { toast('请选择价格日', 'warn'); return; }
+      Store.saveQuote({ instrumentId: instrumentId, priceMinor: priceMinor, priceDate: priceDate }).then(function () {
+        closeSheet();
+        toast('价格已登记（来源：手动）');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'market:toggleAuto': function () {
+      var on = !(state.settings && state.settings.marketDataAutoRefresh === true);
+      var settings = Object.assign({}, state.settings || {}, { marketDataAutoRefresh: on });
+      Store.set('settings', settings).then(function () {
+        toast(on ? '已开启启动时自动更新汇率' : '已关闭启动时自动更新汇率');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+    'market:refresh': function (el) {
+      var scope = el && el.dataset ? el.dataset.scope : '';
+      var payload = scope ? { scopes: [scope] } : {};
+      Store.refreshMarketData(payload).then(function (r) {
+        var parts = [];
+        ((r && r.scopes) || []).forEach(function (s) {
+          var label = s.scope === 'fx' ? '汇率' : '行情';
+          if (s.status === 'updated') parts.push(label + '更新 ' + s.updated + ' 项');
+          else if (s.status === 'partial') parts.push(label + '部分更新（失败 ' + s.errors.length + ' 项）');
+          else if (s.status === 'failed') parts.push(label + '更新失败（' + (s.errors[0] ? s.errors[0].code : 'unknown') + '）');
+          else parts.push(label + '未更新（' + (s.reason || 'skipped') + '）');
+        });
+        toast(parts.join('；') || '刷新完成', r && r.ok ? 'ok' : 'warn');
+        return refreshAssets();
+      }).catch(resourceFail);
+    },
+
     'close:detail': function (el) {
       var id = el && el.dataset ? el.dataset.id : '';
       if (!id) return;

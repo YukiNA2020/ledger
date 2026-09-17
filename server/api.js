@@ -26,6 +26,10 @@ const Catalog = require('./instrument-catalog');
 // 真实行情源要等 4D 通过 D-038 门禁后才允许接入；届时这里换成真实 provider 即可，
 // 上层的 catalog 模块与前端不需要改。
 const FixtureProvider = require('./providers/fixture');
+const FrankfurterProvider = require('./providers/frankfurter');
+const ProviderContract = require('./providers/contract');
+const KeychainKey = require('./providers/keychain-key');
+const MarketData = require('./market-data');
 const Domain = require('../js/domain.js');
 const Core = require('../js/core.js');
 
@@ -54,8 +58,10 @@ const MIME = {
 // Phase 3 已实现：institutions / accounts / account-units / asset-transfers / liabilities / entitlements
 // 与 monthly-closes（ROADMAP Phase 3 工作项 1–6）。
 // Phase 4C 已实现：portfolio-openings / security-events（D-042）。
+// Phase 4D 已实现：quotes（手动补价）与 market-data/refresh（汇率自动更新；行情自动抓取受 D-038 门禁，
+// 默认关闭 → 该作用域返回 200 + skipped(auto_fetch_disabled)，不发起任何请求）。
+// 注意：本表已不含 market-data/refresh —— 它在 4D 被实现，不再是"留给后续阶段"的占位。
 const DEFERRED_WRITES = {
-  'POST /api/v1/market-data/refresh': 'Phase 4',
   'POST /api/v1/risk-assessments': 'Phase 5',
   'POST /api/v1/recommendations': 'Phase 5'
 };
@@ -275,7 +281,18 @@ const DOMAIN_ERROR_STATUS = {
   duplicate_event: 409,
   duplicate_opening: 409,
   idempotency_conflict: 409,
-  insufficient_holdings: 409
+  insufficient_holdings: 409,
+  // Phase 4D：报价与行情写入路径新增的错误码。规则同样是"客户端可修正 → 4xx，
+  // 服务端出错 → 5xx"——`invalid_price`/`invalid_price_date` 是载荷问题（400），
+  // `currency_mismatch` 是"载荷与既有事实冲突、需要改请求"（422），
+  // 自动更新不覆盖手动值不是错误（返回 200 + skipped），所以这里没有对应条目。
+  invalid_quote: 400,
+  invalid_instrument_id: 400,
+  invalid_price: 400,
+  invalid_price_date: 400,
+  invalid_fx: 400,
+  invalid_provider: 400,
+  currency_mismatch: 422
 };
 
 // 幂等键必须绑定“同一路径的同一份请求语义”，不能让同一个 key 悄悄吞掉另一笔事件。
@@ -915,6 +932,88 @@ function createHandler(ctx) {
     } catch (err) {
       return upsertFail(res, err);
     }
+  };
+
+  // 手动补价（Phase 4D，D-044）：行情源不可用/未覆盖时的兜底入口。
+  // 落库来源固定为 'manual'（用户显式事实），自动更新不得覆盖同一天或更早的手动值。
+  // 字段校验统一交给仓储层的单条写入路径（与全量写入共用同一套口径），API 只做载荷形状判断。
+  api['POST /api/v1/quotes'] = async (req, res) => {
+    const body = await readBody(req);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return fail(res, 400, 'invalid_quote', '报价载荷必须是对象', false);
+    }
+    try {
+      const item = dbm.transaction(ctx.db, () =>
+        R.upsertManualQuote(
+          ctx.db,
+          {
+            instrumentId: body.instrumentId,
+            priceMinor: body.priceMinor,
+            priceDate: body.priceDate,
+            currency: body.currency,
+            sourceSymbol: body.sourceSymbol
+          },
+          { now: new Date().toISOString() }
+        )
+      );
+      return sendJson(res, 201, { ok: true, item: item, source: 'manual' });
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  // 行情与汇率刷新（Phase 4D）。响应语义是「一次刷新尝试的报告」，不是「必须拿到数据」：
+  // provider 超时/限额/缺标的等外部失败返回 200 + ok:false + 逐作用域 errors（含 retryable），
+  // 让前端能显示"这次没成、用的是上次的值"，而不是把外部不可达伪装成客户端错误（D-044）。
+  // 自动行情抓取受 D-038 门禁约束：开关只从服务端 settings 读取（不信任请求体），默认关闭。
+  api['POST /api/v1/market-data/refresh'] = async (req, res) => {
+    const body = await readBody(req);
+    if (body != null && (typeof body !== 'object' || Array.isArray(body))) {
+      return fail(res, 400, 'invalid_json', '刷新载荷必须是对象', false);
+    }
+    const rawScopes = body && body.scopes != null ? body.scopes : null;
+    if (rawScopes != null && !Array.isArray(rawScopes)) {
+      return fail(res, 400, 'invalid_scope', 'scopes 必须是数组', false);
+    }
+    if (Array.isArray(rawScopes)) {
+      const unknown = rawScopes.filter((s) => MarketData.SCOPES.indexOf(s) === -1);
+      if (unknown.length) {
+        return fail(res, 400, 'invalid_scope', '未知作用域：' + unknown.join(', '), false);
+      }
+    }
+    const stamp = providerCtx(ctx).now;
+    const asOfRaw = body && body.asOf != null ? String(body.asOf) : localDateStr(new Date(stamp));
+    if (!ProviderContract.isDateString(asOfRaw)) {
+      return fail(res, 400, 'invalid_date', 'asOf 必须是真实存在的 YYYY-MM-DD 日期', false);
+    }
+
+    const state = R.readState(ctx.db);
+    const settings = (state && state.settings) || {};
+    const autoQuotes = settings.marketDataAutoQuotes === true;
+    const fetcher = ctx.marketDataFetcher || {};
+
+    // Key 只在真要发起自动行情抓取时才读，且只取"有没有配好"（密钥内容不进响应、不进日志）。
+    const keyStatus = autoQuotes && !fetcher.quotes ? KeychainKey.providerKeyStatus() : null;
+
+    let summary;
+    try {
+      summary = await MarketData.refreshMarketData({
+        db: ctx.db,
+        now: stamp,
+        asOf: asOfRaw,
+        scopes: Array.isArray(rawScopes) && rawScopes.length ? rawScopes : undefined,
+        autoQuotesEnabled: autoQuotes,
+        fxDisabled: fetcher.fxDisabled === true,
+        fxFetch: fetcher.fx || undefined,
+        quotesFetch: fetcher.quotes || undefined,
+        quotesProviderId: fetcher.quotesProviderId || null,
+        quotesEndpoint: fetcher.quotesEndpoint || null
+      });
+    } catch (err) {
+      return fail(res, 500, 'market_data_failed', (err && err.message) || '刷新失败', true);
+    }
+    if (keyStatus) summary.marketDataKey = keyStatus;
+    return sendJson(res, 200, summary);
   };
 
   api['GET /api/v1/backups'] = (req, res) => {

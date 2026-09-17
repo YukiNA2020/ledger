@@ -128,7 +128,7 @@ const KNOWN = {
     'currency',
     'occurredAt'
   ],
-  quotes: ['instrumentId', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status'],
+  quotes: ['instrumentId', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status', 'sourceSymbol'],
   fxRates: ['base', 'quote', 'rateDecimal', 'rateDate', 'fetchedAt', 'provider', 'status'],
   accounts: ['id', 'name', 'type', 'color', 'initialBalance', 'order', 'aliases', 'deleted'],
   categories: ['id', 'type', 'name', 'icon', 'parent', 'keywords'],
@@ -1008,21 +1008,88 @@ function writeSecurityEvents(db, list) {
   }
 }
 
-function writeQuotes(db, list) {
-  const st = db.prepare(
-    `INSERT INTO quotes (instrument_id, price_minor, currency, price_date, fetched_at, provider, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  );
+/* ------------------------------ 写入/读取：报价（Phase 4D） ------------------------------ */
+
+// 报价行的形状与引用校验，两条写入路径（单条 / 全量 / 自动更新）共用同一套口径
+// —— 4B/4C 的教训是「同一张表两条写入路径两套规则」必然产生补口问题。
+// 币种不采信载荷（D-042 ⑤ 的延伸）：由标的推导；载荷给了不同值 → 显式拒绝而不是静默改写。
+function validateQuoteRow(q, currencies) {
+  if (!q || typeof q !== 'object' || Array.isArray(q)) {
+    throw Object.assign(new Error('报价记录必须是对象'), { code: 'invalid_quote' });
+  }
+  const instrumentId = String(q.instrumentId == null ? '' : q.instrumentId).trim();
+  if (!instrumentId) throw Object.assign(new Error('报价缺少 instrumentId'), { code: 'invalid_instrument_id' });
+  if (!INSTRUMENT_ID_RE.test(instrumentId)) {
+    throw Object.assign(new Error('报价的 instrumentId 形状不合法'), { code: 'invalid_instrument_id' });
+  }
+  const derived = currencies ? currencies[instrumentId] : undefined;
+  if (currencies && derived === undefined) {
+    throw Object.assign(new Error('报价引用了不存在的标的：' + instrumentId), { code: 'unknown_instrument' });
+  }
+  const priceMinor = NUM(q.priceMinor);
+  if (!Number.isSafeInteger(priceMinor) || priceMinor <= 0) {
+    throw Object.assign(new Error('报价必须是大于 0 的最小货币单位整数'), { code: 'invalid_price' });
+  }
+  const priceDate = String(q.priceDate == null ? '' : q.priceDate).trim();
+  if (!isDateStr(priceDate)) {
+    throw Object.assign(new Error('价格日必须是真实存在的 YYYY-MM-DD 日期'), { code: 'invalid_price_date' });
+  }
+  const declared = String(q.currency == null ? '' : q.currency).trim();
+  if (declared && derived !== undefined && declared !== derived) {
+    throw Object.assign(
+      new Error('报价币种与标的币种不一致（标的为 ' + derived + '）'),
+      { code: 'currency_mismatch' }
+    );
+  }
+  const currency = derived !== undefined ? derived : declared;
+  if (Domain.CURRENCIES.indexOf(currency) === -1) {
+    throw Object.assign(new Error('报价币种必须是 CNY/HKD/USD'), { code: 'invalid_currency' });
+  }
+  const out = { instrumentId: instrumentId, priceMinor: priceMinor, priceDate: priceDate, currency: currency };
+  const fetchedAt = STR(q.fetchedAt);
+  const provider = STR(q.provider);
+  const status = STR(q.status);
+  const sourceSymbol = STR(q.sourceSymbol);
+  if (fetchedAt != null) out.fetchedAt = fetchedAt;
+  if (provider != null) out.provider = provider;
+  if (status != null) out.status = status;
+  if (sourceSymbol != null) out.sourceSymbol = sourceSymbol;
+  return out;
+}
+
+function instrumentCurrencyMap(db) {
+  const map = {};
+  all(db, 'SELECT id, currency FROM instruments').forEach((r) => {
+    map[r.id] = r.currency;
+  });
+  return map;
+}
+
+// 全量写入（PUT /state、JSON 恢复、备份还原）：两遍写入，逐条验证归一后整体插入。
+// 任一条不合格即抛错，由 writeState 的事务整体回滚 —— 绝不 `.filter()` 静默丢行（G4B-5）。
+// 元素键（标的, 价格日）的唯一性不在这里强制：v1 的 uq_quotes_dedupe 明确允许同一价格日
+// 不同 provider 并存（见 migrations v7 注释），收紧会拒绝合法的历史状态；该不变量由
+// 单条写入路径（upsertManualQuote / upsertProviderQuote）按元素键替换来维持（D-044）。
+function writeQuotes(db, list, ctx) {
+  const currencies = (ctx && ctx.currencies) || instrumentCurrencyMap(db);
+  const rows = [];
   (list || []).forEach((q) => {
-    if (!q || !q.instrumentId) return;
+    rows.push(validateQuoteRow(q, currencies));
+  });
+  const st = db.prepare(
+    `INSERT INTO quotes (instrument_id, price_minor, currency, price_date, fetched_at, provider, status, source_symbol)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  rows.forEach((q) => {
     st.run(
-      String(q.instrumentId),
-      NUM(q.priceMinor),
-      STR(q.currency) || 'CNY',
-      STR(q.priceDate),
-      STR(q.fetchedAt),
-      STR(q.provider),
-      STR(q.status)
+      q.instrumentId,
+      q.priceMinor,
+      q.currency,
+      q.priceDate,
+      N(q.fetchedAt),
+      N(q.provider),
+      N(q.status),
+      N(q.sourceSymbol)
     );
   });
 }
@@ -1038,26 +1105,128 @@ function readQuotes(db) {
     if (row.fetched_at != null) out.fetchedAt = row.fetched_at;
     if (row.provider != null) out.provider = row.provider;
     if (row.status != null) out.status = row.status;
+    if (row.source_symbol != null) out.sourceSymbol = row.source_symbol;
     return out;
   });
 }
 
+// 元素键上「先替换再插入」：跨 provider 一起替换，保证同一 (标的, 价格日) 只剩一行，
+// 从而 Domain.findQuote 的"最近价格日 + 行序"取值是确定性的（D-044 ③）。
+function replaceQuoteRows(db, instrumentId, priceDate) {
+  run(db, 'DELETE FROM quotes WHERE instrument_id = ? AND price_date = ?', [instrumentId, priceDate]);
+}
+
+// 手动补价（D-044 ①）：用户显式事实，总是生效；provider 固定为 'manual'，
+// 不接受调用方用别的方式绕过来源标记（否则手动值会被后续自动更新当成可覆盖行）。
+function upsertManualQuote(db, q, options) {
+  const opts = options || {};
+  const row = validateQuoteRow(
+    Object.assign({}, q, { provider: Domain.MANUAL_PROVIDER, status: (q && q.status) || 'ok' }),
+    opts.currencies || instrumentCurrencyMap(db)
+  );
+  replaceQuoteRows(db, row.instrumentId, row.priceDate);
+  run(
+    db,
+    `INSERT INTO quotes (instrument_id, price_minor, currency, price_date, fetched_at, provider, status, source_symbol)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      row.instrumentId,
+      row.priceMinor,
+      row.currency,
+      row.priceDate,
+      opts.now || new Date().toISOString(),
+      Domain.MANUAL_PROVIDER,
+      row.status || 'ok',
+      N(row.sourceSymbol)
+    ]
+  );
+  return readQuotes(db).filter(
+    (x) => x.instrumentId === row.instrumentId && x.priceDate === row.priceDate
+  )[0] || null;
+}
+
+// 自动更新的写入（D-044 ②）：手动行是用户显式事实，自动源不得写入**同一天或更早**的观测。
+// 判定把该标的的**全部**既有报价交给 Domain.planMarketMerge（不是只挑同键行）：
+// 手动冻结的是「该标的在手动数据日及更早」这一段观测，与汇率侧规则保持同一口径；
+// 元素键（标的, 价格日）上的替换仍由写入路径强制（replaceQuoteRows），跨 provider 一起替换。
+// 失败/不接受的行永远不会走到这里 —— 编排层先过契约校验与 planMarketMerge。
+function upsertProviderQuote(db, q, options) {
+  const opts = options || {};
+  const row = validateQuoteRow(q, opts.currencies || instrumentCurrencyMap(db));
+  if (!row.provider || row.provider === Domain.MANUAL_PROVIDER) {
+    throw Object.assign(new Error('自动更新的报价必须带真实 provider'), { code: 'invalid_provider' });
+  }
+  const existing = readQuotes(db).filter((x) => x.instrumentId === row.instrumentId);
+  const plan = Domain.planMarketMerge('quotes', existing, [row]);
+  if (!plan.write.length) {
+    return { status: 'skipped', reason: plan.skip[0] ? plan.skip[0].reason : 'not_writable', item: null };
+  }
+  replaceQuoteRows(db, row.instrumentId, row.priceDate);
+  run(
+    db,
+    `INSERT INTO quotes (instrument_id, price_minor, currency, price_date, fetched_at, provider, status, source_symbol)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      row.instrumentId,
+      row.priceMinor,
+      row.currency,
+      row.priceDate,
+      opts.now || new Date().toISOString(),
+      row.provider,
+      row.status || 'ok',
+      N(row.sourceSymbol)
+    ]
+  );
+  const item = readQuotes(db).filter(
+    (x) => x.instrumentId === row.instrumentId && x.priceDate === row.priceDate
+  )[0] || null;
+  return { status: 'updated', reason: null, item: item };
+}
+
+// 汇率行的形状校验，单条 / 全量 / 自动更新三条路径共用（错误码与 Phase 3 的 upsertFxRate 保持一致，
+// 前端与既有测试对此已有关联断言）。定点汇率保留原始字符串：Domain.parseDecimal 返回的是
+// {v,s} 对象，直接 String() 会写进 "[object Object]"（P3-5）。
+function validateFxRow(r) {
+  if (!r || typeof r !== 'object' || Array.isArray(r)) {
+    throw Object.assign(new Error('汇率记录必须是对象'), { code: 'invalid_fx' });
+  }
+  const base = STR(r.base);
+  const quote = STR(r.quote);
+  if (Domain.CURRENCIES.indexOf(base) === -1 || Domain.CURRENCIES.indexOf(quote) === -1) {
+    throw Object.assign(new Error('汇率币种必须是 CNY/HKD/USD'), { code: 'invalid_currency' });
+  }
+  if (base === quote) {
+    throw Object.assign(new Error('汇率的两端币种不能相同'), { code: 'same_currency' });
+  }
+  const rateText = typeof r.rateDecimal === 'string' ? r.rateDecimal.trim() : String(r.rateDecimal == null ? '' : r.rateDecimal);
+  const rate = Domain.parseDecimal(rateText);
+  if (!rate || !(rate.v > 0)) {
+    throw Object.assign(new Error('汇率必须是大于 0 的定点十进制数'), { code: 'invalid_rate' });
+  }
+  const rateDate = STR(r.rateDate);
+  if (!isDateStr(rateDate)) {
+    throw Object.assign(new Error('汇率日期必须是真实存在的 YYYY-MM-DD 日期'), { code: 'invalid_rate_date' });
+  }
+  const out = { base: base, quote: quote, rateDecimal: rateText, rateDate: rateDate };
+  const fetchedAt = STR(r.fetchedAt);
+  const provider = STR(r.provider);
+  const status = STR(r.status);
+  if (fetchedAt != null) out.fetchedAt = fetchedAt;
+  if (provider != null) out.provider = provider;
+  if (status != null) out.status = status;
+  return out;
+}
+
+// 全量写入（PUT /state、JSON 恢复、备份还原）：两遍写入逐条验证，任一条不合格整体回滚。
+// 旧实现会静默跳过缺 base/quote 的行、并把非法汇率写成 '0' —— 用户看不到错误却少了数据（G4B-5 同类）。
 function writeFxRates(db, list) {
+  const rows = (list || []).map((r) => validateFxRow(r));
   const st = db.prepare(
     `INSERT INTO fx_rates (base, "quote", rate_decimal, rate_date, fetched_at, provider, status)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
   );
-  (list || []).forEach((r) => {
-    if (!r || !r.base || !r.quote) return;
-    st.run(
-      String(r.base),
-      String(r.quote),
-      STR(r.rateDecimal) || '0',
-      STR(r.rateDate),
-      STR(r.fetchedAt),
-      STR(r.provider),
-      STR(r.status)
-    );
+  rows.forEach((r) => {
+    st.run(r.base, r.quote, r.rateDecimal, r.rateDate, N(r.fetchedAt), N(r.provider), N(r.status));
   });
 }
 
@@ -1653,6 +1822,47 @@ function upsertFxRate(db, r, options) {
   return readFxRates(db).find((x) => x.base === String(r.base) && x.quote === String(r.quote)) || null;
 }
 
+// 自动更新的汇率写入（Phase 4D，D-044 ②）：手动登记是"这个币对那一天的确认事实"，
+// 自动源不得写入**同一天或更早**的观测（Domain.planMarketMerge 判定，跳过时返回 manual_locked）；
+// 更新的数据日仍可写入，用户手动值不会被永久挡住。
+// 元素键 = (币对, 汇率日)：只替换同一天的行，其他日期的自动历史保留（与手动路径的"整对替换"不同，
+// 因为手动登记是"我确认过这个币对此刻的值"，自动更新是"逐日积累的观测值"）。
+function upsertProviderFxRate(db, r, options) {
+  const opts = options || {};
+  const row = validateFxRow(r);
+  if (!row.provider || row.provider === Domain.MANUAL_PROVIDER) {
+    throw Object.assign(new Error('自动更新的汇率必须带真实 provider'), { code: 'invalid_provider' });
+  }
+  const existing = readFxRates(db).filter((x) => x.base === row.base && x.quote === row.quote);
+  const plan = Domain.planMarketMerge('fx', existing, [row]);
+  if (!plan.write.length) {
+    return { status: 'skipped', reason: plan.skip[0] ? plan.skip[0].reason : 'not_writable', item: null };
+  }
+  run(db, 'DELETE FROM fx_rates WHERE base = ? AND "quote" = ? AND rate_date = ?', [
+    row.base,
+    row.quote,
+    row.rateDate
+  ]);
+  run(
+    db,
+    `INSERT INTO fx_rates (base, "quote", rate_decimal, rate_date, fetched_at, provider, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      row.base,
+      row.quote,
+      row.rateDecimal,
+      row.rateDate,
+      opts.now || new Date().toISOString(),
+      row.provider,
+      row.status || 'ok'
+    ]
+  );
+  const item = readFxRates(db).find(
+    (x) => x.base === row.base && x.quote === row.quote && x.rateDate === row.rateDate
+  ) || null;
+  return { status: 'updated', reason: null, item: item };
+}
+
 function upsertLiability(db, l, options) {
   const opts = options || {};
   if (!l || !l.id) throw Object.assign(new Error('缺少负债 id'), { code: 'invalid_id' });
@@ -1859,6 +2069,9 @@ module.exports = {
   readOpenings,
   readSecurityEvents,
   readQuotes,
+  upsertManualQuote,
+  upsertProviderQuote,
+  replaceQuoteRows,
   readFxRates,
   readTxns,
   readAccounts,
@@ -1884,6 +2097,8 @@ module.exports = {
   getCloseSnapshotPayload,
   getCloseSnapshot,
   upsertFxRate,
+  upsertProviderFxRate,
+  validateFxRow,
   upsertSecurityEvent,
   getSecurityEvent,
   upsertPortfolioOpening

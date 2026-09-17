@@ -396,7 +396,7 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
     assert.strictEqual(events.json.error.code, 'invalid_event');
 
     const cases = [
-      ['POST', '/api/v1/market-data/refresh', 'Phase 4'],
+      // market-data/refresh 已在 Phase 4D 实现（D-044）：不再是 501，见下方专项断言
       ['POST', '/api/v1/risk-assessments', 'Phase 5'],
       ['POST', '/api/v1/recommendations', 'Phase 5']
     ];
@@ -409,6 +409,17 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
       assert.strictEqual(res.json.error.code, 'not_implemented');
       assert.ok(res.json.error.message.indexOf(phase) !== -1, pathname + ' 应说明所属阶段');
     }
+
+    // Phase 4D：行情刷新已实现；自动行情抓取受 D-038 门禁约束默认关闭，
+    // 因此 quotes 作用域是 200 + skipped(auto_fetch_disabled)，而不是 501。
+    const refresh = await request(srv.port, 'POST', '/api/v1/market-data/refresh', {
+      headers: writeHeaders(ctx),
+      body: '{}'
+    });
+    assert.strictEqual(refresh.status, 200);
+    const quoteScope = refresh.json.scopes.filter((s) => s.scope === 'quotes')[0];
+    assert.strictEqual(quoteScope.status, 'skipped');
+    assert.strictEqual(quoteScope.reason, 'auto_fetch_disabled');
 
     const decisionEvent = await request(srv.port, 'POST', '/api/v1/decisions/d-1/events', {
       headers: writeHeaders(ctx),

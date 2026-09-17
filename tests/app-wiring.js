@@ -889,6 +889,128 @@
         '全量写回后推导数量必须仍是 11');
     });
 
+    // C12 Phase 4D：行情区块（手动补价兜底）+ 启动时自动更新汇率开关 + 刷新报告渲染。
+    // 真实取数路径（provider / 契约校验 / 写库）由 node 测试用注入的固定 fixture 覆盖；
+    // 这里的三项只验证「界面布线 + 事实源口径」，且除最后一项之外不替换任何网络行为。
+    await check('行情区块：默认不自动抓取；手动补价写入事实源并渲染价格与来源', async function () {
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:assets"]'); }, 8000, '决策台资产入口');
+      clickAction('#view [data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('[data-action="market:toggleAuto"]'); }, 8000, '行情区块');
+
+      // 默认关闭：D-038 门禁未通过，界面必须直说而不是假装已开启
+      equal(document.querySelector('[data-action="market:toggleAuto"]').textContent.trim(), '开启',
+        '自动行情/汇率更新的默认状态必须是关闭');
+      assert(document.querySelector('#view').textContent.indexOf('默认关闭') >= 0,
+        '行情区块应说明自动抓取默认关闭');
+
+      var st0 = await apiState();
+      var voo = (st0.assets.instruments || []).filter(function (r) { return r.symbol === 'VOO'; })[0];
+      assert(voo, '前置：VOO 标的应存在（4B/4C 场景产物）');
+      var card = document.querySelector('[data-quote="' + voo.id + '"]');
+      assert(card, '有持仓事实的标的应出现在行情区块');
+      assert(card.textContent.indexOf('尚未登记任何报价') >= 0,
+        '没有任何报价时不得用 0 冒充价格');
+
+      // 手动补价：唯一可用的兜底入口
+      clickAction('[data-quote="' + voo.id + '"] [data-action="asset:quote"]');
+      await waitFor(function () { return document.querySelector('#q-price'); }, 5000, '手动补价弹层');
+      document.querySelector('#q-inst').value = voo.id;
+      document.querySelector('#q-price').value = '498.00';
+      document.querySelector('#q-date').value = '2026-09-14';
+      clickAction('[data-action="asset:saveQuote"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return (st.assets.quotes || []).length === 1;
+      }, 8000, '报价写入事实源');
+
+      var st = await apiState();
+      var quote = st.assets.quotes[0];
+      equal(quote.instrumentId, voo.id, '报价必须绑定该标的');
+      equal(quote.priceMinor, 49800, '金额按最小货币单位整数存储');
+      equal(quote.priceDate, '2026-09-14', '价格日必须保留');
+      equal(quote.provider, 'manual', '手动补价的来源标记必须是 manual');
+      equal(quote.currency, 'USD', '报价币种由标的推导，不由调用方声明');
+
+      // 界面核对：价格、价格日、来源都要显示出来
+      var after = document.querySelector('[data-quote="' + voo.id + '"]');
+      assert(after.textContent.indexOf('2026-09-14') >= 0, '行情卡片应显示价格日');
+      assert(after.textContent.indexOf('manual') >= 0, '行情卡片应标注来源');
+
+      // 事实源直读：页面写的就是服务端存的（S2.1 单一事实源）
+      var rows = await fetch('/api/v1/quotes').then(function (r) { return r.json(); });
+      equal(rows.items.length, 1, 'GET /quotes 应有一行');
+      equal(rows.items[0].priceMinor, 49800, '服务端存的就是页面提交的金额');
+      equal(rows.items[0].provider, 'manual', '服务端记录的来源必须是 manual');
+    });
+
+    await check('启动时自动更新汇率开关：默认关闭，切换可写入 settings 并回读', async function () {
+      var st0 = await apiState();
+      assert(!(st0.settings && st0.settings.marketDataAutoRefresh === true),
+        '默认不得开启启动时自动更新（D-007 的失败兜底以手动为主）');
+
+      clickAction('[data-action="market:toggleAuto"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return !!(st.settings && st.settings.marketDataAutoRefresh === true);
+      }, 8000, '开关开启写入事实源');
+      assert(document.querySelector('#view').textContent.indexOf('已开启') >= 0,
+        '开启后界面应显示已开启');
+
+      clickAction('[data-action="market:toggleAuto"]');
+      await waitFor(async function () {
+        var st = await apiState();
+        return !(st.settings && st.settings.marketDataAutoRefresh === true);
+      }, 8000, '开关关闭写入事实源');
+      assert(document.querySelector('#view').textContent.indexOf('已关闭（默认）') >= 0,
+        '关闭后界面应恢复显示已关闭');
+    });
+
+    await check('刷新报告的界面渲染：逐作用域状态如实提示，且不改动已登记的手动价格', async function () {
+      // 只替换刷新接口：返回一份固定报告（汇率成功 + 行情因门禁未更新），
+      // 其余 /api 请求照常走真实服务 —— 因此本项不断言"取数成功"，只断言界面与库不被篡改。
+      var origFetch = window.fetch;
+      var canned = {
+        ok: true, asOf: '2026-09-17', now: '2026-09-17T09:00:00Z',
+        scopeOrder: ['fx', 'quotes'],
+        scopes: [
+          { scope: 'fx', status: 'updated', updated: 1, skipped: [], errors: [], attempts: 1, reason: null, items: [] },
+          { scope: 'quotes', status: 'skipped', updated: 0, skipped: [], errors: [], attempts: 0,
+            reason: 'auto_fetch_disabled', items: [] }
+        ]
+      };
+      window.fetch = function (url, init) {
+        if (String(url).indexOf('/api/v1/market-data/refresh') >= 0) {
+          return Promise.resolve({
+            ok: true, status: 200,
+            json: function () { return Promise.resolve(canned); }
+          });
+        }
+        return origFetch(url, init);
+      };
+      try {
+        var before = await fetch('/api/v1/quotes').then(function (r) { return r.json(); });
+        equal(before.items.length, 1, '前置：应已有 1 条手动价格');
+
+        clickAction('[data-action="market:refresh"]');
+        await waitFor(function () {
+          return document.querySelector('#toast').textContent.indexOf('行情未更新') >= 0;
+        }, 5000, '刷新提示');
+        var toast = document.querySelector('#toast').textContent;
+        assert(toast.indexOf('汇率更新 1 项') >= 0, '成功的汇率作用域应如实报数量，实际：' + toast);
+        assert(toast.indexOf('auto_fetch_disabled') >= 0,
+          '门禁未通过应把原因显示出来，而不是笼统报错，实际：' + toast);
+
+        // 行情刷新不得动到用户手动确认过的价格
+        var after = await fetch('/api/v1/quotes').then(function (r) { return r.json(); });
+        equal(after.items.length, 1, '刷新后手动报价行数不变');
+        equal(after.items[0].priceMinor, 49800, '刷新后手动报价金额不变');
+        equal(after.items[0].provider, 'manual', '刷新后来源仍是 manual');
+      } finally {
+        window.fetch = origFetch;
+      }
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();

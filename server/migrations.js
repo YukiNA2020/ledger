@@ -20,6 +20,8 @@
  *   - v5（Phase 4C）给 security_events 加 amount_minor 列（分红/费用总额落点）与事件重放索引。
  *   - v6（Phase 4C 复核补口）给 portfolio_openings 加 (account_id, instrument_id) 唯一索引，
  *     把「同一持仓只有一行期初事实」提升为数据库不变量（G4C-3）。
+ *   - v7（Phase 4D）给 quotes 加 source_symbol 列，承载行情 provider 返回的原始代码（追溯要求）。
+ *     只有加列、不加索引：报价的「(标的, 价格日) 元素键」由写入路径强制，原因见 v7 迁移内的注释。
  *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
 'use strict';
@@ -391,6 +393,25 @@ const MIGRATIONS = [
         CREATE UNIQUE INDEX uq_portfolio_openings_dedupe
           ON portfolio_openings(account_id, instrument_id);
       `);
+    }
+  },
+  {
+    version: 7,
+    name: 'phase4d-quote-source-symbol',
+    up(db) {
+      /* Phase 4D：日终行情需要把 provider 返回的**原始代码**留档。
+       * quotes.source_symbol 存 provider 侧的原形（如 `VOO` / `voo.us`），与本地
+       * instruments.symbol 可能不同形；ROADMAP 4D 范围 3 要求「保存价格日、抓取时间、
+       * provider 与原始代码」，原始代码此前没有落点（provider / fetched_at 已有）。
+       *
+       * 只加列，不新增索引：D-044 冻结的元素键是「(标的, 价格日)」，但它只能在**写入路径**
+       * 强制（先按该键跨 provider 替换再插入），不能提升为数据库唯一索引 —— v1 已发布的
+       * 表达式唯一索引 uq_quotes_dedupe 是 (instrument_id, price_date, IFNULL(provider,''))，
+       * 即「provider 参与去重、同一价格日可不同 provider 并存」，这一点被
+       * tests/server-migration.test.js「provider 缺省也参与去重」冻结为既有口径；
+       * 收紧成 (instrument_id, price_date) 会推翻该已发布断言（并可能拒绝合法历史快照）。
+       * 该取舍已记入 DECISIONS.md D-044 与 PHASE4D 证据。 */
+      db.exec('ALTER TABLE quotes ADD COLUMN source_symbol TEXT;');
     }
   }
 ];
