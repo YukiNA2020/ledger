@@ -233,8 +233,11 @@ Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的�
 | 期初日期边界（G4C-4，D-042 ⑦） | ✅ 通过 | 真实 HTTP：期初 10（asOf 09-06）+ 09-01 买 2 → 推导仍 10、`boundarySkippedEvents` 留痕 1 条；同日与次日买入正常叠加 → 14。领域侧 3 项（含"早于期初的卖出不参与 strict 重放"） |
 | 真实日历日校验（G4C-5） | ✅ 通过 | 真实 HTTP：`2026-02-30` 事件 → 400 `invalid_event_date`；同期初 → 400 `invalid_date` |
 | 备份必需列校验（G4C-6） | ✅ 通过 | v5 库删除 `security_events.amount_minor` 后 `validateBackupFile` 拒绝且原因点名缺失列（曾返回 `{"ok":true,"schemaVersion":5}`） |
+| 幂等原子性与请求绑定（G4C-7） | ✅ 通过 | 同 key 同请求体正常回放；同 key 不同请求体 → 409 `idempotency_conflict` 且只保留首笔；强制幂等记录插入失败时事件事实随同一事务回滚、零残留 |
+| 仅证券账户可承载持仓（G4C-8） | ✅ 通过 | `bank` 账户的期初与事件均 → 422 `invalid_account_type`；`PUT /state` 同样拒绝并整体回滚 |
+| 事件往返保真（G4C-9） | ✅ 通过 | 分红的可选 quantity 与未知 `sourceRef` 经单条写入和全量往返保留；载荷伪造 HKD 被忽略、按 USD 标的推导为 USD；分红 quantity 不改变持仓 |
 
-Phase 4C 退出证据（第 1 轮复核补口后更新）：全量 `node --test` **407/407**（397 基线零回归 + 复核反例 **10** 项：领域 3 + 真实 HTTP 6 + 备份 1；领域现 **19** 项、真实 HTTP 现 **16** 项）；浏览器 wiring **18/18**（连续两轮全绿）；数据库迁移停在 **v6**；`market-data/refresh` 仍 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-042（⑦ 日期边界 / ⑧ 期初全路径唯一性为本轮新增）；复核缺口与修复状态见 `PHASE4C_ACCEPTANCE_GAPS.md`。
+Phase 4C 退出证据（完整性补口后更新）：全量 `node --test` **411/411**；4C 真实 HTTP **20/20**；浏览器 wiring **18/18**；数据库迁移停在 **v6**；`market-data/refresh` 仍 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-042；复核缺口与修复状态见 `PHASE4C_ACCEPTANCE_GAPS.md`。
 
 ### S4D.1 自动更新成功
 

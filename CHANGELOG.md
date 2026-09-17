@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **Phase 4C 证券事件幂等写入原子化**（G4C-7）：事件事实与幂等记录改为同一 SQLite 事务；`Idempotency-Key` 绑定请求指纹，同 key 不同请求体返回 409 `idempotency_conflict`，不再错误回放另一笔事件。
+- **Phase 4C 账户边界与全量校验补齐**（G4C-8）：期初和事件只允许关联 `kind=broker` 的证券账户，单条与 `/state` 全量路径共用引用校验，普通账户返回 422 `invalid_account_type`。
+- **Phase 4C 事件往返保真**（G4C-9）：未知扩展字段经 `extra_json` 保留；分红/费用的可选 quantity 被校验并保存但不改变持仓；载荷冗余 currency 不再可能覆盖从标的推导的币种。
+
 - **Phase 4B 更新标的不再级联删除后续事实**：单条 instrument 写入从“先删后插”改为原位 upsert，保持持仓快照、证券事件与报价的外键引用。
 - **Phase 4B provider 身份绑定与失败语义补齐**：元数据返回代码必须与请求一致，提交交易所与 provider 不一致时返回 `exchange_mismatch`；搜索返回非数组/非法候选时显式报告 `invalid_payload`，不再伪装成“无命中”。
 - **Phase 4B 跨市场歧义不再受返回顺序影响**：一个无交易所本地记录对应多个 provider 市场时，任何市场都不与本地合并，本地记录单独保留并报告歧义。

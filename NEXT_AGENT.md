@@ -2,7 +2,7 @@
 
 ## 当前事实
 
-- 2026-09-16 起：v3 **Phase 1–3 已完成并验收**；**Phase 4B「标的目录与分类确认」两轮独立复核补口及第三轮引用安全审计完成、等待独立复核确认**（G4B-1–12 全部修复，原始结论见 `PHASE4B_ACCEPTANCE_GAPS.md`，开工前先确认复核已通过）；**Phase 4C「持仓账本与证券事件」第 1 轮独立复核补口完成、等待独立复核确认**（复核判定"暂不通过"的 G4C-1–6 已逐条闭合，见 `PHASE4C_ACCEPTANCE_GAPS.md`；口径冻结见 D-042 ⑦⑧；全量 407/407 + wiring 18/18 两轮）。Phase 4A 正式验收仍暂不通过：T-002 行情端点待 4D 前决定。
+- 2026-09-16 起：v3 **Phase 1–3 已完成并验收**；**Phase 4B「标的目录与分类确认」两轮独立复核补口及第三轮引用安全审计完成、等待独立复核确认**（G4B-1–12 全部修复）；**Phase 4C「持仓账本与证券事件」复核与完整性补口完成、等待独立复核确认**（G4C-1–9 已闭合：D-042 业务口径 + D-043 写入完整性；全量 411/411、4C HTTP 20/20、wiring 18/18）。Phase 4A 正式验收仍暂不通过：T-002 行情端点待 4D 前决定。
 - 已有 v3 能力：
   - 领域层：`js/domain.js`（资产模型、CNY/HKD/USD 定点折算、总览聚合与新鲜度状态、`computeCloseChecklist` 月结核对、`emergencyCoverageMonths` 应急金覆盖；4B 新增 `instrumentKey` / `EXPOSURE_MARKETS` / `diffInstrumentFields` / `suggestFromProvider` / `USER_JUDGEMENT_FIELDS`；**4C 新增 `SECURITY_EVENT_TYPES`、`compareDecimals` / `sumQuantities` / `subtractQuantities` 定点数量助手与 `deriveHoldings` 唯一推导实现**——期初 + Σ买入 − Σ卖出，分红/费用不改数量，strict 模式对卖出超额抛 `insufficient_holdings`，`computeOverview` / `computeCloseChecklist` 有事件时内部走推导、无事件零回归；`ASSET_KEYS` 现为 10 键含 `securityEvents`）；
   - 服务层：`server/main.js`（入口/单实例锁/每日备份/token）、`server/api.js`（`/api/v1` + 静态托管 + 写门禁 + Phase 3 资源 upsert、换汇、手动汇率、月结与快照明细 + 4B 标的检索/建立/确认 + **4C 的 `POST /portfolio-openings`、`POST /security-events`（Idempotency-Key 回放）、`GET /security-events`**；`market-data/refresh` 仍 501）、`server/migrations.js`（v1–v3、v4 `uq_instruments_dedupe`、**v5 `phase4c-security-event-amounts`：`security_events.amount_minor` 列 + `(account_id, instrument_id, occurred_at)` 重放索引**）、`server/db.js`、`server/repository.js`（全量写入按 schema 校验；4B 标的读写；**4C 新增 `readSecurityEvents` / `upsertSecurityEvent`（同 id 409 `duplicate_event`、strict 重放守卖出不越界）/ `writeSecurityEvents`（全量路径同口径逐条校验 + strict 重放）/ `upsertPortfolioOpening`（同键第二行 409 `duplicate_opening`）；`readHoldings` 已是推导视图，含 `openingId` / `eventCounts` / `lastEventAt` 追溯字段；`readState` / `writeState` 带 `securityEvents` 键**）、`server/backup.js`（`VACUUM INTO` 快照 + 按版本校验必需表与必需索引）、`server/keychain.js`、`server/login-item.js`；
@@ -10,10 +10,10 @@
   - Phase 4B 编排层：`server/instrument-catalog.js`（稳定 id 按 identity key 派生永久锁定、去重键三路径显式拒绝、`confirmed` 本地锁定、冲突只提示不覆盖；D-039/D-041）；
   - 前端：`js/store.js`（资源创建含 idempotencyKey、月结、快照、标的检索/建立/确认、**4C 的 `listHoldings` / `listSecurityEvents`**）、`js/app.js`（资产决策台、资产录入页 `assets` 含**标的目录区块 + 持仓与证券事件区块**（期初快照弹层 / 事件弹层 / 推导持仓卡片 / 事件流水，`data-holding` / `data-event-id` 可定位）、月度结账页、现金流页；`APP_VERSION` = `2.3.9-phase4c`）、`sw.js`（缓存键 `ledger-v2.3.9-phase4c`）；
   - 运维：`start.command`、`scripts/install-login-item.sh` / `uninstall-login-item.sh`。
-- **事实源：** SQLite（默认 `~/Library/Application Support/Ledger/ledger.db`）。API 模式下前端**完全不触碰 IndexedDB**；服务不可达时只读降级，绝不双写。资源 upsert 见 D-031，估值/追溯口径见 D-034，备份校验见 D-035，汇率源见 D-036，ETF 元数据来源见 D-037，行情源启用门禁见 D-038，标的目录口径见 D-039，结构校验覆盖不变量载体见 D-040，标的引用完整性见 D-041，**持仓账本与证券事件口径（唯一推导 / 重复拒绝 / 事件不写 txns / 币种推导 / suggested 可录入+阻塞）见 D-042**。
+- **事实源：** SQLite（默认 `~/Library/Application Support/Ledger/ledger.db`）。API 模式下前端**完全不触碰 IndexedDB**；服务不可达时只读降级，绝不双写。资源 upsert 见 D-031，估值/追溯口径见 D-034，备份校验见 D-035，汇率源见 D-036，ETF 元数据来源见 D-037，行情源启用门禁见 D-038，标的目录口径见 D-039，结构校验覆盖不变量载体见 D-040，标的引用完整性见 D-041，持仓业务口径见 D-042，**事件幂等原子性、证券账户门禁与事件往返保真见 D-043**。
 - **尚无** Phase 4D+ 能力：行情 provider 仍只有 fixture（不发真实网络）；`POST /api/v1/market-data/refresh` 仍 501；自动抓取默认关闭，价格仍只能手动补（quotes 走 `PUT /state` 全量路径）；汇率仍只能手工登记。Keychain 读取路径就绪但**尚未真正接入行情 Key**。4E 的下钻归因未开始。
 - Phase 4 已在 `ROADMAP.md` 拆成 **4A 数据源与契约 → 4B 标的目录 → 4C 持仓账本 → 4D 日终行情 → 4E 下钻归因**。每个任务只领取一个子阶段。**进入 4D 前必须先关闭 T-002 行情源缺口（D-038 门禁）**。
-- 测试基线：`node --test` **407/407 通过**（397 第 1 轮基线零回归 + 复核反例 10 项；领域 `domain-phase4c` 19、真实 HTTP `server-phase4c` 16、迁移 16、`instrument-catalog` 48、`server-phase4b` 17）；浏览器 wiring **18/18**（连续两轮全绿）。数据库 schema 版本 **v6**（v6 = `uq_portfolio_openings_dedupe` 期初唯一索引）。
+- 测试基线：`node --test` **411/411 通过**；领域 `domain-phase4c` 19、真实 HTTP `server-phase4c` **20**、迁移 16、`instrument-catalog` 48、`server-phase4b` 17；浏览器 wiring **18/18**。数据库 schema 版本 **v6**（v6 = `uq_portfolio_openings_dedupe` 期初唯一索引）。
 - 遗留：登录项端到端（重启 Mac 自动打开）与 Keychain 真实读取留待用户在本机手动执行；「15 分钟完成一次月结」的真实耗时按计划留到 Phase 7 验证；**行情主源端点未定**（不存在免费无 key 且有官方条款的 A/H/US ETF 日终源），由 D-038 门禁在 4D 前置解决。
 
 ## 你的任务

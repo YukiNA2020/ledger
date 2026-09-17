@@ -126,9 +126,9 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 **持仓账本与证券事件（D-042，4C）：**
 
 - 持有数量的**唯一推导实现** = `js/domain.js` 的 `deriveHoldings`：数量 = 期初快照 + Σ买入 − Σ卖出；分红/费用只记金额、不改数量；买入可无期初（从 0 起算）；事件按 `occurred_at` 升序重放。**期初日期边界（D-042 ⑦）**：期初快照数量为期初日**日初**数量——`occurred_at` 严格早于期初 `as_of` 的事件视为已含在快照内，不再叠加、不进计数与活动时间戳（记入 `boundarySkippedEvents` 留痕）；期初日当天及以后的事件正常叠加。`computeOverview` / `computeCloseChecklist` / `GET /holdings` 有事件时共用该推导，无事件时与期初口径一致（零回归），三处不会分叉。
-- 事件类型词表 `buy/sell/dividend/fee`；`occurred_at` 为**真实存在的** `YYYY-MM-DD`（日历日校验，`2026-02-30` 拒绝，G4C-5）；buy/sell 必填 `quantity`（正定点数 ≤8 位小数）且禁止携带 `amount_minor`；dividend/fee 必填 `amount_minor`（正整数）。`price_minor` 只存每股价格，不做字段混用。
-- 显式拒绝（不静默吞）：同 id 重放 → 409 `duplicate_event`（HTTP 重试用 `Idempotency-Key` 回放首次响应）；卖出超过当时推导数量 → 409 `insufficient_holdings`（写前 strict 时间线重放，失败整体回滚；**期初写入（新建与更新）后同样在同一事务内 strict 全时间线重放**，G4C-2）；同一（账户, 标的）第二行期初 → 409 `duplicate_opening`；未知账户/标的 → 422。全量 `PUT /state` 与单条写入同一套校验（期初侧抽 `validateOpeningRow` 共用，缺 id / 同键二期初整体拒绝，绝不静默丢行，G4C-3），并由迁移 v6 唯一索引 `uq_portfolio_openings_dedupe(account_id, instrument_id)` 数据库兜底。
-- 证券事件**绝不写 `txns`**（不重复计入现金流），现金余额由余额单元人工核对（D-034/D-042 ④，事件不自动改写）；币种由标的 `currency` 推导；事件重放索引 `(account_id, instrument_id, occurred_at)`（迁移 v5）；备份结构校验按版本覆盖必需表、必需索引与**必需列**（v5+ 要求 `security_events.amount_minor`，G4C-6）。
+- 事件类型词表 `buy/sell/dividend/fee`；`occurred_at` 为**真实存在的** `YYYY-MM-DD`（日历日校验，`2026-02-30` 拒绝，G4C-5）；buy/sell 必填 `quantity`（正定点数 ≤8 位小数）且禁止携带 `amount_minor`；dividend/fee 必填 `amount_minor`（正整数），可选 `quantity` 若提供也必须为正定点数并原样保留，但绝不参与数量变化。`price_minor` 只存每股价格，不做字段混用；未知扩展字段经 `extra_json` 无损往返。
+- 显式拒绝（不静默吞）：同 id 重放 → 409 `duplicate_event`；HTTP 重试的 `Idempotency-Key` 与请求指纹绑定，复用到不同请求体 → 409 `idempotency_conflict`，且事件事实与幂等记录在**同一事务**提交（G4C-7）；卖出超过当时推导数量 → 409 `insufficient_holdings`（写前 strict 时间线重放，失败整体回滚；**期初写入（新建与更新）后同样在同一事务内 strict 全时间线重放**，G4C-2）；同一（账户, 标的）第二行期初 → 409 `duplicate_opening`；未知账户/标的或非证券账户分别 → 422 `unknown_*` / `invalid_account_type`。全量 `PUT /state` 与单条写入同一套校验（期初与事件均逐条查引用；持仓只允许 `kind=broker`；缺 id / 同键二期初整体拒绝，绝不静默丢行，G4C-3/G4C-8），并由迁移 v6 唯一索引 `uq_portfolio_openings_dedupe(account_id, instrument_id)` 数据库兜底。
+- 证券事件**绝不写 `txns`**（不重复计入现金流），现金余额由余额单元人工核对（D-034/D-042 ④，事件不自动改写）；币种只由标的 `currency` 推导，载荷中的冗余 currency 不采信也不能经 extra 覆盖（G4C-9）；事件重放索引 `(account_id, instrument_id, occurred_at)`（迁移 v5）；备份结构校验按版本覆盖必需表、必需索引与**必需列**（v5+ 要求 `security_events.amount_minor`，G4C-6）。
 
 **标的身份与去重（D-039，4B 复核补口后）：**
 
