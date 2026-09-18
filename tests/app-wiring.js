@@ -1011,6 +1011,167 @@
       }
     });
 
+    // C13 Phase 4E：估值下钻与收益归因。
+    // 断言只读**结构化定位属性**（data-drilldown / data-consistency / data-positions-detail /
+    // data-attr-totals / data-attr-row），并与 GET /api/v1/overview 交叉核对，
+    // 不解析「按机构 / 按币种」这些区块里的格式化文案。
+    await check('估值下钻：四维度合计与总览自洽，逐持仓可追溯到价格与汇率来源', async function () {
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-drilldown="1"]'); }, 8000, '估值下钻卡片');
+
+      // 「下钻合计 == 总览」由领域层在同一遍估值里给结论（构造性一致），页面只负责如实呈现
+      var cons = document.querySelector('#view [data-consistency]');
+      assert(cons, '下钻卡片必须自报一致性结论');
+      equal(cons.getAttribute('data-consistency'), 'ok', '四个维度合计必须与总览一致：' + cons.textContent);
+
+      // 与事实源交叉核对：页面上的总额必须等于服务端按同一数据日算出的总览（S2.1）
+      var card = document.querySelector('#view [data-drilldown="1"]');
+      var ov = await fetch('/api/v1/overview').then(function (r) { return r.json(); });
+      equal(Number(card.getAttribute('data-total-assets')), ov.totalAssetsMinor,
+        '页面总资产必须等于 GET /overview 的总资产');
+      equal(Number(card.getAttribute('data-net-worth')), ov.netWorthMinor,
+        '页面净资产必须等于 GET /overview 的净资产');
+      equal(Number(card.getAttribute('data-investable')), ov.pools.investableMinor,
+        '页面投资池合计必须等于 GET /overview 的投资池');
+      // 四个维度的覆盖范围不同，各自对上自己的分母（全部资产 / 投资池 / 投资池持仓）
+      equal(Number(card.getAttribute('data-sum-by-account')), ov.totalAssetsMinor, '按机构合计必须等于总资产');
+      equal(Number(card.getAttribute('data-sum-by-currency')), ov.totalAssetsMinor, '按币种合计必须等于总资产');
+      equal(Number(card.getAttribute('data-sum-by-asset-class')), ov.pools.investableMinor,
+        '按资产类别合计必须等于投资池');
+      assert(Number(card.getAttribute('data-sum-by-market')) <= ov.pools.investableMinor,
+        '按敞口市场合计（只含持仓）不得超过投资池');
+
+      // 逐持仓追溯：每一行都要能回答「这条估值用的是哪天的价格 / 哪个来源 / 哪天的汇率」
+      var st = await apiState();
+      var voo = (st.assets.instruments || []).filter(function (r) { return r.symbol === 'VOO'; })[0];
+      assert(voo, '前置：VOO 标的应存在（4B/4C 场景产物）');
+      var posCount = Number(card.getAttribute('data-positions'));
+      assert(posCount >= 1, '本场景已有持仓事实，逐持仓追溯不应为空');
+      var detail = document.querySelector('#view [data-positions-detail]');
+      assert(detail, '下钻必须提供逐持仓追溯入口');
+      equal(Number(detail.getAttribute('data-positions-detail')), posCount, '追溯入口的行数必须与持仓数一致');
+      assert(detail.textContent.indexOf('2026-09-14') >= 0, '追溯表必须写明这条估值用的价格日');
+      assert(detail.textContent.indexOf('manual') >= 0, '追溯表必须写明价格来源');
+
+      // 追溯表显示的价格日/来源必须就是事实源里那一行（不新建任何估值输入）
+      var quotes = await fetch('/api/v1/quotes').then(function (r) { return r.json(); });
+      var vooQuote = quotes.items.filter(function (x) { return x.instrumentId === voo.id; })[0];
+      assert(vooQuote, '前置：VOO 应有一条手动报价（4D 场景产物）');
+      equal(vooQuote.priceDate, '2026-09-14', '追溯表显示的价格日必须与事实源一致');
+      equal(vooQuote.provider, 'manual', '追溯表显示的价格来源必须与事实源一致');
+    });
+
+    await check('收益归因：基准取自已结账月快照，价格+汇率+未分解恒等于估值变化', async function () {
+      // 前置：至少要两个已结账月，基准选择器才有可比对象。
+      // 注意：本仓库的「全量写入」是**先清后写**（clearState 会把 monthly_closes / close_snapshots
+      // 一并清掉），前面的持仓场景做过全量写回 —— 所以这里不能假设结账记录还在，缺什么就补什么。
+      // 补造走的是与界面同一个结账接口；核对项不足的月份只会存成**估算**，不会伪造正式口径。
+      var cur = new Date();
+      var curYm = cur.getFullYear() + '-' + String(cur.getMonth() + 1).padStart(2, '0');
+      var ymBack = function (n) {
+        var t = new Date(cur.getFullYear(), cur.getMonth() - n, 1);
+        return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0');
+      };
+      var prevYm = ymBack(1), prev2Ym = ymBack(2);
+
+      var ensureClose = async function (month) {
+        var list = await fetch('/api/v1/monthly-closes').then(function (r) { return r.json(); });
+        if (list.items.some(function (c) { return String(c.month) === month; })) return null;
+        var r = await fetch('/api/v1/monthly-closes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': Store.readSessionToken() },
+          body: JSON.stringify({ month: month })
+        });
+        assert(r.ok, '补造结账月 ' + month + ' 应成功，实际 ' + r.status);
+        var b = await r.json();
+        assert(b.ok && b.close && b.close.month === month, '补造的结账月必须落库');
+        assert(b.close.dataCutoff === month + '-31' || /^\d{4}-\d{2}-\d{2}$/.test(b.close.dataCutoff),
+          '结账数据截止日必须是该月最后一天');
+        return b;
+      };
+      // 更早的那个月余额未核对过 → 必须是估算，不能是 formal
+      var older2 = await ensureClose(prev2Ym);
+      if (older2) {
+        equal(older2.close.status, 'estimate', '该月没有余额核对记录，只能存成估算');
+      }
+      await ensureClose(prevYm);
+
+      var closes = await fetch('/api/v1/monthly-closes').then(function (r) { return r.json(); });
+      assert(closes.items.length >= 2, '前置：应有两个已结账月可供选择');
+      // 仓库按 month DESC 返回 → filter 后第 0 个就是「早于本月的最近一个」
+      var expected = closes.items.filter(function (c) { return String(c.month) < curYm; })[0];
+      assert(expected && expected.month === prevYm, '前置：最近一个已结账月应在上个月');
+      var other = closes.items.filter(function (c) {
+        return c.id !== expected.id && String(c.month) < curYm;
+      })[0];
+      assert(other && other.snapshot, '前置：应还有另一个更早的、带快照的结账月');
+
+      // 决策台缓存了上一版的结账列表：先经 nav:close 强制刷新，再回决策台看归因
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:close"]'); }, 8000, '决策台结账入口');
+      clickAction('#view [data-action="nav:close"]');
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () {
+        var s = document.querySelector('#view #attr-baseline');
+        return s && s.options.length >= 2;
+      }, 8000, '期初基准选择器（含补造的结账月）');
+
+      var totals = document.querySelector('#view [data-attr-totals]');
+      assert(totals, '归因卡片必须给出合计');
+      equal(totals.getAttribute('data-baseline-id'), expected.id,
+        '默认期初基准必须是「早于本月的最近一个已结账月」，而不是最早那一个');
+      equal(totals.getAttribute('data-baseline-hash'), expected.snapshot.payloadHash,
+        '归因必须挂到该基准的快照哈希上（事后可追溯）');
+
+      // 恒等式：价格影响 + 汇率影响 + 未分解 = 估值变化（整数最小货币单位，全程无浮点）
+      var rows = document.querySelectorAll('#view [data-attr-row]');
+      equal(rows.length, Number(totals.getAttribute('data-count')), '合计里的行数必须等于行明细条数');
+      var sumPrice = 0, sumAttributable = 0, sumBoundary = 0;
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (r.getAttribute('data-attributable') === '1') {
+          sumAttributable += 1;
+          var pe = Number(r.getAttribute('data-price'));
+          var fe = Number(r.getAttribute('data-fx'));
+          equal(pe + fe, Number(r.getAttribute('data-change')),
+            '可分解行的「价格影响 + 汇率影响」必须等于估值变化');
+          equal(r.getAttribute('data-boundaries'), '', '可分解行不应带任何边界');
+          sumPrice += pe;
+        } else {
+          sumBoundary += 1;
+          assert(r.getAttribute('data-boundaries').length > 0, '不可分解行必须写明卡在哪条边界上');
+          equal(r.getAttribute('data-price'), '', '不可分解行不得给出价格影响（不许插值凑数）');
+          equal(r.getAttribute('data-fx'), '', '不可分解行不得给出汇率影响（不许插值凑数）');
+        }
+      }
+      equal(sumAttributable, Number(totals.getAttribute('data-attributable-count')), '可分解行数必须与合计一致');
+      equal(sumBoundary, Number(totals.getAttribute('data-boundary-count')), '有边界的行数必须与合计一致');
+      equal(sumPrice, Number(totals.getAttribute('data-price')), '合计的证券价格影响必须等于逐行相加');
+
+      var tChange = Number(totals.getAttribute('data-change'));
+      equal(Number(totals.getAttribute('data-price')) + Number(totals.getAttribute('data-fx')) +
+        Number(totals.getAttribute('data-unattributed')), tChange,
+        '合计必须满足：价格影响 + 汇率影响 + 未分解 = 估值变化');
+      equal(Number(totals.getAttribute('data-end')) - Number(totals.getAttribute('data-start')), tChange,
+        '估值变化必须等于期末估值 − 期初估值');
+
+      // 切换期初基准：换成更早那个已结账月后，卡片必须按新基准重算，而不是继续显示旧基准
+      var sel = document.querySelector('#view #attr-baseline');
+      assert(sel, '归因卡片必须提供期初基准选择器');
+      sel.value = other.id;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(function () {
+        var t2 = document.querySelector('#view [data-attr-totals]');
+        return t2 && t2.getAttribute('data-baseline-id') === other.id;
+      }, 5000, '切换期初基准生效');
+      var t3 = document.querySelector('#view [data-attr-totals]');
+      equal(t3.getAttribute('data-baseline-hash'), other.snapshot.payloadHash,
+        '切换后必须挂到新基准的快照哈希上');
+      equal(Number(t3.getAttribute('data-price')) + Number(t3.getAttribute('data-fx')) +
+        Number(t3.getAttribute('data-unattributed')), Number(t3.getAttribute('data-change')),
+        '换基准后恒等式必须仍然成立');
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();

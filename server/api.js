@@ -707,6 +707,28 @@ function createHandler(ctx) {
       basis: basis
     };
 
+    // Phase 4E：把本期收益归因一并封存进快照。基准 = **上一个已结账月**的快照（asOf 即它的 dataCutoff），
+    // 与 D-034 ③「结账相关口径以封存事实为准、不按今天的口径倒推」同纪律。
+    // 没有任何更早的结账记录时 baseline = null，领域层整段不出归因（unavailable='no_baseline'），
+    // 宁可说"还没有可比的已结账月"，也不编一个基准出来。
+    const priorCloses = R.listMonthlyCloses(ctx.db).filter((c) => String(c.month) < String(month));
+    const prior = priorCloses.length ? priorCloses[0] : null;
+    const attributionBaseline = prior && prior.dataCutoff
+      ? {
+        asOf: prior.dataCutoff,
+        month: prior.month,
+        closeId: prior.id,
+        snapshotId: prior.snapshot ? prior.snapshot.id : null,
+        payloadHash: prior.snapshot ? prior.snapshot.payloadHash : null,
+        status: prior.status
+      }
+      : null;
+    const attribution = Domain.computeReturnAttribution(state.assets, {
+      now: asOf,
+      settings: settings,
+      baseline: attributionBaseline
+    });
+
     const nowIso = new Date().toISOString();
     const closeId = R.getMonthlyCloseByMonth(ctx.db, month) || newResourceId('close');
     const snapshotId = newResourceId('snap');
@@ -717,7 +739,9 @@ function createHandler(ctx) {
       overview: overview,
       checklist: checklist,
       emergencyCoverageMonths: emergencyMonths,
-      emergency: emergency
+      emergency: emergency,
+      // Phase 4E 追加字段（纯追加）：旧快照没有这个键，读取方必须容忍它缺失。
+      attribution: attribution
     });
     const payloadHash = crypto.createHash('sha256').update(payloadJson).digest('hex');
 
@@ -764,7 +788,9 @@ function createHandler(ctx) {
         canComplete: checklist.canComplete,
         blockers: checklist.items
       },
-      snapshot: { id: snapshotId, payloadHash: payloadHash, capturedAt: nowIso }
+      snapshot: { id: snapshotId, payloadHash: payloadHash, capturedAt: nowIso },
+      // 归因随结账响应一起返回，省掉一次 close-snapshots 往返；它同时已封存进快照 payload。
+      attribution: attribution
     });
   };
 

@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.10-phase4d';
+  var APP_VERSION = '2.3.11-phase4e';
 
   /* ================= 状态 ================= */
   var state = {
@@ -24,7 +24,8 @@
     statsView: 'root',   // V2.3.4 一级/二级聚合视图
     statNec: '',         // V2.2.1 必要性筛选（'' 全部 / need / want）
     pendingRecurring: 0, // 待生成的周期账笔数（首页横幅）
-    closes: [], closesLoaded: false, // Phase 3：月度结账历史
+    closes: [], closesLoaded: false, closesLoading: false, // Phase 3：月度结账历史
+    baselineCloseId: null, // Phase 4E：收益归因选中的期初基准（结账快照 id，null = 用默认基准）
     // Phase 4B：标的目录（检索结果只存在内存里，不写事实源；事实源只有 instruments 表）
     instQuery: '', instResult: null, instBusy: false, instError: '',
     wiz: null
@@ -299,6 +300,24 @@
     if (location.hash.replace('#', '') === page) route(page);
     else location.hash = page;
   }
+  // Phase 4E：结账快照列表既是「历史结账」的数据源，也是收益归因的**基准来源**。
+  // 决策台与结账页都要用，因此统一在这里惰性加载一次（同一进程不重复请求），
+  // 加载完成后再按需要重渲染当前页。force=true 用于刚结完账时强制刷新。
+  function ensureClosesLoaded(force) {
+    if (state.closesLoading) return;
+    if (state.closesLoaded && !force) return;
+    state.closesLoading = true;
+    Store.listMonthlyCloses().then(function (r) {
+      state.closes = (r && r.items) || [];
+      state.closesLoaded = true;
+      state.closesLoading = false;
+      if (state.page === 'close' || state.page === 'home') render();
+    }).catch(function () {
+      state.closesLoaded = true;
+      state.closesLoading = false;
+    });
+  }
+
   function route(page) {
     if (!state.ready) return;
     if (['home', 'cashflow', 'list', 'stats', 'settings', 'add', 'import', 'accounts', 'categories',
@@ -315,6 +334,8 @@
         esc(e && e.message || e) + '<div class="small muted" style="margin-top:8px">数据未受影响，可返回首页重试</div>' +
         '<button class="btn primary" style="margin-top:12px" onclick="location.hash=\'home\'">回首页</button></div>';
     }
+    // Phase 4E：决策台要展示收益归因、结账页要展示历史结账，都需要快照列表
+    if (page === 'home' || page === 'close') ensureClosesLoaded(false);
     window.scrollTo(0, 0);
   }
 
@@ -381,9 +402,250 @@
     cash: '现金', fixed_income: '固收', broad_equity: '宽基权益',
     theme_equity: '主题权益', stock: '个股', other: '其他'
   };
+  // Phase 4E：敞口市场展示名。'unspecified' 是"用户还没填"的分组桶，不是 EXPOSURE_MARKETS 词表值。
+  var EXPOSURE_MARKET_LABELS = {
+    CN: '中国内地', HK: '中国香港', US: '美国', global: '全球', other: '其他',
+    unspecified: '未填写敞口市场'
+  };
+  // Phase 4E 归因边界码 → 为什么这一段不能拆成"价格影响 + 汇率影响"。
+  // 这些码只描述"能不能分解"，与 BLOCKER_LABELS 的"能不能给正式建议"是两套语义，不得混用。
+  var ATTRIBUTION_BOUNDARY_LABELS = {
+    no_baseline: '没有可用的期初基准（需要一份已结账月快照）',
+    missing_start_quote: '缺少期初价格（基准日当天及之前没有报价）',
+    missing_end_quote: '缺少期末价格',
+    missing_start_fx: '缺少期初汇率（基准日当天及之前没有该币对汇率）',
+    missing_end_fx: '缺少期末汇率',
+    currency_changed: '期间报价币种发生变化',
+    position_opened: '期间新建仓位',
+    position_closed: '期末已清仓',
+    quantity_changed: '期间有买卖，持有数量已变化',
+    opening_rebased: '期间重录了期初快照（数量跳档不是收益）',
+    instrument_missing: '标的记录缺失',
+    holding_invalid: '数量或价格无法参与计算'
+  };
+  var ATTRIBUTION_NOTE_LABELS = {
+    end_quote_stale: '期末行情已过期（本期仍是估算口径）',
+    end_fx_stale: '期末汇率已过期（本期仍是估算口径）',
+    classification_unconfirmed: '标的分类未确认（本期仍是估算口径）'
+  };
 
   function blockerText(b) {
     return (BLOCKER_LABELS[b.code] || b.code) + (b.detail ? '（' + b.detail + '）' : '');
+  }
+
+  /* ============== Phase 4E：估值下钻与收益归因（决策台） ============== */
+
+  // 估值下钻：四个维度共用 Domain.computeAssetDrilldown 的**同一遍**估值，
+  // 因此"合计与总览一致"由领域层直接给结论，页面不再各写一套容忍判断。
+  function groupBlock(title, scope, groups, totalMinor) {
+    var rows = groups.map(function (g) {
+      var pct = totalMinor > 0 ? Math.round(g.valueCnyMinor / totalMinor * 1000) / 10 : null;
+      return '<div class="risk-row"><span class="r-name">' + esc(g.label || g.key) + '</span>' +
+        '<span class="r-bar"><i style="width:' + Math.min(pct || 0, 100) + '%"></i></span>' +
+        '<span class="r-val">' + Core.fmtMoney(g.valueCnyMinor) + '</span>' +
+        '<span class="r-pct">' + (pct == null ? '—' : pct + '%') + '</span></div>' +
+        (g.unvaluedCount
+          ? '<div class="small muted" style="padding:0 0 4px">· 有 ' + g.unvaluedCount + ' 项因缺汇率未计入合计</div>'
+          : '');
+    }).join('');
+    return '<div class="sec-head" style="margin-top:10px"><b>' + esc(title) + '</b>' +
+      '<span class="small muted" style="margin-left:auto">' + esc(scope) + '</span></div>' +
+      (rows || '<div class="small muted" style="padding:6px 0">无</div>');
+  }
+
+  function positionsDetail(positions) {
+    if (!positions.length) return '';
+    var rows = positions.map(function (p) {
+      return '<tr><td style="text-align:left">' + esc(p.symbol || p.instrumentId || '') +
+        '<div class="small muted">' + esc(p.accountName || '') + ' · ' +
+        esc(RISK_CLASS_LABELS[p.riskClass] || p.riskClass || '') + ' · ' +
+        esc(EXPOSURE_MARKET_LABELS[p.exposureMarket || 'unspecified'] || '') + '</div></td>' +
+        '<td>' + (p.quantity == null ? '—' : esc(String(p.quantity))) + '</td>' +
+        '<td>' + (p.priceMinor == null ? '—' : Core.fmtMoney(p.priceMinor) + ' ' + esc(p.currency || '')) +
+        '<div class="small muted">价格日 ' + esc(p.priceDate || '—') + ' · 来源 ' + esc(p.priceProvider || '—') + '</div></td>' +
+        '<td>' + (p.fxRateDecimal == null ? '<span class="muted">—</span>' : esc(String(p.fxRateDecimal))) +
+        '<div class="small muted">汇率日 ' + esc(p.fxRateDate || '—') + ' · 来源 ' + esc(p.fxProvider || '—') + '</div></td>' +
+        '<td>' + (p.valueCnyMinor == null
+          ? '<span class="muted">' + (p.skipped === 'missing_fx' ? '缺汇率·未计入' : '未计入') + '</span>'
+          : Core.fmtMoney(p.valueCnyMinor) + ' CNY') + '</td></tr>';
+    }).join('');
+    return '<details style="margin-top:10px" data-positions-detail="' + positions.length + '">' +
+      '<summary class="small muted">逐持仓追溯（数量 / 价格 / 价格日 / 来源 / 汇率 / 汇率日 / 来源）</summary>' +
+      '<div style="overflow-x:auto"><table class="mini"><thead><tr>' +
+      '<th style="text-align:left">标的 / 账户</th><th>数量</th><th>价格</th><th>汇率</th><th>折 CNY</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div></details>';
+  }
+
+  function drilldownCard() {
+    var dd = Domain.computeAssetDrilldown(state.assets, { now: todayDateStr(), settings: state.settings });
+    var c = dd.consistency;
+    var ok = c.byAccountMatches && c.byCurrencyMatches && c.byAssetClassMatches && c.byMarketMatches;
+    var consistency = '<div class="small muted" style="margin-top:8px" data-consistency="' + (ok ? 'ok' : 'mismatch') + '">' +
+      (ok
+        ? '✓ 四个维度合计与总览一致（机构 / 币种 = 总资产，资产类别 = 投资池，市场 = 投资池持仓）'
+        : '⚠️ 下钻合计与总览不一致：机构 ' + Core.fmtMoney(c.sumByAccountMinor) +
+          ' · 币种 ' + Core.fmtMoney(c.sumByCurrencyMinor) +
+          ' · 类别 ' + Core.fmtMoney(c.sumByAssetClassMinor) +
+          ' · 市场 ' + Core.fmtMoney(c.sumByMarketMinor) + '，请勿据此决策') +
+      '</div>';
+    // 结构化定位属性：wiring 用这些数字与 GET /api/v1/overview 交叉核对，
+    // 而不是解析「按机构 / 按币种」这些区块里的格式化文案。
+    return '<div class="card" data-drilldown="1"' +
+      ' data-as-of="' + esc(dd.asOf) + '"' +
+      ' data-positions="' + dd.positions.length + '"' +
+      ' data-total-assets="' + dd.totals.totalAssetsMinor + '"' +
+      ' data-net-worth="' + dd.totals.netWorthMinor + '"' +
+      ' data-investable="' + dd.totals.investableMinor + '"' +
+      ' data-sum-by-account="' + c.sumByAccountMinor + '"' +
+      ' data-sum-by-currency="' + c.sumByCurrencyMinor + '"' +
+      ' data-sum-by-asset-class="' + c.sumByAssetClassMinor + '"' +
+      ' data-sum-by-market="' + c.sumByMarketMinor + '">' +
+      '<div class="row small muted"><b>估值下钻</b>' +
+      '<span style="margin-left:auto">数据日 ' + esc(dd.asOf) + '</span></div>' +
+      groupBlock('按机构', '全部资产 · 合计 ' + Core.fmtMoney(dd.totals.totalAssetsMinor), dd.byAccount, dd.totals.totalAssetsMinor) +
+      groupBlock('按币种', '全部资产 · 合计 ' + Core.fmtMoney(dd.totals.totalAssetsMinor), dd.byCurrency, dd.totals.totalAssetsMinor) +
+      groupBlock('按资产类别', '仅投资池 · 合计 ' + Core.fmtMoney(dd.totals.investableMinor), dd.byAssetClass, dd.totals.investableMinor) +
+      groupBlock('按敞口市场', '仅投资池持仓 · 合计 ' + Core.fmtMoney(dd.totals.investableHoldingsMinor), dd.byMarket, dd.totals.investableHoldingsMinor) +
+      consistency + positionsDetail(dd.positions) + '</div>';
+  }
+
+  // 默认基准：最近一个「早于本月」的已结账月；若没有（例如本月也已结账），退化为最新一份快照。
+  function pickBaseline(closes) {
+    if (!closes.length) return null;
+    if (state.baselineCloseId) {
+      var picked = closes.filter(function (x) { return x.id === state.baselineCloseId; })[0];
+      if (picked) return picked;
+    }
+    var month = todayDateStr().slice(0, 7);
+    var older = closes.filter(function (x) { return String(x.month) < month; });
+    return older.length ? older[0] : closes[0];
+  }
+
+  function attributionLine(label, minor) {
+    return '<div class="row small"><span>' + esc(label) + '</span>' +
+      '<span style="margin-left:auto">' + (minor == null ? '—' : Core.fmtMoney(minor) + ' CNY') + '</span></div>';
+  }
+
+  function attributionCard() {
+    var head = '<div class="row small muted"><b>收益归因</b>' +
+      '<span style="margin-left:auto">证券价格影响与汇率影响分开计算</span></div>';
+
+    if (!state.closesLoaded) {
+      return '<div class="card" data-attribution="loading">' + head +
+        '<div class="small muted" style="padding:6px 0">加载结账快照…</div></div>';
+    }
+    var closes = state.closes || [];
+    if (!closes.length) {
+      return '<div class="card" data-attribution="no-closes">' + head +
+        '<div class="small muted" style="padding:6px 0;line-height:1.8">' +
+        '收益归因需要一个已结账月作为期初基准，目前还没有结账记录。<br>' +
+        '先做一次月度结账，这里就能看到「证券价格影响」和「汇率影响」各是多少。</div>' +
+        '<button class="btn ghost small" data-action="nav:close">去月度结账</button></div>';
+    }
+
+    var baseline = pickBaseline(closes);
+    var baselineArg = baseline && baseline.snapshot && baseline.dataCutoff
+      ? {
+        asOf: baseline.dataCutoff,
+        month: baseline.month,
+        closeId: baseline.id,
+        snapshotId: baseline.snapshot.id,
+        payloadHash: baseline.snapshot.payloadHash,
+        status: baseline.status
+      }
+      : null;
+    var at = Domain.computeReturnAttribution(state.assets, {
+      now: todayDateStr(),
+      settings: state.settings,
+      baseline: baselineArg
+    });
+
+    var options = closes.map(function (x) {
+      return '<option value="' + esc(x.id) + '"' + (baseline && x.id === baseline.id ? ' selected' : '') + '>' +
+        esc(ymLabel(x.month)) + ' 月末快照（' + (x.status === 'formal' ? '正式' : '估算') + '）</option>';
+    }).join('');
+    var picker = '<div class="small muted" style="margin-top:6px">期初基准</div>' +
+      '<select id="attr-baseline" data-change="attr:baseline" data-baseline="' + esc(baseline ? baseline.id : '') + '">' +
+      options + '</select>';
+
+    if (at.unavailable === 'no_baseline') {
+      return '<div class="card" data-attribution="no-baseline">' + head + picker +
+        '<div class="small muted" style="padding:6px 0">这份快照缺少可用的数据截止日，无法作为期初基准。' +
+        '换一个基准月，或重新结账以生成完整快照。</div></div>';
+    }
+
+    var t = at.totals;
+    // 结构化定位属性：wiring 断言读这些数字，而不是解析格式化后的文案。
+    // null 一律输出空串（不是 0），让断言能区分「零」与「定不出来」。
+    var numAttr = function (m) { return m == null ? '' : String(m); };
+    var summary = '<div class="acc-card" style="margin-top:8px" data-attr-totals="1"' +
+      ' data-count="' + t.rowCount + '" data-attributable-count="' + t.attributableCount + '"' +
+      ' data-boundary-count="' + t.boundaryCount + '"' +
+      ' data-can-advise="' + (at.valuation.canAdvise ? '1' : '0') + '"' +
+      ' data-start="' + numAttr(t.startValueCnyMinor) + '"' +
+      ' data-end="' + numAttr(t.endValueCnyMinor) + '"' +
+      ' data-change="' + numAttr(t.valueChangeCnyMinor) + '"' +
+      ' data-price="' + numAttr(t.priceEffectCnyMinor) + '"' +
+      ' data-fx="' + numAttr(t.fxEffectCnyMinor) + '"' +
+      ' data-unattributed="' + numAttr(t.unattributedChangeCnyMinor) + '"' +
+      ' data-baseline-id="' + esc(String(at.baseline && at.baseline.closeId || '')) + '"' +
+      ' data-baseline-hash="' + esc(String(at.baseline && at.baseline.payloadHash || '')) + '">' +
+      attributionLine('期初估值（' + (at.baseline && at.baseline.asOf ? at.baseline.asOf : '—') + '）', t.startValueCnyMinor) +
+      attributionLine('期末估值（' + at.asOf + '）', t.endValueCnyMinor) +
+      attributionLine('估值变化', t.valueChangeCnyMinor) +
+      attributionLine('其中 · 证券价格影响', t.priceEffectCnyMinor) +
+      attributionLine('其中 · 汇率影响', t.fxEffectCnyMinor) +
+      (t.unattributedChangeCnyMinor
+        ? attributionLine('未能归因的变化', t.unattributedChangeCnyMinor)
+        : '') +
+      '<div class="small muted" style="margin-top:6px">已分解 ' + t.attributableCount + ' 条 · 有边界 ' + t.boundaryCount +
+      ' 条（价格影响 + 汇率影响 + 未能归因 = 估值变化）</div>' +
+      '<div class="small muted">口径：' + (at.valuation.canAdvise ? '正式' : '估算（存在数据缺口，暂不能生成正式建议）') +
+      ' · 基准快照 ' + esc(String(at.baseline && at.baseline.payloadHash || '').slice(0, 8)) + '</div></div>';
+
+    var rowHtml = at.rows.map(function (r) {
+      var boundaryHtml = r.boundaries.map(function (b) {
+        return '<div class="small muted">· ' + esc(ATTRIBUTION_BOUNDARY_LABELS[b] || b) + '</div>';
+      }).join('');
+      var noteHtml = r.notes.map(function (n) {
+        return '<div class="small muted">· ' + esc(ATTRIBUTION_NOTE_LABELS[n] || n) + '</div>';
+      }).join('');
+      var money = function (m) { return m == null ? '—' : Core.fmtMoney(m); };
+      return '<div class="acc-card" data-attr-row="' + esc(r.instrumentId || '') + '"' +
+        ' data-attributable="' + (r.attributable ? '1' : '0') + '"' +
+        ' data-boundaries="' + esc(r.boundaries.join(',')) + '"' +
+        ' data-notes="' + esc(r.notes.join(',')) + '"' +
+        ' data-change="' + numAttr(r.valueChangeCnyMinor) + '"' +
+        ' data-price="' + numAttr(r.priceEffectCnyMinor) + '"' +
+        ' data-fx="' + numAttr(r.fxEffectCnyMinor) + '"' +
+        ' data-start-quantity="' + esc(String(r.startQuantity)) + '"' +
+        ' data-end-quantity="' + esc(String(r.endQuantity)) + '"' +
+        ' data-start-price-date="' + esc(String(r.startPriceDate || '')) + '"' +
+        ' data-end-price-date="' + esc(String(r.endPriceDate || '')) + '">' +
+        '<div class="row"><b>' + esc(r.symbol || r.instrumentId || '') + '</b>' +
+        '<span class="small muted" style="margin-left:auto">' + esc(r.accountName || '') + '</span></div>' +
+        '<div class="small muted">数量 ' + esc(r.startQuantity) + ' → ' + esc(r.endQuantity) +
+        ' · 价格 ' + money(r.startPriceMinor) + '（' + esc(r.startPriceDate || '—') + '）→ ' +
+        money(r.endPriceMinor) + '（' + esc(r.endPriceDate || '—') + '）' +
+        ' · 来源 ' + esc(r.startPriceProvider || '—') + '/' + esc(r.endPriceProvider || '—') + '</div>' +
+        '<div class="small muted">汇率 ' + esc(String(r.startRateDecimal || '—')) + '（' + esc(r.startRateDate || '—') + '）→ ' +
+        esc(String(r.endRateDecimal || '—')) + '（' + esc(r.endRateDate || '—') + '）' +
+        ' · 来源 ' + esc(r.startRateProvider || '—') + '/' + esc(r.endRateProvider || '—') + '</div>' +
+        (r.attributable
+          ? '<div class="dash-sub"><span>价格影响 ' + money(r.priceEffectCnyMinor) + '</span>' +
+            '<span>汇率影响 ' + money(r.fxEffectCnyMinor) + '</span>' +
+            '<span>合计 ' + money(r.valueChangeCnyMinor) + '</span></div>'
+          : '<div class="small muted">本次不做分解' +
+            (r.valueChangeCnyMinor == null ? '（两端估值也定不出来）' : '：估值变化 ' + money(r.valueChangeCnyMinor) + ' 未分解') +
+            '</div>') +
+        boundaryHtml + noteHtml + '</div>';
+    }).join('');
+
+    return '<div class="card" data-attribution="ready">' + head + picker + summary + rowHtml +
+      '<div class="small muted" style="margin-top:8px;line-height:1.8">' +
+      '· 价格影响 =（期末本地币值 − 期初本地币值）× 期初汇率；汇率影响取残差，两侧相加恒等于估值变化。<br>' +
+      '· 期初数量按期初日重放事件求得；期初价格与汇率只认基准日当天及之前的事实，绝不插值、不按 1:1 兜底。<br>' +
+      '· 期间有买卖、清仓、重录期初，或缺任一端的价格/汇率时，只给估值变化、不做分解。</div></div>';
   }
 
   function tplDashboard() {
@@ -510,7 +772,8 @@
       '<div><b>月度结账</b><div class="small muted">' + ymLabel(ymShift(todayDateStr(), -1)) + ' 核对清单与结账快照</div></div>' +
       '<span class="arrow">›</span></div>';
 
-    return html + blockerHtml + hero + poolCards + emergencyCard + riskCard + newFundsCard + todoHtml + caliber +
+    return html + blockerHtml + hero + poolCards + emergencyCard + riskCard + newFundsCard + todoHtml +
+      drilldownCard() + attributionCard() + caliber +
       assetEntry + closeEntry + cashflowEntry;
   }
 
@@ -3167,11 +3430,8 @@
     'nav:assets': function () { nav('assets'); },
     'nav:close': function () {
       nav('close');
-      Store.listMonthlyCloses().then(function (r) {
-        state.closes = (r && r.items) || [];
-        state.closesLoaded = true;
-        if (state.page === 'close') render();
-      }).catch(function () { state.closesLoaded = true; });
+      // 刚结完账回来要看到新快照，因此强制重拉一次
+      ensureClosesLoaded(true);
     },
     'asset:acc': assetAccountSheet,
     'asset:saveAcc': function () {
@@ -3921,6 +4181,9 @@
   };
 
   var changes = {
+    // 收益归因：切换期初基准快照。只改本地选中项，重渲染后由 pickBaseline 优先采用；
+    // 估值与归因都在前端按 Domain 单一实现重算，不向后端写任何东西。
+    'attr:baseline': function (el) { state.baselineCloseId = el.value || null; render(); },
     'filter:type': function (el) { state.listFilters.type = el.value; render(); filterSheet(); },
     'filter:account': function (el) { state.listFilters.account = el.value; render(); filterSheet(); },
     'filter:category': function (el) { state.listFilters.category = el.value; render(); filterSheet(); },

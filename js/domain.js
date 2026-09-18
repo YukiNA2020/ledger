@@ -131,6 +131,12 @@
     return formatDecimal(av - bv, s);
   }
 
+  // 持仓的身份键：一个 (账户, 标的) 一行持有事实（D-042）。键的拼法只有这一处实现，
+  // deriveHoldings 与 holdingsAsOf 共用，避免两处各写一份字符串拼接后悄悄分叉。
+  function holdingKey(accountId, instrumentId) {
+    return String(accountId) + '|' + String(instrumentId);
+  }
+
   /* ------------------------------ 持仓推导（Phase 4C，D-042/D-025） ------------------------------ */
 
   // deriveHoldings(openings, events, options) — 持有数量的**唯一推导实现**：
@@ -155,9 +161,7 @@
 
     var map = {};
     var order = [];
-    function keyOf(accountId, instrumentId) {
-      return String(accountId) + '|' + String(instrumentId);
-    }
+    var keyOf = holdingKey;
     function holdingFor(accountId, instrumentId) {
       var key = keyOf(accountId, instrumentId);
       if (!map[key]) {
@@ -265,6 +269,36 @@
     return { holdings: holdings, invalidEvents: invalidEvents };
   }
 
+  /* --------------------- Phase 4E：基准日的持有数量（as-of 重放，D-045） --------------------- */
+
+  // holdingsAsOf(openings, events, asOf) — 基准日的持有数量。
+  // 口径：把「期初快照 + 事件」按基准日**截断**后交给 deriveHoldings 重放，不另写一套加减
+  //（D-042 ① 的唯一推导实现）。截断规则：
+  //   - 期初快照的 asOf 晚于基准日 → 该快照在基准日尚不存在，整行排除（数量只能由当时可见的事实推导）；
+  //   - 事件 occurredAt 晚于基准日 → 排除；occurredAt 缺失的事件不是可用事实，同样排除。
+  // 基准日**当天**的期初与事件均计入 —— 与 D-042 ⑦「期初快照 = 期初日日初数量」的边界口径一致。
+  function holdingsAsOf(openings, events, asOf) {
+    var limit = asOf == null ? null : String(asOf);
+    if (!limit) return { holdings: [], byKey: {}, invalidEvents: [] };
+    var openList = (Array.isArray(openings) ? openings : []).filter(function (o) {
+      if (!o) return false;
+      var d = o.asOf == null ? '' : String(o.asOf);
+      return !d || d <= limit;
+    });
+    var evList = (Array.isArray(events) ? events : []).filter(function (e) {
+      if (!e) return false;
+      var d = e.occurredAt == null ? '' : String(e.occurredAt);
+      return !!d && d <= limit;
+    });
+    var result = deriveHoldings(openList, evList);
+    var byKey = {};
+    result.holdings.forEach(function (h) {
+      if (!h || !h.accountId || !h.instrumentId) return;
+      byKey[holdingKey(h.accountId, h.instrumentId)] = h;
+    });
+    return { holdings: result.holdings, byKey: byKey, invalidEvents: result.invalidEvents };
+  }
+
   /* ------------------------------ 日期与新鲜度 ------------------------------ */
 
   // 'YYYY-MM-DD' 之间的自然日差（b − a）
@@ -352,6 +386,17 @@
 
   /* ------------------------------ 汇率与报价 ------------------------------ */
 
+  // 陈旧判定的**唯一实现**：报价过期与汇率过期是同一条规则（A-004）。
+  // findQuote / findFxRate 与 4E 的 as-of 腿都调它，避免出现第二套阈值或第二个比较方向。
+  function quoteStatusOf(priceDate, now) {
+    return isStaleDays(priceDate, now, MAX_STALE_DAYS) ? 'quote_stale' : 'ok';
+  }
+
+  function fxStatusOf(rateDate, now) {
+    return isStaleDays(rateDate, now, MAX_STALE_DAYS) ? 'fx_stale' : 'ok';
+  }
+
+
   // 取币对最近一条汇率；无 → null；有但超 5 个自然日 → status 'fx_stale'（估值仍可用）
   function findFxRate(fxRates, base, quote, now) {
     var best = null;
@@ -365,7 +410,7 @@
       rateDecimal: best.rateDecimal,
       rateDate: best.rateDate || null,
       provider: best.provider || null,
-      status: isStaleDays(best.rateDate, now, MAX_STALE_DAYS) ? 'fx_stale' : 'ok'
+      status: fxStatusOf(best.rateDate, now)
     };
   }
 
@@ -392,7 +437,54 @@
       currency: best.currency,
       priceDate: best.priceDate || null,
       provider: best.provider || null,
-      status: isStaleDays(best.priceDate, now, MAX_STALE_DAYS) ? 'quote_stale' : 'ok'
+      status: quoteStatusOf(best.priceDate, now)
+    };
+  }
+
+  /* --------------------- Phase 4E：历史基准的 as-of 查询（D-045） --------------------- */
+
+  // 取基准日**当天及之前**最近一条报价。与 findQuote 的区别：
+  //   findQuote    用于「当前估值」——取全局最新一条，陈旧性由 now 判定（A-004）；
+  //   as-of 查询   用于「历史基准」——**绝不返回晚于基准日的行**，否则会拿未来价格回算历史。
+  // 历史基准不做陈旧判定（那一刻的观测就是那一刻的事实），因此不返回 status。
+  function findQuoteAsOf(quotes, instrumentId, asOf) {
+    if (!asOf) return null;
+    var limit = String(asOf);
+    var best = null;
+    (quotes || []).forEach(function (q) {
+      if (!q || q.instrumentId !== instrumentId) return;
+      if (typeof q.priceMinor !== 'number' || !isFinite(q.priceMinor)) return;
+      var d = q.priceDate == null ? '' : String(q.priceDate);
+      if (!d || d > limit) return;
+      if (!best || d > String(best.priceDate || '')) best = q;
+    });
+    if (!best) return null;
+    return {
+      priceMinor: best.priceMinor,
+      currency: best.currency == null ? null : best.currency,
+      priceDate: best.priceDate || null,
+      provider: best.provider || null
+    };
+  }
+
+  // 取基准日**当天及之前**最近一条汇率（同上：as-of 语义，绝不返回未来行）。
+  // 币对方向仍按精确匹配，不取倒数（与 findFxRate 同纪律）。
+  function findFxRateAsOf(fxRates, base, quote, asOf) {
+    if (!asOf) return null;
+    var limit = String(asOf);
+    var best = null;
+    (fxRates || []).forEach(function (r) {
+      if (!r || r.base !== base || r.quote !== quote) return;
+      if (!parseDecimal(r.rateDecimal)) return;
+      var d = r.rateDate == null ? '' : String(r.rateDate);
+      if (!d || d > limit) return;
+      if (!best || d > String(best.rateDate || '')) best = r;
+    });
+    if (!best) return null;
+    return {
+      rateDecimal: best.rateDecimal,
+      rateDate: best.rateDate || null,
+      provider: best.provider || null
     };
   }
 
@@ -605,6 +697,155 @@
 
   /* ------------------------------ 总览计算 ------------------------------ */
 
+  // 折算到 CNY 并同步登记阻塞码（fx_missing / fx_stale）—— 金额估值路径的唯一折算入口。
+  // 返回 { valueMinor, status, rate }；缺汇率 → null（绝不按 1:1 兜底）。
+  // rate 是本次折算**实际用到**的汇率事实（同币种为恒等 '1'），供「这条估值用的哪天的汇率」追溯（4E）。
+  function convertToCny(minor, currency, fxRates, now, addBlocker) {
+    var conv = convertMinor(minor, currency, 'CNY', fxRates, now);
+    if (conv.status === 'missing_fx') { addBlocker('fx_missing', currency); return null; }
+    if (conv.status === 'fx_stale') addBlocker('fx_stale', currency);
+    var rate = currency === 'CNY'
+      ? { rateDecimal: '1', rateDate: null, provider: null }
+      : findFxRate(fxRates, currency, 'CNY', now);
+    return { valueMinor: conv.valueMinor, status: conv.status, rate: rate };
+  }
+
+  // 资产项估值（Phase 4E 抽取，D-025 单一实现）：逐条估值「余额单元 + 持仓」，并记录**全部追溯字段**
+  //（数量 / 价格 / 价格日 / 价格来源 / 汇率 / 汇率日 / 汇率来源）。
+  // computeOverview 与 computeAssetDrilldown 共用本函数，因此「下钻合计 == 总览」是**同一遍计算**的
+  // 必然结果，而不是两套算法互相校对。阻塞码的判定顺序与 Phase 1–3 逐字一致（零回归的前提）。
+  // 返回 items[]：未计入合计的项也保留在列表里（valueCnyMinor = null + skipped 原因），绝不静默丢行。
+  function valueAssetItems(a, ctx) {
+    var now = ctx.now;
+    var addBlocker = ctx.addBlocker;
+    var accountMap = ctx.accountMap;
+    var instrumentMap = ctx.instrumentMap;
+    var items = [];
+
+    /* 现金与明确余额单元 */
+    a.assetUnits.forEach(function (u) {
+      if (!u) return;
+      var acct = accountMap[u.accountId];
+      var pool = acct && POOLS.indexOf(acct.pool) !== -1 ? acct.pool : null;
+      if (!pool) addBlocker('pool_missing', (acct && acct.name) || u.accountId || '');
+      var item = {
+        kind: 'unit',
+        id: u.id || null,
+        accountId: u.accountId || null,
+        accountName: (acct && acct.name) || null,
+        pool: pool,
+        currency: u.currency || null,
+        assetClass: 'cash',
+        riskClass: 'cash',
+        exposureMarket: null,
+        classificationStatus: null,
+        instrumentId: null,
+        symbol: null,
+        quantity: null,
+        balanceMinor: u.balanceMinor == null ? null : u.balanceMinor,
+        valueDate: u.asOf || null,
+        priceMinor: null,
+        priceDate: null,
+        priceProvider: null,
+        priceStatus: null,
+        fxRateDecimal: null,
+        fxRateDate: null,
+        fxProvider: null,
+        fxStatus: null,
+        valueLocalMinor: u.balanceMinor == null ? null : u.balanceMinor,
+        valueCnyMinor: null,
+        valueStatus: null,
+        skipped: null
+      };
+      items.push(item);
+      if (u.balanceMinor == null) {
+        addBlocker('balance_missing', (acct && acct.name) || u.accountId || ''); // 无明确余额：不参与合计，不按 0 处理
+        item.skipped = 'balance_missing';
+        return;
+      }
+      if (ymOf(u.asOf) !== ymOf(now)) addBlocker('balance_stale', (acct && acct.name) || u.accountId || ''); // A-005
+      var conv = convertToCny(u.balanceMinor, u.currency, a.fxRates, now, addBlocker);
+      if (conv == null) { item.skipped = 'missing_fx'; return; }
+      item.valueCnyMinor = conv.valueMinor;
+      item.valueStatus = conv.status;
+      item.fxRateDecimal = conv.rate ? conv.rate.rateDecimal : null;
+      item.fxRateDate = conv.rate ? conv.rate.rateDate : null;
+      item.fxProvider = conv.rate ? conv.rate.provider : null;
+      item.fxStatus = conv.status;
+    });
+
+    /* 持仓估值：数量口径只有一份（D-025/D-042）。
+     * 有证券事件时，估值数量来自 deriveHoldings 的推导结果（期初 + Σ买入 − Σ卖出）；
+     * 无事件时直接用期初快照，两者数值一致、零回归。 */
+    var holdingRows = a.holdings;
+    if (a.securityEvents && a.securityEvents.length > 0) {
+      holdingRows = deriveHoldings(a.holdings, a.securityEvents).holdings;
+    }
+    holdingRows.forEach(function (h) {
+      if (!h) return;
+      var ins = instrumentMap[h.instrumentId];
+      var acct = accountMap[h.accountId];
+      var pool = acct && POOLS.indexOf(acct.pool) !== -1 ? acct.pool : null;
+      var item = {
+        kind: 'holding',
+        id: h.openingId != null ? h.openingId : (h.id || null),
+        accountId: h.accountId || null,
+        accountName: (acct && acct.name) || null,
+        pool: pool,
+        currency: ins && ins.currency != null ? ins.currency : null,
+        assetClass: ins && ins.assetClass != null ? ins.assetClass : null,
+        riskClass: ins && RISK_CLASSES.indexOf(ins.assetClass) !== -1 ? ins.assetClass : 'other',
+        exposureMarket: ins && isExposureMarket(ins.exposureMarket) ? ins.exposureMarket : null,
+        classificationStatus: ins ? (ins.classificationStatus || null) : null,
+        instrumentId: h.instrumentId || null,
+        symbol: ins ? (ins.symbol || null) : null,
+        quantity: h.quantity || null,
+        balanceMinor: null,
+        valueDate: null,
+        priceMinor: null,
+        priceDate: null,
+        priceProvider: null,
+        priceStatus: null,
+        fxRateDecimal: null,
+        fxRateDate: null,
+        fxProvider: null,
+        fxStatus: null,
+        valueLocalMinor: null,
+        valueCnyMinor: null,
+        valueStatus: null,
+        skipped: null
+      };
+      items.push(item);
+      if (!ins) { addBlocker('instrument_missing', h.instrumentId || ''); item.skipped = 'instrument_missing'; return; }
+      if (!pool) addBlocker('pool_missing', (acct && acct.name) || h.accountId || '');
+      var q = findQuote(a.quotes, h.instrumentId, now);
+      if (!q) { addBlocker('quote_missing', ins.symbol || h.instrumentId || ''); item.skipped = 'missing_quote'; return; }
+      if (q.status === 'quote_stale') addBlocker('quote_stale', ins.symbol || '');
+      item.priceMinor = q.priceMinor;
+      item.priceDate = q.priceDate || null;
+      item.priceProvider = q.provider || null;
+      item.priceStatus = q.status;
+      item.currency = q.currency == null ? item.currency : q.currency; // 估值币种 = 报价币种
+      var minor = mulMinor(h.quantity, q.priceMinor);
+      if (minor == null) { addBlocker('holding_invalid', ins.symbol || ''); item.skipped = 'holding_invalid'; return; }
+      item.valueLocalMinor = minor;
+      var hconv = convertToCny(minor, q.currency, a.fxRates, now, addBlocker);
+      if (hconv == null) { item.skipped = 'missing_fx'; return; }
+      item.valueCnyMinor = hconv.valueMinor;
+      item.valueStatus = hconv.status;
+      item.fxRateDecimal = hconv.rate ? hconv.rate.rateDecimal : null;
+      item.fxRateDate = hconv.rate ? hconv.rate.rateDate : null;
+      item.fxProvider = hconv.rate ? hconv.rate.provider : null;
+      item.fxStatus = hconv.status;
+      if (pool === 'investable' && item.riskClass === 'other' && ins.assetClass) {
+        addBlocker('asset_class_invalid', ins.symbol || '');
+      }
+      if (ins.classificationStatus !== 'confirmed') addBlocker('classification_unconfirmed', ins.symbol || '');
+    });
+
+    return items;
+  }
+
   // computeOverview(assets, { now, settings })
   //   now：'YYYY-MM-DD'（必传，固定时钟）；
   //   settings.safetyTargetMinor：安全储备目标（分，可缺省 → 缺口按 0 并列入待办）。
@@ -640,63 +881,24 @@
     var hasAnyData = a.assetUnits.length > 0 || a.holdings.length > 0 || a.liabilities.length > 0 ||
       a.securityEvents.length > 0;
 
-    function convertFor(minor, currency, label) {
-      var conv = convertMinor(minor, currency, 'CNY', a.fxRates, now);
-      if (conv.status === 'missing_fx') { addBlocker('fx_missing', currency); return null; }
-      if (conv.status === 'fx_stale') addBlocker('fx_stale', currency);
-      return conv.valueMinor;
-    }
-
-    /* 现金与明确余额单元 */
-    a.assetUnits.forEach(function (u) {
-      if (!u) return;
-      var acct = accountMap[u.accountId];
-      var pool = acct && POOLS.indexOf(acct.pool) !== -1 ? acct.pool : null;
-      if (!pool) addBlocker('pool_missing', (acct && acct.name) || u.accountId || '');
-      if (u.balanceMinor == null) {
-        addBlocker('balance_missing', (acct && acct.name) || u.accountId || ''); // 无明确余额：不参与合计，不按 0 处理
-        return;
-      }
-      if (ymOf(u.asOf) !== ymOf(now)) addBlocker('balance_stale', (acct && acct.name) || u.accountId || ''); // A-005
-      var value = convertFor(u.balanceMinor, u.currency);
-      if (value == null) return;
-      totalAssets += value;
-      if (pool) pools[pool] += value;
-      if (pool === 'investable') {
-        investableCash += value;
-        riskValue.cash += value;
-      }
+    // 资产项估值只走 valueAssetItems 这一遍（D-025）：总览与下钻因此不可能对不上。
+    var items = valueAssetItems(a, {
+      now: now,
+      addBlocker: addBlocker,
+      accountMap: accountMap,
+      instrumentMap: instrumentMap
     });
-
-    /* 持仓估值：数量口径只有一份（D-025/D-042）。
-     * 有证券事件时，估值数量来自 deriveHoldings 的推导结果（期初 + Σ买入 − Σ卖出）；
-     * 无事件时直接用期初快照，两者数值一致、零回归。 */
-    var holdingRows = a.holdings;
-    if (a.securityEvents && a.securityEvents.length > 0) {
-      holdingRows = deriveHoldings(a.holdings, a.securityEvents).holdings;
-    }
-    holdingRows.forEach(function (h) {
-      if (!h) return;
-      var ins = instrumentMap[h.instrumentId];
-      if (!ins) { addBlocker('instrument_missing', h.instrumentId || ''); return; }
-      var acct = accountMap[h.accountId];
-      var pool = acct && POOLS.indexOf(acct.pool) !== -1 ? acct.pool : null;
-      if (!pool) addBlocker('pool_missing', (acct && acct.name) || h.accountId || '');
-      var q = findQuote(a.quotes, h.instrumentId, now);
-      if (!q) { addBlocker('quote_missing', ins.symbol || h.instrumentId || ''); return; }
-      if (q.status === 'quote_stale') addBlocker('quote_stale', ins.symbol || '');
-      var minor = mulMinor(h.quantity, q.priceMinor);
-      if (minor == null) { addBlocker('holding_invalid', ins.symbol || ''); return; }
-      var value = convertFor(minor, q.currency);
-      if (value == null) return;
-      totalAssets += value;
-      if (pool) pools[pool] += value;
-      if (pool === 'investable') {
-        var cls = RISK_CLASSES.indexOf(ins.assetClass) !== -1 ? ins.assetClass : 'other';
-        if (cls === 'other' && ins.assetClass) addBlocker('asset_class_invalid', ins.symbol || '');
-        riskValue[cls] += value;
+    items.forEach(function (it) {
+      if (it.valueCnyMinor == null) return; // 未计入合计的项（缺汇率等）已在 items 中留痕
+      totalAssets += it.valueCnyMinor;
+      if (it.pool) pools[it.pool] += it.valueCnyMinor;
+      if (it.pool !== 'investable') return;
+      if (it.kind === 'unit') {
+        investableCash += it.valueCnyMinor;
+        riskValue.cash += it.valueCnyMinor;
+      } else {
+        riskValue[it.riskClass] += it.valueCnyMinor;
       }
-      if (ins.classificationStatus !== 'confirmed') addBlocker('classification_unconfirmed', ins.symbol || '');
     });
 
     /* 负债与近期应付款 */
@@ -704,10 +906,10 @@
       if (!l) return;
       if (l.balanceMinor == null) { addBlocker('liability_missing', l.name || ''); return; }
       if (ymOf(l.asOf) !== ymOf(now)) addBlocker('balance_stale', l.name || '');
-      var value = convertFor(l.balanceMinor, l.currency);
-      if (value == null) return;
-      totalLiabilities += value; // 负债单独累计，不冲减总资产
-      if (l.termType === 'current') duePayables += value;
+      var lconv = convertToCny(l.balanceMinor, l.currency, a.fxRates, now, addBlocker);
+      if (lconv == null || lconv.valueMinor == null) return;
+      totalLiabilities += lconv.valueMinor; // 负债单独累计，不冲减总资产
+      if (l.termType === 'current') duePayables += lconv.valueMinor;
     });
 
     /* 保障权益：只展示状态，不进入任何金额合计（D-011） */
@@ -733,7 +935,7 @@
     var isEmpty = ASSET_KEYS.every(function (k) { return a[k].length === 0; });
     var valuationStatus = isEmpty ? 'empty' : (blockers.length ? 'estimate' : 'formal');
 
-    return {
+    var out = {
       asOf: now,
       isEmpty: isEmpty,
       valuationStatus: valuationStatus,
@@ -768,6 +970,10 @@
       canAdvise: valuationStatus === 'formal',
       entitlements: entitlementView
     };
+    // 可选：把逐项估值明细一并返回（4E 估值下钻用）。默认不返回 —— 结账快照 payload 调用的是
+    // 不带 withItems 的版本，payload 形状与哈希口径因此完全不变（旧快照仍可读）。
+    if (opts.withItems === true) out.items = items;
+    return out;
   }
 
   /* ------------------------------ 月度结账（Phase 3） ------------------------------ */
@@ -841,6 +1047,12 @@
       var minor = q ? mulMinor(h.quantity, q.priceMinor) : null;
       var conv = minor == null ? { valueMinor: null, status: 'missing_quote' }
         : convertMinor(minor, q.currency, 'CNY', a.fxRates, now);
+      // Phase 4E：追加「折算实际用到的汇率事实」（纯追加字段）。让快照自身能回答
+      //「这次持仓估值用的是哪一天的汇率、来自哪个来源」，不必回头按今天的口径重推。
+      // 同币种折算记恒等汇率 '1'；没有报价就没有汇率可言，留 null。
+      var rate = !q ? null
+        : q.currency === 'CNY' ? { rateDecimal: '1', rateDate: null, provider: null }
+          : findFxRate(a.fxRates, q.currency, 'CNY', now);
       return {
         kind: 'holding',
         id: h.openingId != null ? h.openingId : (h.id || null),
@@ -853,6 +1065,9 @@
         priceCurrency: q ? q.currency : null,
         priceDate: q ? q.priceDate : null,
         priceStatus: q ? q.status : 'missing_quote',
+        fxRateDecimal: rate ? rate.rateDecimal : null,
+        fxRateDate: rate ? rate.rateDate : null,
+        fxProvider: rate ? rate.provider : null,
         asOf: h.openingAsOf != null ? h.openingAsOf : (h.asOf || null),
         valueMinor: minor,
         valueCnyMinor: conv.status === 'missing_fx' ? null : conv.valueMinor,
@@ -895,6 +1110,390 @@
     };
   }
 
+  /* --------------------- Phase 4E：估值下钻与收益归因（D-045） --------------------- */
+
+  // 敞口市场的「未分类」桶：市场维度需要一个"用户还没填"的位置。不能把未分类的持仓静默并进某个
+  // 真实市场（那会让"市场分布"看起来比事实更确定）。它只是分组桶，不是 EXPOSURE_MARKETS 词表值，
+  // 也不会写回任何事实。
+  var MARKET_UNSPECIFIED = 'unspecified';
+
+  // 把估值明细按某个键分组：每组带 CNY 合计、项数与**未计入合计的项数**。
+  // 未计入合计（valueCnyMinor == null）的项保留在组里并计入 unvaluedCount —— 否则
+  //「下钻合计 == 总览」会通过，而用户看不到被漏掉的那几条，这正是最危险的假绿。
+  function groupAssetItems(items, keyOf, labelOf) {
+    var map = {}, order = [];
+    items.forEach(function (it) {
+      var k = keyOf(it);
+      if (k == null) return;
+      var g = map[k];
+      if (!g) {
+        g = {
+          key: k,
+          label: labelOf ? labelOf(it) : k,
+          valueCnyMinor: 0,
+          itemCount: 0,
+          unvaluedCount: 0,
+          holdings: 0,
+          units: 0
+        };
+        map[k] = g;
+        order.push(k);
+      }
+      g.itemCount += 1;
+      if (it.kind === 'holding') g.holdings += 1; else g.units += 1;
+      if (typeof it.valueCnyMinor === 'number') g.valueCnyMinor += it.valueCnyMinor;
+      else g.unvaluedCount += 1;
+    });
+    // 金额降序、同额按键升序：相同输入必然得到相同顺序（可复算的前提）。
+    return order.map(function (k) { return map[k]; }).sort(function (x, y) {
+      if (x.valueCnyMinor !== y.valueCnyMinor) return y.valueCnyMinor - x.valueCnyMinor;
+      return x.key < y.key ? -1 : x.key > y.key ? 1 : 0;
+    });
+  }
+
+  function sumGroupValue(groups) {
+    return groups.reduce(function (acc, g) { return acc + g.valueCnyMinor; }, 0);
+  }
+
+  // computeAssetDrilldown(assets, { now, settings }) — 4E 估值下钻。
+  // 与 computeOverview 共用**同一遍**估值（valueAssetItems），因此「下钻合计 == 总览」是构造性成立的，
+  // 不是两套算法互相对账。四个维度的覆盖范围不同，各自用 scope 说明自己覆盖什么：
+  //   byAccount / byCurrency —— 全部资产项（余额单元 + 持仓），合计 = totalAssetsMinor；
+  //   byAssetClass           —— 只覆盖投资池（余额单元 + 持仓），合计 = pools.investableMinor，
+  //                             与 overview.riskClasses 完全同口径；现金记入 'cash' 类；
+  //   byMarket               —— 只覆盖投资池**持仓**（现金没有敞口市场），合计 = 投资池持仓合计；
+  //                             加上 totals.investableCashMinor 才等于 pools.investableMinor。
+  // 负债不进入资产项下钻（它是负项，混进来「合计 == 总资产」就没有意义了），单列在 totals 里。
+  function computeAssetDrilldown(assets, opts) {
+    if (!opts || !opts.now) throw new Error('computeAssetDrilldown 需要 now 参数（YYYY-MM-DD）');
+    var now = opts.now;
+    var a = normalizeAssets(assets);
+    var overview = computeOverview(a, { now: now, settings: opts.settings || {}, withItems: true });
+    var items = overview.items;
+
+    var byAccount = groupAssetItems(items, function (it) {
+      return it.accountId || MARKET_UNSPECIFIED;
+    }, function (it) {
+      return it.accountName || it.accountId || MARKET_UNSPECIFIED;
+    });
+    var byCurrency = groupAssetItems(items, function (it) {
+      return it.currency || MARKET_UNSPECIFIED;
+    });
+    var investable = items.filter(function (it) { return it.pool === 'investable'; });
+    var byAssetClass = groupAssetItems(investable, function (it) {
+      return it.kind === 'unit' ? 'cash' : it.riskClass;
+    });
+    var investableHoldings = investable.filter(function (it) { return it.kind === 'holding'; });
+    var byMarket = groupAssetItems(investableHoldings, function (it) {
+      return it.exposureMarket || MARKET_UNSPECIFIED;
+    });
+
+    var investableCashMinor = 0;
+    var investableHoldingsMinor = 0;
+    investable.forEach(function (it) {
+      if (typeof it.valueCnyMinor !== 'number') return;
+      if (it.kind === 'unit') investableCashMinor += it.valueCnyMinor;
+      else investableHoldingsMinor += it.valueCnyMinor;
+    });
+
+    // 逐持仓追溯：这一行就是「这条估值用的是哪天的价格、哪个来源、哪天的汇率」。
+    var positions = items.filter(function (it) { return it.kind === 'holding'; }).map(function (it) {
+      return {
+        instrumentId: it.instrumentId,
+        symbol: it.symbol,
+        accountId: it.accountId,
+        accountName: it.accountName,
+        pool: it.pool,
+        currency: it.currency,
+        assetClass: it.assetClass,
+        riskClass: it.riskClass,
+        exposureMarket: it.exposureMarket,
+        classificationStatus: it.classificationStatus,
+        quantity: it.quantity,
+        priceMinor: it.priceMinor,
+        priceDate: it.priceDate,
+        priceProvider: it.priceProvider,
+        priceStatus: it.priceStatus,
+        fxRateDecimal: it.fxRateDecimal,
+        fxRateDate: it.fxRateDate,
+        fxProvider: it.fxProvider,
+        fxStatus: it.fxStatus,
+        valueLocalMinor: it.valueLocalMinor,
+        valueCnyMinor: it.valueCnyMinor,
+        valueStatus: it.valueStatus,
+        skipped: it.skipped
+      };
+    });
+
+    var sumAccount = sumGroupValue(byAccount);
+    var sumCurrency = sumGroupValue(byCurrency);
+    var sumAssetClass = sumGroupValue(byAssetClass);
+    var sumMarket = sumGroupValue(byMarket);
+
+    return {
+      asOf: now,
+      valuationStatus: overview.valuationStatus,
+      canAdvise: overview.canAdvise,
+      totals: {
+        totalAssetsMinor: overview.totalAssetsMinor,
+        totalLiabilitiesMinor: overview.totalLiabilitiesMinor,
+        netWorthMinor: overview.netWorthMinor,
+        safetyMinor: overview.pools.safetyMinor,
+        investableMinor: overview.pools.investableMinor,
+        investableCashMinor: investableCashMinor,
+        investableHoldingsMinor: investableHoldingsMinor,
+        restrictedMinor: overview.pools.restrictedMinor
+      },
+      byAccount: byAccount,
+      byCurrency: byCurrency,
+      byAssetClass: byAssetClass,
+      byMarket: byMarket,
+      positions: positions,
+      // 「下钻合计 == 总览」由领域层自己给结论，各页面不必再各写一套容忍判断。
+      consistency: {
+        sumByAccountMinor: sumAccount,
+        sumByCurrencyMinor: sumCurrency,
+        sumByAssetClassMinor: sumAssetClass,
+        sumByMarketMinor: sumMarket,
+        byAccountMatches: sumAccount === overview.totalAssetsMinor,
+        byCurrencyMatches: sumCurrency === overview.totalAssetsMinor,
+        byAssetClassMatches: sumAssetClass === overview.pools.investableMinor,
+        byMarketMatches: sumMarket === investableHoldingsMinor
+      },
+      freshness: overview.freshness,
+      blockers: overview.blockers
+    };
+  }
+
+  // computeReturnAttribution(assets, { now, settings, baseline }) — 4E 收益归因。
+  // baseline 来自**已结账月快照**（D-034 ③ 的封存事实口径）：{ asOf, month, closeId, snapshotId, payloadHash }。
+  // 没有 baseline 就逐行标注 no_baseline —— 宁可说不出来，也不给一个按今天口径倒推的假基准。
+  //
+  // 分解口径（D-045）：把一条持仓的 CNY 估值写成 V = Q × P × R（Q 数量、P 价格、R 汇率→CNY），
+  //   价格影响 = (L1 − L0) × R0     其中 L = Q × P（本地币值）
+  //   汇率影响 = ΔV − 价格影响        ΔV = V1 − V0
+  // 汇率影响取**残差**，于是「价格影响 + 汇率影响 = 估值变化」逐行恒等，舍入缺口只落在汇率一侧，
+  // 不会留下"归因不出来的差额"。两侧都是整数最小货币单位，全程不经浮点。
+  //
+  // 期初数量 Q0 由 holdingsAsOf 在基准日重放事件求得（复用 deriveHoldings，不另写加减）；
+  // 期初价格与汇率走 as-of 查询（绝不返回基准日之后的行）。**绝不插值、绝不用 1:1 兜底。**
+  // 不能分解的情形逐条写进 row.boundaries 并计入 totals.unattributedChangeCnyMinor；
+  // 但只要能算出两端估值就照样给 ΔV ——「分解不了」与「算不出变化」是两件事。
+  function computeReturnAttribution(assets, opts) {
+    if (!opts || !opts.now) throw new Error('computeReturnAttribution 需要 now 参数（YYYY-MM-DD）');
+    var now = opts.now;
+    var a = normalizeAssets(assets);
+    var baseline = opts.baseline || null;
+    var baselineAsOf = baseline && baseline.asOf ? String(baseline.asOf) : null;
+    // 估值状态沿用既有 blocker（quote_stale / fx_stale / classification_unconfirmed...），
+    // 不新造第二套"能不能给正式建议"的判定（4E 的边界码只描述"能不能分解"）。
+    var overview = computeOverview(a, { now: now, settings: opts.settings || {} });
+
+    var accountMap = {}, instrumentMap = {};
+    a.assetAccounts.forEach(function (x) { if (x && x.id) accountMap[x.id] = x; });
+    a.instruments.forEach(function (x) { if (x && x.id) instrumentMap[x.id] = x; });
+
+    // 两端都按 as-of 截断，本期归因因此只依赖窗口内的事实：重算旧月份必然得到同一个结果，
+    // 也不会把结账之后才发生的行情或事件算进本期。
+    var endSide = holdingsAsOf(a.holdings, a.securityEvents, now).holdings;
+    var startSide = baselineAsOf ? holdingsAsOf(a.holdings, a.securityEvents, baselineAsOf).holdings : [];
+    var endByKey = {}, startByKey = {}, keys = [], keySeen = {};
+    function indexInto(map, list) {
+      list.forEach(function (h) {
+        if (!h || !h.accountId || !h.instrumentId) return;
+        var k = holdingKey(h.accountId, h.instrumentId);
+        map[k] = h;
+        if (!keySeen[k]) { keySeen[k] = true; keys.push(k); }
+      });
+    }
+    indexInto(endByKey, endSide);
+    indexInto(startByKey, startSide);
+
+    var ZERO_COUNTS = { buy: 0, sell: 0, dividend: 0, fee: 0 };
+
+    // 没有基准日就**整段不出归因**（rows 为空 + unavailable 说明），而不是把期初数量当成 0 ——
+    // "期初 0"会读成"你当时没有持仓"，那正是要避免的假基准。有基准日时，"期初查不到这一条"
+    // 才是真实推断（事实按基准日截断后确实还不存在），可以放心用 '0' + position_opened 表达。
+    var rows = baselineAsOf ? keys.map(function (key) {
+      var end = endByKey[key] || null;
+      var start = startByKey[key] || null;
+      var accountId = (end && end.accountId) || (start && start.accountId);
+      var instrumentId = (end && end.instrumentId) || (start && start.instrumentId);
+      var acct = accountMap[accountId];
+      var ins = instrumentMap[instrumentId];
+      var endQuantity = end ? end.quantity : '0';
+      var startQuantity = start ? start.quantity : '0';
+      var endCounts = (end && end.counts) || ZERO_COUNTS;
+      var startCounts = (start && start.counts) || ZERO_COUNTS;
+
+      // 期末腿也走 as-of（只认查询日当天及之前的事实），期初腿同理：两腿同一套查询语义，
+      // 差别只在日期。now = 今天且没有未来日期的事实行时，期末腿与决策台的当前估值逐分一致
+      //（自测里有专门断言）；结账快照用月末 asOf，于是"重算旧月份"得到的是历史结果而不是今天的结果。
+      var q1 = findQuoteAsOf(a.quotes, instrumentId, now);
+      var q0 = findQuoteAsOf(a.quotes, instrumentId, baselineAsOf);
+      var endCur = q1 && q1.currency != null ? q1.currency : null;
+      var startCur = q0 && q0.currency != null ? q0.currency : null;
+      var endFx = null;
+      if (endCur) {
+        var endRaw = endCur === 'CNY'
+          ? { rateDecimal: '1', rateDate: null, provider: null }
+          : findFxRateAsOf(a.fxRates, endCur, 'CNY', now);
+        if (endRaw) {
+          endFx = {
+            rateDecimal: endRaw.rateDecimal,
+            rateDate: endRaw.rateDate,
+            provider: endRaw.provider,
+            status: fxStatusOf(endRaw.rateDate, now)
+          };
+        }
+      }
+      var startFx = null;
+      if (startCur) {
+        startFx = startCur === 'CNY'
+          ? { rateDecimal: '1', rateDate: null, provider: null }
+          : findFxRateAsOf(a.fxRates, startCur, 'CNY', baselineAsOf);
+      }
+
+      var row = {
+        accountId: accountId || null,
+        accountName: (acct && acct.name) || null,
+        instrumentId: instrumentId || null,
+        symbol: ins ? (ins.symbol || null) : null,
+        currency: (ins && ins.currency) || endCur || startCur || null,
+        assetClass: ins && ins.assetClass != null ? ins.assetClass : null,
+        exposureMarket: ins && isExposureMarket(ins.exposureMarket) ? ins.exposureMarket : null,
+        startQuantity: startQuantity,
+        endQuantity: endQuantity,
+        startPriceMinor: q0 ? q0.priceMinor : null,
+        startPriceDate: q0 ? q0.priceDate : null,
+        startPriceProvider: q0 ? q0.provider : null,
+        endPriceMinor: q1 ? q1.priceMinor : null,
+        endPriceDate: q1 ? q1.priceDate : null,
+        endPriceProvider: q1 ? q1.provider : null,
+        startRateDecimal: startFx ? startFx.rateDecimal : null,
+        startRateDate: startFx ? startFx.rateDate : null,
+        startRateProvider: startFx ? startFx.provider : null,
+        endRateDecimal: endFx ? endFx.rateDecimal : null,
+        endRateDate: endFx ? endFx.rateDate : null,
+        endRateProvider: endFx ? endFx.provider : null,
+        startValueLocalMinor: null,
+        endValueLocalMinor: null,
+        startValueCnyMinor: null,
+        endValueCnyMinor: null,
+        valueChangeCnyMinor: null,
+        priceEffectCnyMinor: null,
+        fxEffectCnyMinor: null,
+        attributable: false,
+        boundaries: [],
+        notes: [],
+        periodEventCounts: {
+          buy: endCounts.buy - startCounts.buy,
+          sell: endCounts.sell - startCounts.sell,
+          dividend: endCounts.dividend - startCounts.dividend,
+          fee: endCounts.fee - startCounts.fee
+        }
+      };
+
+      if (!ins) row.boundaries.push('instrument_missing');
+      if (baselineAsOf && !q0) row.boundaries.push('missing_start_quote');
+      if (!q1) row.boundaries.push('missing_end_quote');
+      if (startCur && !startFx) row.boundaries.push('missing_start_fx');
+      if (endCur && !endFx) row.boundaries.push('missing_end_fx');
+      if (startCur && endCur && startCur !== endCur) row.boundaries.push('currency_changed');
+      if (endQuantity === '0') row.boundaries.push('position_closed');
+      else if (startQuantity === '0') row.boundaries.push('position_opened');
+      else if (compareDecimals(startQuantity, endQuantity) !== 0) row.boundaries.push('quantity_changed');
+      // 期间重录期初（期初快照的 asOf 落在基准日与今天之间）：数量会凭空跳一档，那不是交易造成的，
+      // 既不能归因也不能当成收益。用**事实表**判断，不看推导出来的数量差值。
+      var rebased = a.holdings.some(function (o) {
+        return o && o.accountId === accountId && o.instrumentId === instrumentId &&
+          o.asOf && baselineAsOf && String(o.asOf) > baselineAsOf && String(o.asOf) <= String(now);
+      });
+      if (rebased) row.boundaries.push('opening_rebased');
+      if (q1 && quoteStatusOf(q1.priceDate, now) === 'quote_stale') row.notes.push('end_quote_stale');
+      if (endFx && endFx.status === 'fx_stale') row.notes.push('end_fx_stale');
+      if (ins && ins.classificationStatus !== 'confirmed') row.notes.push('classification_unconfirmed');
+
+      // 两端都能定价时才给 ΔV：「分解不了」与「算不出变化」是两件事。
+      var l0 = null, l1 = null, v0 = null, v1 = null;
+      if (q0 && startFx) {
+        l0 = mulMinor(startQuantity, q0.priceMinor);
+        if (l0 != null) v0 = mulByRate(l0, startFx.rateDecimal);
+      }
+      if (q1 && endFx) {
+        l1 = mulMinor(endQuantity, q1.priceMinor);
+        if (l1 != null) v1 = mulByRate(l1, endFx.rateDecimal);
+      }
+      if (l0 == null || l1 == null || v0 == null || v1 == null) {
+        if (row.boundaries.indexOf('missing_start_quote') < 0 &&
+          row.boundaries.indexOf('missing_end_quote') < 0 &&
+          row.boundaries.indexOf('holding_invalid') < 0) {
+          row.boundaries.push('holding_invalid');
+        }
+        return row;
+      }
+      row.startValueLocalMinor = l0;
+      row.endValueLocalMinor = l1;
+      row.startValueCnyMinor = v0;
+      row.endValueCnyMinor = v1;
+      row.valueChangeCnyMinor = v1 - v0;
+      if (row.boundaries.length > 0) return row; // 有过不去的边界：给出变化额，但不做分解
+      var priceEffect = mulByRate(l1 - l0, startFx.rateDecimal);
+      if (priceEffect == null) { row.boundaries.push('holding_invalid'); return row; }
+      row.priceEffectCnyMinor = priceEffect;
+      row.fxEffectCnyMinor = row.valueChangeCnyMinor - priceEffect; // 残差：保证两侧相加恒等于 ΔV
+      row.attributable = true;
+      return row;
+    }) : [];
+
+    var totals = {
+      rowCount: rows.length,
+      attributableCount: 0,
+      boundaryCount: 0,
+      startValueCnyMinor: 0,
+      endValueCnyMinor: 0,
+      valueChangeCnyMinor: 0,
+      priceEffectCnyMinor: 0,
+      fxEffectCnyMinor: 0,
+      unattributedChangeCnyMinor: 0
+    };
+    rows.forEach(function (r) {
+      if (typeof r.startValueCnyMinor === 'number') totals.startValueCnyMinor += r.startValueCnyMinor;
+      if (typeof r.endValueCnyMinor === 'number') totals.endValueCnyMinor += r.endValueCnyMinor;
+      if (typeof r.valueChangeCnyMinor === 'number') totals.valueChangeCnyMinor += r.valueChangeCnyMinor;
+      if (r.attributable) {
+        totals.attributableCount += 1;
+        totals.priceEffectCnyMinor += r.priceEffectCnyMinor;
+        totals.fxEffectCnyMinor += r.fxEffectCnyMinor;
+      } else {
+        totals.boundaryCount += 1;
+        if (typeof r.valueChangeCnyMinor === 'number') totals.unattributedChangeCnyMinor += r.valueChangeCnyMinor;
+      }
+    });
+
+    return {
+      asOf: now,
+      baseline: baseline ? {
+        asOf: baseline.asOf || null,
+        month: baseline.month || null,
+        closeId: baseline.closeId || null,
+        snapshotId: baseline.snapshotId || null,
+        payloadHash: baseline.payloadHash || null,
+        status: baseline.status || null
+      } : null,
+      rows: rows,
+      // 整段不可用的原因（目前只有一种）：界面据此说"还没有可比的已结账月"，不给任何数字。
+      unavailable: baselineAsOf ? null : 'no_baseline',
+      totals: totals,
+      valuation: {
+        valuationStatus: overview.valuationStatus,
+        canAdvise: overview.canAdvise,
+        freshness: overview.freshness
+      },
+      blockers: overview.blockers
+    };
+  }
+
   // emergencyCoverageMonths(safetyMinor, avgNecessaryMinor) → 应急金覆盖月数。
   //   安全储备 ÷ 月均必要支出，保留 1 位小数；无法估算（必要支出为 0/非法或储备未知）→ null。
   function emergencyCoverageMonths(safetyMinor, avgNecessaryMinor) {
@@ -931,6 +1530,14 @@
     sumQuantities: sumQuantities,
     subtractQuantities: subtractQuantities,
     deriveHoldings: deriveHoldings,
+    holdingKey: holdingKey,
+    holdingsAsOf: holdingsAsOf,
+    findQuoteAsOf: findQuoteAsOf,
+    findFxRateAsOf: findFxRateAsOf,
+    convertToCny: convertToCny,
+    MARKET_UNSPECIFIED: MARKET_UNSPECIFIED,
+    computeAssetDrilldown: computeAssetDrilldown,
+    computeReturnAttribution: computeReturnAttribution,
     daysBetween: daysBetween,
     isStaleDays: isStaleDays,
     ymOf: ymOf,
