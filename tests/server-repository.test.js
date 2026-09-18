@@ -59,6 +59,58 @@ test('重复写入同一状态结果一致（幂等，无重复行）', () => {
   }
 });
 
+test('旧备份缺少新增资产集合键时仍按空数组兼容', () => {
+  const ctx = setup('ledger-repo-legacy-assets-');
+  try {
+    const state = loadFixtureState();
+    delete state.assets.holdings;
+    delete state.assets.quotes;
+    delete state.assets.fxRates;
+    delete state.assets.securityEvents;
+    assert.doesNotThrow(() => R.writeState(ctx.db, state));
+    const out = R.readState(ctx.db);
+    assert.deepStrictEqual(out.assets.holdings, []);
+    assert.deepStrictEqual(out.assets.quotes, []);
+    assert.deepStrictEqual(out.assets.fxRates, []);
+    assert.deepStrictEqual(out.assets.securityEvents, []);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('根状态与显式 assets 形状在清库前拒绝；完全缺失 assets 仍兼容旧备份', () => {
+  const ctx = setup('ledger-repo-root-shape-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const baseline = R.readState(ctx.db);
+
+    assert.throws(
+      () => R.writeState(ctx.db, []),
+      (err) => err && err.code === 'invalid_state'
+    );
+    for (const badAssets of [null, [], 'bad-assets', {}]) {
+      const bad = loadFixtureState();
+      bad.assets = badAssets;
+      assert.throws(
+        () => R.writeState(ctx.db, bad),
+        (err) => err && err.code === 'invalid_assets'
+      );
+      assert.deepStrictEqual(R.readState(ctx.db), baseline, '错误形状不得改变既有事实');
+    }
+
+    const legacy = loadFixtureState();
+    delete legacy.assets;
+    assert.doesNotThrow(() => R.writeState(ctx.db, legacy));
+    const restored = R.readState(ctx.db);
+    assert.deepStrictEqual(restored.accounts, legacy.accounts);
+    Object.keys(restored.assets).filter((key) => key !== 'schemaVersion').forEach((key) => {
+      assert.deepStrictEqual(restored.assets[key], [], '缺失 assets 时 ' + key + ' 应兼容为空数组');
+    });
+  } finally {
+    ctx.close();
+  }
+});
+
 test('总览口径与 ACCEPTANCE §2 精确一致（复用同一份 domain.js）', () => {
   const ctx = setup('ledger-repo-');
   try {

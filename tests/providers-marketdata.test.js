@@ -38,6 +38,18 @@ function addInstrument(db, id, symbol, exchange, currency) {
   return id;
 }
 
+function assertScopeAccounting(scope) {
+  assert.strictEqual(
+    scope.requested,
+    scope.updated + scope.skipped.length + scope.errors.length,
+    '每个请求目标必须恰好结算为 updated / skipped / error 之一'
+  );
+}
+
+function scopeOf(summary, name) {
+  return summary.scopes.filter((scope) => scope.scope === name)[0];
+}
+
 // 断网模拟：provider 直接抛错（DNS/连接失败），而不是返回结果
 function offlineProvider() {
   return () => Promise.reject(new Error('getaddrinfo ENOTFOUND api.example.invalid'));
@@ -113,6 +125,8 @@ test('S4D.2 自动行情抓取默认关闭：D-038 门禁未通过时不发起�
       db: db,
       now: NOW,
       asOf: '2026-09-17',
+      scopes: ['quotes'],
+      quoteTargets: [{ instrumentId: 'inst-voo', symbol: 'VOO', providerSymbol: 'VOO' }],
       quotesFetch: spy
       // autoQuotesEnabled 缺省 → false
     });
@@ -123,6 +137,8 @@ test('S4D.2 自动行情抓取默认关闭：D-038 门禁未通过时不发起�
     assert.strictEqual(called, 0, '门禁未通过时不得调用 provider');
     assert.strictEqual(R.readQuotes(db).length, 0);
     assert.strictEqual(summary.ok, true, '被门禁拦住不算失败');
+    assertScopeAccounting(q);
+    assert.strictEqual(q.skipped.length, 1, '被门禁拦住的目标也必须逐项记为 skipped');
   } finally {
     dbm.closeQuietly(db);
   }
@@ -345,6 +361,7 @@ test('S4D.2 手动值不被自动值覆盖（D-044 ②）：同一天或更早�
     assert.strictEqual(q.updated, 0);
     assert.strictEqual(q.skipped.length, 1);
     assert.strictEqual(q.skipped[0].reason, 'manual_locked');
+    assert.strictEqual(q.reason, 'manual_locked');
     const rows = R.readQuotes(db);
     assert.strictEqual(rows.length, 1);
     assert.strictEqual(rows[0].priceMinor, 9999, '手动确认过的价格不被自动值覆盖');
@@ -377,6 +394,7 @@ test('S4D.2 报价的手动锁覆盖「更早」的自动观测（D-044 ②）',
     assert.strictEqual(q.updated, 0);
     assert.strictEqual(q.skipped.length, 1);
     assert.strictEqual(q.skipped[0].reason, 'manual_locked');
+    assert.strictEqual(q.reason, 'manual_locked');
     const rows = R.readQuotes(db);
     assert.strictEqual(rows.length, 1, '更早的自动观测不得写入');
     assert.strictEqual(rows[0].priceDate, '2026-09-14');
@@ -405,6 +423,7 @@ test('S4D.2 汇率的手动锁同样覆盖「更早」的自动观测（与报�
     const fx = summary.scopes.filter((s) => s.scope === 'fx')[0];
     assert.strictEqual(fx.updated, 0);
     assert.strictEqual(fx.skipped[0].reason, 'manual_locked');
+    assert.strictEqual(fx.reason, 'manual_locked');
     const rows = R.readFxRates(db);
     assert.strictEqual(rows.length, 1, '更早的自动观测不得写入');
     assert.strictEqual(rows[0].rateDate, '2026-09-14');
@@ -585,6 +604,7 @@ test('无目标时不发请求（no_targets），也不会被当成失败', asyn
     summary.scopes.forEach((s) => {
       assert.strictEqual(s.status, 'skipped');
       assert.ok(['no_targets', 'auto_fetch_disabled'].indexOf(s.reason) !== -1);
+      if (s.reason === 'no_targets') assert.strictEqual(s.requested, 0, 'no_targets 只允许用于 requested=0');
     });
   } finally {
     dbm.closeQuietly(db);
@@ -646,6 +666,158 @@ test('provider 返回未请求的标的时显式拒绝写入（不得张冠李�
     assert.strictEqual(q.updated, 0);
     assert.strictEqual(q.errors[0].code, Contract.ERRORS.INVALID_PAYLOAD);
     assert.strictEqual(R.readQuotes(db).length, 0);
+  } finally {
+    dbm.closeQuietly(db);
+  }
+});
+
+test('4D 反例：汇率 provider 返回未请求币对时整批拒绝，不得把 HKD/CNY 写成 USD/CNY 的结果', async () => {
+  const db = freshDb();
+  try {
+    const summary = await MD.refreshMarketData({
+      db: db,
+      now: NOW,
+      asOf: '2026-09-18',
+      scopes: ['fx'],
+      pairs: [{ base: 'USD', quote: 'CNY' }],
+      fxFetch: () => Promise.resolve([Contract.fxResult({
+        base: 'HKD', quote: 'CNY', rateDecimal: '0.9200', rateDate: '2026-09-18',
+        fetchedAt: NOW, provider: 'bad-fixture'
+      })])
+    });
+    const fx = scopeOf(summary, 'fx');
+    assert.strictEqual(fx.status, 'failed');
+    assert.strictEqual(fx.updated, 0);
+    assert.strictEqual(fx.errors.length, 1);
+    assert.strictEqual(fx.errors[0].subject, 'USD/CNY');
+    assert.strictEqual(fx.errors[0].code, 'invalid_payload');
+    assert.strictEqual(R.readFxRates(db).length, 0);
+    assertScopeAccounting(fx);
+  } finally {
+    dbm.closeQuietly(db);
+  }
+});
+
+test('4D 反例：provider 漏返回目标时生成明确错误，部分成功也不能伪装成整批成功', async () => {
+  const db = freshDb();
+  try {
+    const summary = await MD.refreshMarketData({
+      db: db,
+      now: NOW,
+      asOf: '2026-09-18',
+      scopes: ['fx'],
+      pairs: [{ base: 'USD', quote: 'CNY' }, { base: 'HKD', quote: 'CNY' }],
+      fxFetch: () => Promise.resolve([Contract.fxResult({
+        base: 'USD', quote: 'CNY', rateDecimal: '7.1900', rateDate: '2026-09-18',
+        fetchedAt: NOW, provider: 'partial-fixture'
+      })])
+    });
+    const fx = scopeOf(summary, 'fx');
+    assert.strictEqual(fx.status, 'partial');
+    assert.strictEqual(fx.requested, 2);
+    assert.strictEqual(fx.updated, 1);
+    assert.strictEqual(fx.errors.length, 1);
+    assert.strictEqual(fx.errors[0].subject, 'HKD/CNY');
+    assert.match(fx.errors[0].detail, /未返回/);
+    assert.strictEqual(R.readFxRates(db).length, 1);
+    assertScopeAccounting(fx);
+  } finally {
+    dbm.closeQuietly(db);
+  }
+});
+
+test('4D 反例：报价 provider 返回空数组时是 missing error，不是 skipped(no_targets)', async () => {
+  const db = freshDb();
+  try {
+    addInstrument(db, 'inst-voo', 'VOO', 'NYSE', 'USD');
+    const summary = await MD.refreshMarketData({
+      db: db,
+      now: NOW,
+      asOf: '2026-09-18',
+      scopes: ['quotes'],
+      autoQuotesEnabled: true,
+      quoteTargets: [{ instrumentId: 'inst-voo', symbol: 'VOO', providerSymbol: 'VOO' }],
+      quotesFetch: () => Promise.resolve([])
+    });
+    const q = scopeOf(summary, 'quotes');
+    assert.strictEqual(q.status, 'failed');
+    assert.strictEqual(q.reason, null);
+    assert.strictEqual(q.errors.length, 1);
+    assert.strictEqual(q.errors[0].subject, 'VOO');
+    assert.match(q.errors[0].detail, /未返回/);
+    assert.strictEqual(R.readQuotes(db).length, 0);
+    assertScopeAccounting(q);
+  } finally {
+    dbm.closeQuietly(db);
+  }
+});
+
+test('4D 反例：同一请求键的重复结果被拒绝，不能重复写入或把 updated 计成 2', async () => {
+  const db = freshDb();
+  try {
+    addInstrument(db, 'inst-voo', 'VOO', 'NYSE', 'USD');
+    const row = Contract.quoteResult({
+      symbol: 'VOO', priceMinor: 5000, currency: 'USD', priceDate: '2026-09-18',
+      fetchedAt: NOW, provider: 'duplicate-fixture'
+    });
+    const summary = await MD.refreshMarketData({
+      db: db,
+      now: NOW,
+      asOf: '2026-09-18',
+      scopes: ['quotes'],
+      autoQuotesEnabled: true,
+      quoteTargets: [{ instrumentId: 'inst-voo', symbol: 'VOO', providerSymbol: 'VOO' }],
+      quotesFetch: () => Promise.resolve([row, Object.assign({}, row)])
+    });
+    const q = scopeOf(summary, 'quotes');
+    assert.strictEqual(q.status, 'failed');
+    assert.strictEqual(q.updated, 0);
+    assert.match(q.errors[0].detail, /重复结果/);
+    assert.strictEqual(R.readQuotes(db).length, 0);
+    assertScopeAccounting(q);
+  } finally {
+    dbm.closeQuietly(db);
+  }
+});
+
+test('4D 反例：报价与汇率数据日晚于 asOf 时均拒绝入库', async () => {
+  const db = freshDb();
+  try {
+    addInstrument(db, 'inst-voo', 'VOO', 'NYSE', 'USD');
+    const quotes = await MD.refreshMarketData({
+      db: db,
+      now: NOW,
+      asOf: '2026-09-18',
+      scopes: ['quotes'],
+      autoQuotesEnabled: true,
+      quoteTargets: [{ instrumentId: 'inst-voo', symbol: 'VOO', providerSymbol: 'VOO' }],
+      quotesFetch: () => Promise.resolve([Contract.quoteResult({
+        symbol: 'VOO', priceMinor: 5000, currency: 'USD', priceDate: '2026-09-19',
+        fetchedAt: NOW, provider: 'future-fixture'
+      })])
+    });
+    const q = scopeOf(quotes, 'quotes');
+    assert.strictEqual(q.status, 'failed');
+    assert.match(q.errors[0].detail, /晚于 asOf/);
+    assert.strictEqual(R.readQuotes(db).length, 0);
+    assertScopeAccounting(q);
+
+    const rates = await MD.refreshMarketData({
+      db: db,
+      now: NOW,
+      asOf: '2026-09-18',
+      scopes: ['fx'],
+      pairs: [{ base: 'USD', quote: 'CNY' }],
+      fxFetch: () => Promise.resolve([Contract.fxResult({
+        base: 'USD', quote: 'CNY', rateDecimal: '7.1900', rateDate: '2026-09-19',
+        fetchedAt: NOW, provider: 'future-fixture'
+      })])
+    });
+    const fx = scopeOf(rates, 'fx');
+    assert.strictEqual(fx.status, 'failed');
+    assert.match(fx.errors[0].detail, /晚于 asOf/);
+    assert.strictEqual(R.readFxRates(db).length, 0);
+    assertScopeAccounting(fx);
   } finally {
     dbm.closeQuietly(db);
   }

@@ -443,6 +443,38 @@ test('P1-D 活库丢失去重索引时拒绝产出"看似合格"的备份，且�
   }
 });
 
+test('4C 反例：v6 同名 UNIQUE(id) 不能冒充期初 (account_id, instrument_id) 唯一索引', async () => {
+  const ctx = setup('ledger-bak-opening-idx-columns-');
+  try {
+    R.writeState(ctx.db, loadFixtureState());
+    const result = await B.createBackup(ctx.db, ctx.paths, { reason: 'manual' });
+    const swapped = path.join(ctx.paths.backupDir, 'ledger-20260901-153000-opening-wrong-cols.db');
+    fs.copyFileSync(result.file, swapped);
+
+    const raw = new DatabaseSync(swapped);
+    const opening = raw.prepare(
+      'SELECT account_id, instrument_id FROM portfolio_openings LIMIT 1'
+    ).get();
+    assert.ok(opening, '前提：fixture 含一条期初持仓');
+    raw.exec('DROP INDEX uq_portfolio_openings_dedupe');
+    raw.exec('CREATE UNIQUE INDEX uq_portfolio_openings_dedupe ON portfolio_openings(id)');
+    raw.prepare(
+      'INSERT INTO portfolio_openings (id, account_id, instrument_id, quantity) VALUES (?, ?, ?, ?)'
+    ).run('opening-counterfeit-idx', opening.account_id, opening.instrument_id, '1');
+    const info = dbm.indexInfo(raw, 'portfolio_openings', 'uq_portfolio_openings_dedupe');
+    assert.strictEqual(info.unique, true, '前提：伪索引仍带 UNIQUE 属性');
+    assert.deepStrictEqual(info.columns, ['id'], '前提：伪索引实际只覆盖 id');
+    raw.close();
+
+    const check = B.validateBackupFile(swapped);
+    assert.strictEqual(check.ok, false, '同名且唯一但列错误的索引不得通过校验');
+    assert.ok(String(check.reason).indexOf('索引列不匹配') >= 0, check.reason);
+    assert.ok(String(check.reason).indexOf('account_id, instrument_id') >= 0, check.reason);
+  } finally {
+    ctx.close();
+  }
+});
+
 /* ---------- 第 1 轮复核反例（G4C-6）：必需列也属于结构校验 ---------- */
 
 test('G4C-6 v5 库缺 security_events.amount_minor 列时校验必须拒绝', async () => {

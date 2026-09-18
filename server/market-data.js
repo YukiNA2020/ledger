@@ -74,6 +74,117 @@ async function fetchWithRetry(fetchFn, items, ctx, maxAttempts) {
   return { results: results, attempts: attempts };
 }
 
+function fxKey(value) {
+  if (!value || !value.base || !value.quote) return null;
+  return String(value.base) + '/' + String(value.quote);
+}
+
+function quoteKey(value) {
+  if (!value) return null;
+  if (value.kind === 'quote') return value.symbol || null;
+  if (value.kind === 'error') return value.subject || null;
+  return value.providerSymbol || null;
+}
+
+function resultKey(result, kind) {
+  if (!result || typeof result !== 'object') return null;
+  if (result.kind === 'error') return result.subject || null;
+  return kind === 'fx' ? fxKey(result) : quoteKey(result);
+}
+
+function requestSubject(item, kind) {
+  return kind === 'fx' ? fxKey(item) : quoteKey(item);
+}
+
+function uniqueRequests(items, kind) {
+  const out = [];
+  const seen = new Set();
+  (items || []).forEach((item) => {
+    const key = requestSubject(item, kind);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(item);
+  });
+  return out;
+}
+
+function requestError(subject, detail, code) {
+  return Contract.errorResult({
+    subject: subject,
+    code: code || Contract.ERRORS.INVALID_PAYLOAD,
+    detail: detail
+  });
+}
+
+// 把 provider 的批量返回严格对齐到请求键：每个请求目标最终恰好得到一个成功、跳过或错误。
+// 这样既不会把未请求结果写进库，也不会把漏返回伪装成成功；调用方还能稳定满足
+// requested = updated + skipped + errors（4D 独立复核）。
+function reconcileResults(requests, results, options) {
+  const opts = options || {};
+  const kind = opts.kind;
+  const asOf = opts.asOf;
+  const wanted = uniqueRequests(requests, kind);
+  const wantedKeys = new Set(wanted.map((item) => requestSubject(item, kind)));
+  const failAll = (detail, code) => wanted.map((item) =>
+    requestError(requestSubject(item, kind), detail, code)
+  );
+
+  const valid = [];
+  for (const result of results || []) {
+    try {
+      Contract.assertValidResult(result);
+      valid.push(result);
+    } catch (_) {
+      return failAll('provider 返回了不满足契约的结果，整批已拒绝写入');
+    }
+  }
+
+  // subject 为空表示整批级错误（如传输失败）。为每个请求目标复制一份错误，避免
+  // requested=2、errors=1 这种“少结算一个目标”的假成功报告。
+  const globalError = valid.find((result) => result.kind === 'error' && !result.subject);
+  if (globalError) {
+    return wanted.map((item) => requestError(
+      requestSubject(item, kind),
+      globalError.detail,
+      globalError.code
+    ));
+  }
+
+  const groups = new Map();
+  let hasUnexpected = false;
+  valid.forEach((result) => {
+    const key = resultKey(result, kind);
+    if (!key || !wantedKeys.has(key)) {
+      hasUnexpected = true;
+      return;
+    }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(result);
+  });
+  if (hasUnexpected) {
+    return failAll('provider 返回了未请求或无法绑定的结果，整批已拒绝写入');
+  }
+
+  return wanted.map((item) => {
+    const subject = requestSubject(item, kind);
+    const matches = groups.get(subject) || [];
+    if (matches.length === 0) {
+      return requestError(subject, 'provider 未返回该请求目标');
+    }
+    if (matches.length > 1) {
+      return requestError(subject, 'provider 对同一请求目标返回了重复结果');
+    }
+    const result = matches[0];
+    if (result.kind === kind) {
+      const dataDate = kind === 'fx' ? result.rateDate : result.priceDate;
+      if (dataDate > asOf) {
+        return requestError(subject, 'provider 数据日晚于 asOf，已拒绝写入');
+      }
+    }
+    return result;
+  });
+}
+
 // 逐条结果的处理：先过契约校验（不合格一律拒绝写入），再交给 apply 落库。
 function applyResults(results, apply) {
   const errors = [];
@@ -133,6 +244,14 @@ function scopeStatus(requested, updated, skippedCount, errorCount) {
 
 function scopeSummary(spec, requested, applied, attempts, skippedReason) {
   const status = scopeStatus(requested, applied.items.length, applied.skipped.length, applied.errors.length);
+  const skipReasons = Array.from(new Set(applied.skipped.map((row) => row.reason).filter(Boolean)));
+  let reason = null;
+  if (status === 'skipped') {
+    if (skippedReason) reason = skippedReason;
+    else if (requested === 0) reason = 'no_targets';
+    else if (skipReasons.length === 1) reason = skipReasons[0];
+    else reason = 'skipped';
+  }
   // provider/endpoint 以**实际写入的行**为准（注入离线 provider 时不能冒充 Frankfurter）；
   // 没有写入行时回退到这一轮声明的 provider。
   const itemProvider = applied.items.length ? applied.items[0].provider : null;
@@ -147,21 +266,22 @@ function scopeSummary(spec, requested, applied, attempts, skippedReason) {
     skipped: applied.skipped,
     errors: applied.errors,
     attempts: attempts,
-    reason: status === 'skipped' ? skippedReason || 'no_targets' : null,
+    reason: reason,
     items: applied.items
   };
 }
 
-function emptyScope(spec, requested, reason) {
+function emptyScope(spec, subjects, reason) {
+  const list = Array.isArray(subjects) ? subjects : [];
   return {
     scope: spec.scope,
     status: 'skipped',
     provider: spec.provider || null,
     endpoint: spec.endpoint || null,
     asOf: spec.asOf,
-    requested: requested,
+    requested: list.length,
     updated: 0,
-    skipped: [],
+    skipped: list.map((subject) => ({ subject: subject, reason: reason })),
     errors: [],
     attempts: 0,
     reason: reason,
@@ -180,15 +300,17 @@ async function refreshFxScope(db, options) {
     endpoint: opts.endpoint || null,
     asOf: opts.asOf
   };
-  const pairs = Array.isArray(opts.pairs) ? opts.pairs : [];
-  if (!pairs.length) return emptyScope(spec, 0, 'no_targets');
+  const pairs = uniqueRequests(Array.isArray(opts.pairs) ? opts.pairs : [], 'fx');
+  const subjects = pairs.map((pair) => fxKey(pair));
+  if (!pairs.length) return emptyScope(spec, [], 'no_targets');
   if (typeof opts.fetchFn !== 'function') {
     // 没有可用的 provider（例如用户关掉了自动更新，或该作用域尚未配置 provider）。
-    return emptyScope(spec, pairs.length, opts.disabledReason || 'provider_not_configured');
+    return emptyScope(spec, subjects, opts.disabledReason || 'provider_not_configured');
   }
 
   const fetched = await fetchWithRetry(opts.fetchFn, pairs, { now: opts.now, asOf: opts.asOf }, MAX_ATTEMPTS);
-  const applied = applyResults(fetched.results, (r) =>
+  const reconciled = reconcileResults(pairs, fetched.results, { kind: 'fx', asOf: opts.asOf });
+  const applied = applyResults(reconciled, (r) =>
     R.upsertProviderFxRate(
       db,
       {
@@ -218,10 +340,11 @@ async function refreshQuotesScope(db, options) {
     endpoint: opts.endpoint || null,
     asOf: opts.asOf
   };
-  const targets = Array.isArray(opts.targets) ? opts.targets : [];
-  if (!opts.autoEnabled) return emptyScope(spec, targets.length, 'auto_fetch_disabled');
-  if (!targets.length) return emptyScope(spec, 0, 'no_targets');
-  if (typeof opts.fetchFn !== 'function') return emptyScope(spec, targets.length, 'provider_not_configured');
+  const targets = uniqueRequests(Array.isArray(opts.targets) ? opts.targets : [], 'quotes');
+  const subjects = targets.map((target) => target.providerSymbol);
+  if (!opts.autoEnabled) return emptyScope(spec, subjects, 'auto_fetch_disabled');
+  if (!targets.length) return emptyScope(spec, [], 'no_targets');
+  if (typeof opts.fetchFn !== 'function') return emptyScope(spec, subjects, 'provider_not_configured');
 
   const symbols = targets.map((t) => t.providerSymbol);
   const byProviderSymbol = {};
@@ -230,7 +353,8 @@ async function refreshQuotesScope(db, options) {
   });
 
   const fetched = await fetchWithRetry(opts.fetchFn, symbols, { now: opts.now, asOf: opts.asOf }, MAX_ATTEMPTS);
-  const applied = applyResults(fetched.results, (r) => {
+  const reconciled = reconcileResults(targets, fetched.results, { kind: 'quote', asOf: opts.asOf });
+  const applied = applyResults(reconciled, (r) => {
     const target = byProviderSymbol[r.symbol];
     if (!target) {
       throw Object.assign(new Error('provider 返回了未请求的标的，已拒绝写入'), {
@@ -371,6 +495,7 @@ module.exports = {
   normalizeScopes: normalizeScopes,
   marketDataTargets: marketDataTargets,
   symbolForProvider: symbolForProvider,
+  reconcileResults: reconcileResults,
   refreshMarketData: refreshMarketData,
   // 供测试单独驱动某一路径
   refreshFxScope: refreshFxScope,

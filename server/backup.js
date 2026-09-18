@@ -58,7 +58,13 @@ const REQUIRED_TABLES_BY_VERSION = {
 // （第二轮复核 G4B-6：DROP INDEX 后校验仍返回 ok）。
 const REQUIRED_INDEXES_BY_VERSION = {
   4: [{ table: 'instruments', name: 'uq_instruments_dedupe', unique: true }],
-  6: [{ table: 'portfolio_openings', name: 'uq_portfolio_openings_dedupe', unique: true }]
+  6: [{
+    table: 'portfolio_openings',
+    name: 'uq_portfolio_openings_dedupe',
+    unique: true,
+    columns: ['account_id', 'instrument_id'],
+    partial: false
+  }]
 };
 
 // 必需**列**随 schema 版本增长（复核 G4C-6）：有些事实承载在列上，光看表齐不齐看不出来。
@@ -205,6 +211,20 @@ function validateBackupFile(file) {
       }
       if (spec.unique && !info.unique) {
         return { ok: false, reason: '必需索引不是唯一索引：' + spec.name };
+      }
+      if (Array.isArray(spec.columns)) {
+        const sameColumns = info.columns.length === spec.columns.length &&
+          info.columns.every((name, i) => name === spec.columns[i]);
+        if (!sameColumns) {
+          return {
+            ok: false,
+            reason: '必需索引列不匹配：' + spec.name +
+              '（应为 ' + spec.columns.join(', ') + '，实际为 ' + info.columns.join(', ') + '）'
+          };
+        }
+      }
+      if (spec.partial === false && info.partial) {
+        return { ok: false, reason: '必需索引不能是部分索引：' + spec.name };
       }
     }
     // 索引之外还有承载事实的必需列（复核 G4C-6）：缺列的库恢复后迁移器不会补列，

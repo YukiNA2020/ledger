@@ -236,8 +236,11 @@ Phase 4B 退出证据：搜索、预分类、确认、刷新不覆盖、标的�
 | 幂等原子性与请求绑定（G4C-7） | ✅ 通过 | 同 key 同请求体正常回放；同 key 不同请求体 → 409 `idempotency_conflict` 且只保留首笔；强制幂等记录插入失败时事件事实随同一事务回滚、零残留 |
 | 仅证券账户可承载持仓（G4C-8） | ✅ 通过 | `bank` 账户的期初与事件均 → 422 `invalid_account_type`；`PUT /state` 同样拒绝并整体回滚 |
 | 事件往返保真（G4C-9） | ✅ 通过 | 分红的可选 quantity 与未知 `sourceRef` 经单条写入和全量往返保留；载荷伪造 HKD 被忽略、按 USD 标的推导为 USD；分红 quantity 不改变持仓 |
+| 显式错误集合类型不得清库（G4C-10） | ✅ 通过 | `PUT /state` 前先写入持仓/报价/汇率各 1 条，再分别提交 `holdings:{}`、`quotes:{}`、`fxRates:{}`：均在清库前 400 `invalid_asset_collection`，随后读取仍为 1/1/1；字段缺失仍兼容旧备份并读取为空数组 |
+| v6 必需索引列严格校验（G4C-11） | ✅ 通过 | 将 `uq_portfolio_openings_dedupe` 替换成同名 `UNIQUE(id)` 并制造同账户/同标的重复期初，备份校验明确因索引列不匹配而拒绝；`PRAGMA index_xinfo` 结果必须严格为 `account_id, instrument_id` 且索引不可为 partial |
+| 根状态与 `assets` 形状不得绕过清库（G4C-12） | ✅ 通过 | API 与仓储双层校验：raw/wrapped `state=[]` → 400 `invalid_state`；显式 `assets=null/[]/字符串/{}` → 400 `invalid_assets`；每次拒绝后整份 `GET /state` 与基线深比较一致。只有 `assets` 字段完全缺失时按旧备份兼容为空集合 |
 
-Phase 4C 退出证据（完整性补口后更新）：全量 `node --test` **411/411**；4C 真实 HTTP **20/20**；浏览器 wiring **18/18**；数据库迁移停在 **v6**；`market-data/refresh` 仍 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-042；复核缺口与修复状态见 `PHASE4C_ACCEPTANCE_GAPS.md`。
+Phase 4C 退出证据（第三轮复核补口后更新）：当前全量 `node --test` **452/452**；4C/4D 真实 HTTP 合并 **30/30**；浏览器 wiring **21/21**；schema 停在 **v7**（本轮未新增迁移）；零真实网络请求。口径冻结见 `DECISIONS.md` D-042/D-043；复核缺口与修复状态见 `PHASE4C_ACCEPTANCE_GAPS.md`。
 
 ### S4D.1 自动更新成功
 
@@ -265,6 +268,10 @@ Phase 4C 退出证据（完整性补口后更新）：全量 `node --test` **411
 | S4D.2 缺标的 | ✅ 通过 | `not_found` 不写入，`retryable:false` → `attempts:1`（不可重试的错误不重复请求） |
 | S4D.2 节假日 | ✅ 通过 | fixture 中休市标的在 09-14/09-15 无数据，`asOf=2026-09-15` 回退到最近交易日 09-11；断言返回值绝**不晚于** `asOf`；`asOf` 早于数据起始日 → `not_found` 且零写入 |
 | S4D.2 不可入账数据一律拒绝落库 | ✅ 通过 | 负价格 / 汇率 `'0'` → `invalid_payload`；provider 返回**非数组**同样判 `invalid_payload`（不当成空结果）；provider 返回**未请求的标的**显式拒绝写入（不得张冠李戴） |
+| 请求结果必须绑定目标 | ✅ 通过 | 行情与汇率都先建立规范化请求键集合；未请求结果、无法绑定结果与重复键均返回逐目标 `invalid_payload`，整批不写入；汇率路径与报价路径采用同一规则 |
+| provider 漏返回必须显式失败 | ✅ 通过 | 请求两个币对只返回一个时，缺失目标生成明确错误；请求一个报价返回空数组时为 `failed`，不再误报 `skipped(no_targets)`；每个 scope 恒满足 `requested = updated + skipped + errors` |
+| provider 日期不得晚于 `asOf` | ✅ 通过 | `asOf=2026-09-18` 时返回 2026-09-19 的报价或汇率均判 `invalid_payload`、零写入；`fetchedAt` 仍由服务端 `now` 强制生成 |
+| 顶层跳过原因与实际目标一致 | ✅ 通过 | 存在报价目标且自动结果被手动价格冻结时：`requested=1`、元素与顶层 `reason` 均为 `manual_locked`；不再误报 `no_targets`。`no_targets` 仅允许在 `requested=0` 时出现，编排层与真实 HTTP 均有断言 |
 | S4D.2 手动补价兜底 | ✅ 通过 | 真实 HTTP `POST /api/v1/quotes` → 201 + `source:'manual'`（来源固定，拒绝调用方绕过）；同一元素键再次补价**替换**而不是并存，不同价格日各留一行；缺标的 400 `invalid_instrument_id`、非法价格 400 `invalid_price`、非法日期 400 `invalid_price_date`、币种冲突 422 `currency_mismatch`、未知引用 422 `unknown_instrument`，且被拒的写入零残留 |
 | S4D.2 手动值不被自动值覆盖（D-044 ②） | ✅ 通过 | 报价与汇率**同一口径**：手动值所在数据日**及更早**的自动观测一律 `manual_locked`（不是只看同一天）；更新的数据日仍可写入，手动值不会被永久挡住 |
 | S4D.2 元素键替换（D-044 ③） | ✅ 通过 | 同一（标的, 价格日）连续两次写入只保留 **1** 行，且取值是后写入的那一行（不依赖数据库行序）；跨 provider 一起替换。该不变量由写入路径强制，**不**提升为数据库唯一索引（理由见迁移 v7 注释） |
@@ -275,7 +282,7 @@ Phase 4C 退出证据（完整性补口后更新）：全量 `node --test` **411
 | 浏览器最小闭环（wiring） | ✅ 通过 | `tests/app-wiring.js` 新增 3 项：① 行情区块默认不自动抓取、手动补价写入事实源并渲染价格/价格日/来源；② 启动时自动更新汇率开关默认关闭、切换可写入 `settings` 并回读；③ 刷新报告逐作用域如实提示（成功报数量、门禁未通过报原因），且不改动已登记的手动价格 |
 | 离线运行 | ✅ 通过 | 4D 全部自动测试使用固定 fixture 与注入时钟，**零真实网络请求**；真实网络仅用于人工门禁取证（结论记入 `SOURCES.md` §8） |
 
-Phase 4D 退出证据：全量 `node --test` **441/441**（411 基线零回归 + 4D 新增 30 项）；4D 编排层 fixture **22/22**、真实 HTTP **7/7**、Keychain 行情 Key 路径 1 项；浏览器 wiring **21/21**（干净环境连续两轮全绿）；数据库迁移停在 **v7**；`market-data/refresh` 不再是 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-044，门禁证据见 `server/providers/SOURCES.md` §8。
+Phase 4D 退出证据（第三轮复核补口后更新）：全量 `node --test` **452/452**；4D 编排层 fixture **27/27**、真实 HTTP **10/10**；浏览器 wiring **21/21**；数据库迁移停在 **v7**；`market-data/refresh` 不再是 501；零真实网络请求。口径冻结见 `DECISIONS.md` D-044，门禁证据见 `server/providers/SOURCES.md` §8。独立复核再次确认前不进入 4E。
 
 ### S4E.1 估值下钻与收益归因
 

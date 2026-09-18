@@ -169,7 +169,7 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 4C｜持仓账本与证券事件
 
-状态：**实现与自验完成（2026-09-16），等待独立复核确认**。口径冻结见 `DECISIONS.md` D-042。
+状态：**第三轮独立复核补口完成（2026-09-18），等待复核确认**。口径冻结见 `DECISIONS.md` D-042/D-043。
 
 范围：
 
@@ -188,11 +188,11 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 - API：`POST /api/v1/portfolio-openings`、`POST /api/v1/security-events`（支持 `Idempotency-Key` 回放）、`GET /api/v1/security-events`；`DEFERRED_WRITES` 移除两键，`market-data/refresh` 仍 501（4D 且受 D-038 门禁）；错误码集中归位（409/422/400 各就各位）；
 - 前端：资产页新增「持仓与证券事件」区块（期初快照弹层、事件弹层、推导持仓卡片、事件流水），每次写入后 `refreshAssets()` 重拉全量状态；`APP_VERSION` 与 SW 缓存键升至 `2.3.8-phase4c`（复核补口轮升至 `2.3.9-phase4c`）。
 
-退出证据（完整性补口后更新）：全量 `node --test` **411/411**；4C 真实 HTTP **20/20**；浏览器 wiring **18/18**；迁移停在 **v6**；零真实网络请求。除第 1 轮 G4C-1–6 外，补充审计已闭合：事件与幂等记录同事务 + key 绑定请求指纹（G4C-7）、持仓仅允许证券账户且单条/全量同口径（G4C-8）、事件扩展字段与分红可选 quantity 无损往返、currency 始终从标的推导（G4C-9）。详见 `ACCEPTANCE.md` S4C.1、`TEST.md` 与 `PHASE4C_ACCEPTANCE_GAPS.md`。
+退出证据（第三轮复核补口后更新）：全量 `node --test` **452/452**；4C/4D 真实 HTTP 合并 **30/30**；浏览器 wiring **21/21**；schema 停在 **v7**；零真实网络请求。在 G4C-10/11 基础上新增 G4C-12：根 `state` 拒绝数组；`assets` 缺失兼容旧备份，显式存在时必须是非空对象，错误形状在清库前 400 且原事实不变。详见 `ACCEPTANCE.md` S4C.1、`TEST.md` 与 `PHASE4C_ACCEPTANCE_GAPS.md`。
 
 ### Phase 4D｜日终行情、汇率与失败兜底
 
-状态：**实现与自验完成（2026-09-17），等待独立复核确认**。口径冻结见 `DECISIONS.md` D-044，门禁复核证据见 `server/providers/SOURCES.md` §8。
+状态：**第三轮独立复核补口完成（2026-09-18），等待复核确认**。口径冻结见 `DECISIONS.md` D-044，门禁复核证据见 `server/providers/SOURCES.md` §8。
 
 **前置门禁（D-038，未通过不得开启自动抓取）：** 4D 在接入任何自动行情源之前，必须逐条补齐并写入 `server/providers/SOURCES.md`：官方条款链接（含自动化使用授权）、可复核的 API 版本与文档、调用限额（日/分钟）、认证方式、市场覆盖的明确声明、失败语义到五类错误码的映射；门禁未通过时保持自动抓取默认关闭，行情以手动补价 + 本地缓存为唯一事实来源。
 
@@ -215,7 +215,7 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 - **API**：`POST /api/v1/quotes`（手动补价兜底）、`POST /api/v1/market-data/refresh`（`DEFERRED_WRITES` 移除，不再是 501）。响应语义是「一次刷新尝试的报告」：外部失败返回 200 + `ok:false` + 逐作用域 `errors`（含 `retryable`），不把外部不可达伪装成客户端错误。自动行情开关**只从服务端 settings 读取，不信任请求体**；
 - **前端**：资产页新增「行情（收盘价）」区块（逐标的卡片：价格/价格日/来源/新鲜度、手动补价入口、启动时自动更新汇率开关、刷新入口），手动补价弹层走 `js/store.js` 门面；`APP_VERSION` 与 SW 缓存键升至 `2.3.10-phase4d`。
 
-退出证据：全量 `node --test` **441/441**（411 基线零回归 + 4D 新增 30 项：编排层 fixture **22/22**、真实 HTTP **7/7**、Keychain 行情 Key 路径 1 项）；浏览器 wiring **21/21**（干净环境连续两轮全绿，新增 3 项）；迁移停在 **v7**；自动测试**零真实网络请求**（真实网络只用于人工取证，结论记入 SOURCES.md §8）。详见 `ACCEPTANCE.md` S4D.1/S4D.2 与 `TEST.md`。
+退出证据（第三轮复核补口后更新）：全量 `node --test` **452/452**；4D 编排层 fixture **27/27**、真实 HTTP **10/10**；浏览器 wiring **21/21**；迁移停在 **v7**；自动测试**零真实网络请求**。请求—结果继续逐键对齐；顶层跳过原因现在从实际结果推导，有目标且被手动锁定时返回 `manual_locked`，`no_targets` 只用于 `requested=0`。详见 `ACCEPTANCE.md` S4D.1/S4D.2 与 `TEST.md`。
 
 ### Phase 4E｜估值下钻与收益归因
 

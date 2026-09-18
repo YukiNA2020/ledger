@@ -1455,9 +1455,22 @@ function clearState(db) {
   if (tableExists(db, 'sqlite_sequence')) run(db, 'DELETE FROM sqlite_sequence');
 }
 
-function normalizeAssets(raw) {
+function normalizeAssets(raw, explicitlyProvided) {
+  // 旧备份可能完全缺少 assets 或其中的新集合键：缺失键继续按空数组兼容。
+  // 但 assets 一旦显式存在，就必须是非空普通对象；不能把 null / [] / '' / {}
+  // 解释成“清空全部事实”。这项校验必须发生在 clearState 之前（4C 独立复核 P0）。
+  if (explicitlyProvided && (
+    !raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).length === 0
+  )) {
+    throw Object.assign(new Error('assets 必须是非空对象'), { code: 'invalid_assets' });
+  }
   const out = {};
   ASSET_KEYS.forEach((k) => {
+    if (raw && Object.prototype.hasOwnProperty.call(raw, k) && !Array.isArray(raw[k])) {
+      throw Object.assign(new Error('资产集合 ' + k + ' 必须是数组'), {
+        code: 'invalid_asset_collection'
+      });
+    }
     out[k] = raw && Array.isArray(raw[k]) ? raw[k] : [];
   });
   return out;
@@ -1492,8 +1505,12 @@ function readState(db) {
 // 全量写入：单事务、先清后写。相同输入重复写入结果一致（幂等）。
 function writeState(db, state, options) {
   const opts = options || {};
-  const src = state || {};
-  const assets = normalizeAssets(src.assets);
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    throw Object.assign(new Error('state 必须是对象'), { code: 'invalid_state' });
+  }
+  const src = state;
+  const hasAssets = Object.prototype.hasOwnProperty.call(src, 'assets');
+  const assets = normalizeAssets(src.assets, hasAssets);
   const now = opts.now || new Date().toISOString();
   return transaction(db, () => {
     clearState(db);

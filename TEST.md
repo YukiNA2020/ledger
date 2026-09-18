@@ -2,14 +2,14 @@
 
 > 文档用途：记录可复现的测试证据、覆盖范围、缺陷和发布判断。
 > 创建时间：2026-08-16
-> 最近更新：2026-09-17
+> 最近更新：2026-09-18
 
 ## 当前结论
 
-- **测试对象：** Phase 4D 日终行情、汇率与失败兜底
-- **总体状态：** ✅ 实现与自验完成，等待独立复核确认。`node --test` **441/441**；4D 编排层 fixture **22/22**、4D 真实 HTTP **7/7**；浏览器 wiring **21/21**（干净环境连续两轮）。数据库迁移 **v6 → v7**。零真实网络请求。
+- **测试对象：** Phase 4C/4D 第三轮独立复核补口
+- **总体状态：** ✅ 复核缺口已修复，等待独立复核确认。`node --test` **452/452**；4D 编排层 fixture **27/27**、4D 真实 HTTP **10/10**、4C/4D 真实 HTTP 合并 **30/30**；浏览器 wiring **21/21**。数据库 schema 仍为 **v7**。零真实网络请求。
 - **发布判断：** 4D 口径冻结见 `DECISIONS.md` D-044：**自动行情抓取默认关闭**（D-038 六条门禁未通过 → `quotes` 恒为 `skipped(auto_fetch_disabled)`，开关只从服务端 settings 读取、不信任请求体），行情以「手动补价 + 本地缓存」为唯一事实来源；汇率自动更新只接 Frankfurter 且 **pin ECB 端点**（D-036）。`manual` 行是用户显式事实，自动源不得写入**同一天或更早**的观测（报价与汇率同一口径）；元素键（标的+价格日 / 币对+汇率日）由**写入路径**强制替换，**不**建数据库唯一索引（v1 的 `uq_quotes_dedupe` 允许同一价格日不同 provider 并存）；刷新响应是「一次刷新尝试的报告」而非「必须拿到数据」，外部不可达一律 200 + `ok:false` + 逐作用域 `errors`（含 `retryable`），失败**不改动任何已有行**。T-002 更新为「汇率已定、行情仍未选定（无候选通过门禁）」——门禁通过后只需接入 provider 并翻转服务端开关，编排/仓储/前端无需改动。**Phase 4A 仍为「契约完成、正式验收暂不通过」**；4B/4C 复核结论保持已修复状态。
-- **Phase 4C 结论文档存档：** `node --test` 411/411；4C 真实 HTTP 20/20；浏览器 wiring 18/18；迁移停在 v6（G4C-1–9 补口完成，等待独立复核确认）。
+- **Phase 4C 结论：** G4C-1–12 补口完成；根状态与显式 `assets` 错误形状不会清库，v6 必需索引严格校验列。与 4D 合并后的当前基线为 452/452、浏览器 wiring 21/21。
 
 上一阶段（4B）结论存档：`node --test` 371/371、wiring 17/17（第三轮基线），详见 ROADMAP/ACCEPTANCE 的 4B 节与 `PHASE4B_ACCEPTANCE_GAPS.md`。
 
@@ -133,6 +133,34 @@
 | 真实网络访问 | — | ✅ 零 | 4D 全部自动测试使用固定 fixture 与注入时钟；真实网络只用于门禁人工取证，结论已归档 |
 
 **Phase 4D 合计：`node --test` 441/441（411 + 30），4D 编排层 22/22、真实 HTTP 7/7，浏览器 wiring 21/21（两轮）。数据库迁移 v6 → v7。**
+
+### Phase 4C/4D 第二轮独立复核补口证据（2026-09-18）
+
+| 范围 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 4C 错误集合类型 | `node --test tests/server-phase4d.test.js` | ✅ | 先写入 1 条持仓、报价、汇率，再分别提交 `holdings:{}` / `quotes:{}` / `fxRates:{}`，均 400 `invalid_asset_collection`，原有 1/1/1 条事实完整保留；缺失字段的旧备份仍按空数组读取 |
+| 4C 伪造同名索引 | `node --test tests/server-backup.test.js` | ✅ | 把 `uq_portfolio_openings_dedupe` 替换为同名 `UNIQUE(id)` 后，`indexInfo` 读到列 `['id']`，备份校验因索引列不匹配而拒绝；严格要求 `account_id, instrument_id` 且非 partial |
+| 4D 请求—结果绑定 | `node --test tests/providers-marketdata.test.js` | ✅ **27/27** | 新增 5 项：未请求汇率、漏返回、报价空数组、重复结果、未来报价/汇率均显式报错且零写入；每个 scope 满足 `requested = updated + skipped + errors` |
+| 4C/4D 真实 HTTP | `node --test tests/server-phase4c.test.js tests/server-phase4d.test.js` | ✅ **28/28** | 4C 20 项零回归；4D 增至 8 项，覆盖错误集合类型不会清空既有财务事实 |
+| 仓储/备份/编排定向 | `node --test tests/server-backup.test.js tests/providers-marketdata.test.js tests/server-repository.test.js` | ✅ **64/64** | 含旧备份缺集合字段兼容、索引列读取与 provider 边界反例 |
+| 全量回归 | `node --test`（非沙箱，真实用户身份） | ✅ **449/449** | 441 基线 + 8 项真实反例；Keychain 与回环服务测试均通过 |
+| 浏览器接线 | `tests/app-wiring.html`（本地服务托管） | ✅ **21/21** | 页面报告 21 项通过、0 项失败；本轮无 UI 改动 |
+| 静态门禁 | `git diff --check` | ✅ | 无空白错误；schema 仍为 v7，未新增迁移，零真实网络请求 |
+
+本轮只修复 4C/4D 复核缺口，**不进入 4E**。待独立复核再次确认后，才切换下一阶段入口。
+
+### Phase 4C/4D 第三轮独立复核补口证据（2026-09-18）
+
+| 范围 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 根状态与 `assets` HTTP 反例 | `node --test tests/server-phase4d.test.js` | ✅ **10/10** | raw/wrapped `state=[]` 均 400 `invalid_state`；显式 `assets=null/[]/字符串/{}` 均 400 `invalid_assets`；每次拒绝后完整状态与基线深比较一致 |
+| 仓储层纵深防御与旧备份兼容 | `node --test tests/server-repository.test.js` | ✅ **17/17** | 直接调用 `writeState` 同样在清库前拒绝根数组和错误 `assets`；字段完全缺失仍被接受并初始化为空集合 |
+| 手动锁顶层原因 | `node --test tests/providers-marketdata.test.js` | ✅ **27/27** | 报价和汇率手动锁用例同时断言元素与顶层 `reason='manual_locked'`；只有 `requested=0` 才返回 `no_targets` |
+| 全量回归 | `node --test`（非沙箱，真实用户身份） | ✅ **452/452** | 449 基线 + 3 项真实反例；Keychain 与回环服务测试均通过 |
+| 浏览器接线 | `tests/app-wiring.html`（本地服务托管） | ✅ **21/21** | 页面报告 21 项通过、0 项失败；本轮无 UI 改动 |
+| 静态门禁 | `git diff --check` | ✅ | schema 仍为 v7，未新增迁移，零真实网络请求 |
+
+本轮仍只修复 4C/4D，**不进入 4E**。等待独立复核确认。
 
 ### Phase 4D 实现过程中发现并修复的问题（2026-09-17）
 

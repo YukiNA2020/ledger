@@ -247,6 +247,71 @@ test('S4D.2 手动补价兜底：可写入、可读回、同日替换；非法�
   assert.strictEqual((await get(port, '/api/v1/quotes')).json.items.length, 2);
 });
 
+test('4C 反例：显式错误资产集合类型被拒绝，不能把 holdings/quotes/fxRates 静默清空', async (t) => {
+  const ctx = setup('ledger-p4c-collection-shape-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+  await seedOpening(port, accountId, instrumentId);
+
+  const quote = await post(port, '/api/v1/quotes', {
+    instrumentId: instrumentId,
+    priceMinor: 4992,
+    priceDate: '2026-09-14'
+  });
+  assert.strictEqual(quote.status, 201);
+  const fx = await post(port, '/api/v1/fx-rates', {
+    base: 'USD', quote: 'CNY', rateDecimal: '7.1900', rateDate: '2026-09-14'
+  });
+  assert.strictEqual(fx.status, 201);
+
+  for (const key of ['holdings', 'quotes', 'fxRates']) {
+    const state = (await get(port, '/api/v1/state')).json;
+    state.assets[key] = {};
+    const rejected = await put(port, '/api/v1/state', { state: state });
+    assert.strictEqual(rejected.status, 400, key + ' 错误类型必须返回 400');
+    assert.strictEqual(rejected.json.error.code, 'invalid_asset_collection');
+    assert.ok(rejected.json.error.message.indexOf(key) >= 0, '错误应点名集合：' + key);
+
+    const after = (await get(port, '/api/v1/state')).json;
+    assert.strictEqual(after.assets.holdings.length, 1, key + ' 被拒后期初不得丢失');
+    assert.strictEqual(after.assets.quotes.length, 1, key + ' 被拒后报价不得丢失');
+    assert.strictEqual(after.assets.fxRates.length, 1, key + ' 被拒后汇率不得丢失');
+  }
+});
+
+test('4C 反例：根 state 数组与显式空 assets 均在清库前拒绝，既有事实原样保留', async (t) => {
+  const ctx = setup('ledger-p4c-root-shape-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+  await seedOpening(port, accountId, instrumentId);
+  assert.strictEqual((await post(port, '/api/v1/quotes', {
+    instrumentId: instrumentId, priceMinor: 4992, priceDate: '2026-09-14'
+  })).status, 201);
+  assert.strictEqual((await post(port, '/api/v1/fx-rates', {
+    base: 'USD', quote: 'CNY', rateDecimal: '7.1900', rateDate: '2026-09-14'
+  })).status, 201);
+
+  const baseline = (await get(port, '/api/v1/state')).json;
+  const cases = [
+    { body: [], code: 'invalid_state', label: 'raw state=[]' },
+    { body: { state: [] }, code: 'invalid_state', label: 'wrapped state=[]' },
+    { body: { state: Object.assign({}, baseline, { assets: null }) }, code: 'invalid_assets', label: 'assets=null' },
+    { body: { state: Object.assign({}, baseline, { assets: [] }) }, code: 'invalid_assets', label: 'assets=[]' },
+    { body: { state: Object.assign({}, baseline, { assets: 'bad-assets' }) }, code: 'invalid_assets', label: 'assets=string' },
+    { body: { state: Object.assign({}, baseline, { assets: {} }) }, code: 'invalid_assets', label: 'assets={}' }
+  ];
+  for (const row of cases) {
+    const rejected = await put(port, '/api/v1/state', row.body);
+    assert.strictEqual(rejected.status, 400, row.label + ' 必须返回 400');
+    assert.strictEqual(rejected.json.error.code, row.code, row.label + ' 错误码');
+    assert.deepStrictEqual((await get(port, '/api/v1/state')).json, baseline, row.label + ' 不得改变既有事实');
+  }
+});
+
 /* ============================== D-038 启用门禁 ============================== */
 
 test('D-038 请求体不能打开自动行情抓取：开关只从服务端 settings 读取', async (t) => {
@@ -347,6 +412,40 @@ test('D-038 服务端开关打开并注入 provider：行情写入 provider 与�
   const after = await get(port, '/api/v1/quotes');
   assert.strictEqual(after.json.items.length, 1);
   assert.strictEqual(after.json.items[0].priceMinor, 5150, '失败不得覆盖最后有效值');
+});
+
+test('手动价格锁定时顶层刷新原因是 manual_locked，不得误报 no_targets', async (t) => {
+  const ctx = setup('ledger-p4d-manual-reason-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+  const { accountId, instrumentId } = await seedAccountAndInstrument(port);
+  await seedOpening(port, accountId, instrumentId);
+
+  const state = (await get(port, '/api/v1/state')).json;
+  state.settings = Object.assign({}, state.settings || {}, { marketDataAutoQuotes: true });
+  assert.strictEqual((await put(port, '/api/v1/state', { state: state })).status, 200);
+  assert.strictEqual((await post(port, '/api/v1/quotes', {
+    instrumentId: instrumentId,
+    priceMinor: 9999,
+    priceDate: '2026-09-14'
+  })).status, 201);
+
+  ctx.marketDataFetcher = { quotes: Fixture.getEndOfDayQuotes, quotesProviderId: 'fixture' };
+  const refreshed = await post(port, '/api/v1/market-data/refresh', {
+    scopes: ['quotes'],
+    asOf: '2026-09-15'
+  });
+  assert.strictEqual(refreshed.status, 200);
+  const quotes = scopeOf(refreshed.json, 'quotes');
+  assert.strictEqual(quotes.requested, 1);
+  assert.strictEqual(quotes.status, 'skipped');
+  assert.strictEqual(quotes.reason, 'manual_locked');
+  assert.strictEqual(quotes.skipped[0].reason, 'manual_locked');
+  const stored = (await get(port, '/api/v1/quotes')).json.items;
+  assert.strictEqual(stored.length, 1);
+  assert.strictEqual(stored[0].provider, 'manual');
+  assert.strictEqual(stored[0].priceMinor, 9999);
 });
 
 test('自动行情开关打开但 provider 未配置：skipped(provider_not_configured)，Key 只报告是否配置', async (t) => {

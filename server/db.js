@@ -54,25 +54,44 @@ function tableExists(db, name) {
   return !!row;
 }
 
-// 索引信息：是否存在、属于哪张表、是否为唯一索引。
+// 索引信息：是否存在、属于哪张表、是否为唯一索引、按顺序使用了哪些键列。
 // 备份校验不能只看"表齐不齐" —— 有些不变量是索引承载的（如 uq_instruments_dedupe）。
 // PRAGMA 不支持参数绑定，表名一律做标识符白名单过滤后再拼（本项目表名均为内置常量）。
 function indexInfo(db, table, name) {
   if (!table || !name) return null;
   const t = String(table).replace(/[^A-Za-z0-9_]/g, '');
+  const n = String(name).replace(/[^A-Za-z0-9_]/g, '');
+  if (!t || !n) return null;
   const row = get(db, "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?", [name]);
   if (!row) return null;
   if (t && String(row.tbl_name) !== t) return null;
   let unique = false;
+  let partial = false;
+  let columns = [];
   try {
     const list = all(db, 'PRAGMA index_list(' + t + ')');
     const hit = list.filter((i) => i.name === name)[0];
     unique = !!(hit && Number(hit.unique));
+    partial = !!(hit && Number(hit.partial));
+    // index_xinfo 的 key=1 恰好是参与索引键的列；尾部隐含 rowid（key=0）必须排除。
+    // 表达式索引会得到 name=null，这也能让“严格列名”校验可靠失败。
+    columns = all(db, 'PRAGMA index_xinfo(' + n + ')')
+      .filter((i) => Number(i.key) === 1)
+      .sort((a, b) => Number(a.seqno) - Number(b.seqno))
+      .map((i) => (i.name == null ? null : String(i.name)));
   } catch (_) {
     // 读不到索引属性时按"不唯一"处理：校验方宁可拒绝，也不放过不变量缺失的库
     unique = false;
+    partial = true;
+    columns = [];
   }
-  return { name: String(row.name), table: String(row.tbl_name), unique: unique };
+  return {
+    name: String(row.name),
+    table: String(row.tbl_name),
+    unique: unique,
+    partial: partial,
+    columns: columns
+  };
 }
 
 // 表的列名集合：备份校验按版本核对必需列（如 v5 的 security_events.amount_minor）——

@@ -254,6 +254,8 @@ const CATALOG_ERROR_STATUS = {
 const DOMAIN_ERROR_STATUS = {
   invalid_json: 400,
   invalid_state: 400,
+  invalid_assets: 400,
+  invalid_asset_collection: 400,
   invalid_id: 400,
   invalid_symbol: 400,
   invalid_instrument: 400,
@@ -376,8 +378,10 @@ function createHandler(ctx) {
 
   api['PUT /api/v1/state'] = async (req, res) => {
     const body = await readBody(req);
-    const state = body && body.state ? body.state : body;
-    if (!state || typeof state !== 'object') {
+    const bodyWrapsState = body && typeof body === 'object' && !Array.isArray(body) &&
+      Object.prototype.hasOwnProperty.call(body, 'state');
+    const state = bodyWrapsState ? body.state : body;
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
       return fail(res, 400, 'invalid_state', 'state 必须是对象', false);
     }
     // 幂等键：同一 Idempotency-Key 重复提交直接返回首次结果（§5.6）

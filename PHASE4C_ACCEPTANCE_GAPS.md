@@ -1,5 +1,31 @@
 # Phase 4C 独立复核 — 缺口与修复记录
 
+## 第 3 轮修复状态（2026-09-18）
+
+> 独立复核确认上轮问题已修复，但新发现 1 个 P0；另有 1 个 Phase 4D P2。本轮已补齐并加入 HTTP 反例，仍等待再次独立复核，不进入 4E。
+
+| 编号 | 级别 | 原始结论 | 修复状态 | 处理方式与证据 |
+|---|---|---|---|---|
+| G4C-12 | P0 | raw/wrapped `state=[]` 会通过 `typeof object` 校验；`assets=null` 又被当成缺失字段，覆盖写入后账户/持仓/报价/汇率全部清零 | ✅ 已修复 | API 用 own-property 区分 wrapper，并明确拒绝数组根状态；repository 再做同一层纵深校验。`assets` 只有完全缺失时兼容旧备份；显式存在必须为非空对象，`null`、数组、字符串、`{}` 全部 `invalid_assets`。真实 HTTP 逐项拒绝后完整状态与基线深比较一致，仓储直调也验证清库前拒绝 |
+| G4D-1 | P2 | 有刷新目标但全被 `manual_locked` 跳过时，顶层 `reason` 错误回退为 `no_targets` | ✅ 已修复 | `scopeSummary` 从实际 skipped 原因推导顶层原因：单一原因透传，多原因用 `skipped`；`no_targets` 只在 `requested=0` 使用。报价/汇率编排断言与真实 HTTP 手动价格锁定反例均通过 |
+
+当前证据：全量 `node --test` **452/452**；4C/4D 真实 HTTP **30/30**；仓储/备份/编排 **65/65**；浏览器 wiring **21/21**；schema 仍为 v7。
+
+---
+
+## 第 2 轮修复状态（2026-09-18）
+
+> 独立复核结论：4C/4D 暂不通过，不建议进入 4E。4C 新发现 1 个 P0、1 个 P1；本轮已按原始反例修复并补测试，等待再次独立复核。
+
+| 编号 | 级别 | 原始结论 | 修复状态 | 处理方式与证据 |
+|---|---|---|---|---|
+| G4C-10 | P0 | `PUT /state` 把显式错误类型的 `holdings:{}` / `quotes:{}` / `fxRates:{}` 转成空数组，接受请求并清空既有财务事实 | ✅ 已修复 | `normalizeAssets` 区分“字段缺失”与“字段显式存在但类型错误”：缺失仍兼容旧备份为 `[]`；显式非数组在事务和清库前抛 `invalid_asset_collection`（HTTP 400）。真实 HTTP 反例先写入 1/1/1 条事实，再逐键提交 `{}`，三次拒绝后数据仍为 1/1/1；仓储测试另覆盖旧备份缺字段兼容 |
+| G4C-11 | P1 | v6 备份只按索引名称与唯一性校验，同名 `UNIQUE(id)` 可冒充 `(account_id, instrument_id)` 去重索引 | ✅ 已修复 | `db.indexInfo` 读取 `PRAGMA index_list` + `PRAGMA index_xinfo`，返回 key 列、unique 与 partial；`backup.js` 严格要求列顺序 `account_id, instrument_id` 且非 partial。反例替换同名索引为 `UNIQUE(id)`、插入同账户/同标的重复期初后，备份校验明确因“索引列不匹配”拒绝 |
+
+当前证据：全量 `node --test` **449/449**；仓储/备份/编排定向 **64/64**；4C/4D 真实 HTTP **28/28**；浏览器 wiring **21/21**；schema 仍为 v7。本轮只补 4C/4D，未进入 4E。
+
+---
+
 > 复核时间：2026-09-17 晚（独立测试 agent，第 1 轮）
 > 复核对象：`v2.3.8-phase4c`（分支 `phase/04c-holdings-events`，实现 `e0adb08` + 文档 `6d218f1`）
 > 复核结论：**Phase 4C 暂不通过，不建议进入 4D。** 正常主链路全绿，但反向测试发现 3 个 P0 和 3 个 P1。
