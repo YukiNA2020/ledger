@@ -7,7 +7,7 @@
 
 本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
 
-截至 2026-09-17，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）、Phase 4B（标的目录与分类确认）、Phase 4C（持仓账本与证券事件）与 Phase 4D（日终行情、汇率与失败兜底）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块），Phase 4C 的期初快照与证券事件写入、推导持仓视图与资产页「持仓与证券事件」区块已可用（`POST /portfolio-openings` / `POST|GET /security-events`、`deriveHoldings` 唯一推导、迁移 v6，口径见 D-042 ⑦⑧）；Phase 4D 的行情/汇率编排层（`server/market-data.js`）、Frankfurter 汇率源（**pin ECB 端点** `/v2/providers/ecb/rates`，D-036）、Keychain 惰性读 Key 与手动补价兜底已可用（`POST /api/v1/quotes`、`POST /api/v1/market-data/refresh`、迁移 v7 的 `quotes.source_symbol`、资产页「行情（收盘价）」区块，口径见 D-044），其中**行情自动抓取默认关闭**——D-038 的六条启用门禁经 2026-09-17 逐条复测后无候选通过（证据见 `server/providers/SOURCES.md` §8），开关只认服务端 settings，门禁通过后仅需接入 provider；4B 同日完成独立复核**两轮**补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`、全量写入逐条校验（非法记录整体拒绝而非静默丢行）、备份结构校验按版本覆盖必需索引（D-040）、检索合并与建立路径共用同一套退化匹配。**尚无**行情自动抓取（4D 交付的是"门禁就绪但未开启"）、估值下钻与收益归因（4E），也没有风险问卷与决策状态机。
+截至 2026-09-18，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）、Phase 4B（标的目录与分类确认）、Phase 4C（持仓账本与证券事件）、Phase 4D（日终行情、汇率与失败兜底）与 Phase 4E（估值下钻与收益归因）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块），Phase 4C 的期初快照与证券事件写入、推导持仓视图与资产页「持仓与证券事件」区块已可用（`POST /portfolio-openings` / `POST|GET /security-events`、`deriveHoldings` 唯一推导、迁移 v6，口径见 D-042 ⑦⑧）；Phase 4D 的行情/汇率编排层（`server/market-data.js`）、Frankfurter 汇率源（**pin ECB 端点** `/v2/providers/ecb/rates`，D-036）、Keychain 惰性读 Key 与手动补价兜底已可用（`POST /api/v1/quotes`、`POST /api/v1/market-data/refresh`、迁移 v7 的 `quotes.source_symbol`、资产页「行情（收盘价）」区块，口径见 D-044），其中**行情自动抓取默认关闭**——D-038 的六条启用门禁经 2026-09-17 逐条复测后无候选通过（证据见 `server/providers/SOURCES.md` §8），开关只认服务端 settings，门禁通过后仅需接入 provider；Phase 4E 的估值下钻与收益归因已可用（`js/domain.js` 的 `computeAssetDrilldown` / `computeReturnAttribution` / `findQuoteAsOf` / `findFxRateAsOf` / `holdingsAsOf`、决策台「估值下钻」与「收益归因」两个区块、月结快照封存的 `attribution` 字段），四个下钻维度与总览共用 `valueAssetItems` 的**同一遍**估值、「价格影响 + 汇率影响」逐行恒等于估值变化、as-of 查询绝不返回未来行（口径见 D-045），本轮**零新数据源、零迁移**；4B 同日完成独立复核**两轮**补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`、全量写入逐条校验（非法记录整体拒绝而非静默丢行）、备份结构校验按版本覆盖必需索引（D-040）、检索合并与建立路径共用同一套退化匹配。**尚无**行情自动抓取（4D 交付的是"门禁就绪但未开启"），也没有风险问卷与决策状态机（Phase 5 起）。
 
 ## 1. 架构原则
 
@@ -33,7 +33,7 @@
 
 可复用资产是已经由 Node 测试覆盖的纯逻辑和账单导入交互。已解决的限制：浏览器数据难以自动备份（现由服务端每日备份 + 30 份保留覆盖）、API Key 无法安全保存（现由 Keychain 适配器覆盖）、KV Schema 不适合持仓与快照关系查询（现由 SQLite 关系表覆盖）。
 
-仍未满足的目标架构能力：开机自动打开端到端、行情自动抓取（编排与契约已就绪，源受 D-038 门禁默认关闭）、估值下钻与收益归因、规则引擎、决策状态机。
+仍未满足的目标架构能力：开机自动打开端到端、行情自动抓取（编排与契约已就绪，源受 D-038 门禁默认关闭）、规则引擎、决策状态机。
 
 ## 3. 目标系统
 
