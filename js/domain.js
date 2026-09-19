@@ -1607,6 +1607,486 @@
     return Math.round((safetyMinor / avgNecessaryMinor) * 10) / 10;
   }
 
+  /* ------------------- 风险问卷规则与配置契约（Phase 5A，D-046） -------------------
+   * 5A 只冻结规则：不建表、不开接口、不改页面。
+   * 本段是题目 / 分值 / 等级边界 / 硬封顶 / 目标模板 / 契约形状的**唯一机器可读定义**，
+   * 浏览器与服务端共用同一份（D-025）。任何规则变更都必须升 RISK_RULE_VERSION：
+   * 历史评估永远带着它当时的版本可读，绝不用新规则静默重算旧答案（不变量 10）。
+   */
+
+  var RISK_RULE_VERSION = 'risk-rules-v1';      // 题目与评分规则版本
+  var RISK_TARGET_VERSION = 'risk-targets-v1';  // 目标区间模板版本
+  var BPS_TOTAL = 10000;                        // 比例一律 basis points 定点整数：100% = 10000（不变量 8）
+
+  var CAPACITY_DIMENSIONS = ['income_stability', 'emergency_fund', 'debt_pressure', 'horizon', 'liquidity_need'];
+  var WILLINGNESS_DIMENSIONS = ['experience', 'knowledge', 'drawdown_tolerance', 'fx_understanding'];
+  var RISK_LEVELS = [1, 2, 3, 4, 5];
+
+  // 题库：稳定题目 id + 选项 id + 分值；持久化只认 id，显示文案属本地知识卡（5E，explainKey）。
+  // 不采集年龄 / 性别等与承受能力无因果的变量。
+  var RISK_QUESTIONS = [
+    {
+      id: 'q_income_stability', kind: 'capacity', dimension: 'income_stability', explainKey: 'card-income-stability',
+      options: [
+        { id: 'o_fixed_stable', score: 3 },
+        { id: 'o_variable_predictable', score: 2 },
+        { id: 'o_irregular', score: 1 },
+        { id: 'o_no_stable_income', score: 0 }
+      ]
+    },
+    {
+      id: 'q_emergency_fund', kind: 'capacity', dimension: 'emergency_fund', explainKey: 'card-emergency-fund',
+      options: [
+        { id: 'o_cover_12m_plus', score: 3 },
+        { id: 'o_cover_6_12m', score: 2 },
+        { id: 'o_cover_3_6m', score: 1 },
+        { id: 'o_cover_under_3m', score: 0 }
+      ]
+    },
+    {
+      id: 'q_debt_pressure', kind: 'capacity', dimension: 'debt_pressure', explainKey: 'card-debt-pressure',
+      options: [
+        { id: 'o_no_debt', score: 3 },
+        { id: 'o_manageable', score: 2 },
+        { id: 'o_heavy', score: 1 },
+        { id: 'o_current_due_or_overdue', score: 0 }
+      ]
+    },
+    {
+      id: 'q_horizon', kind: 'capacity', dimension: 'horizon', explainKey: 'card-horizon',
+      options: [
+        { id: 'o_horizon_10y_plus', score: 3 },
+        { id: 'o_horizon_5_10y', score: 2 },
+        { id: 'o_horizon_3_5y', score: 1 },
+        { id: 'o_horizon_under_3y', score: 0 }
+      ]
+    },
+    {
+      id: 'q_liquidity_need', kind: 'capacity', dimension: 'liquidity_need', explainKey: 'card-liquidity-need',
+      options: [
+        { id: 'o_no_need', score: 3 },
+        { id: 'o_minor_need', score: 2 },
+        { id: 'o_planned_1_3y', score: 1 },
+        { id: 'o_large_within_1y', score: 0 }
+      ]
+    },
+    {
+      id: 'q_experience', kind: 'willingness', dimension: 'experience', explainKey: 'card-experience',
+      options: [
+        { id: 'o_exp_5y_plus', score: 3 },
+        { id: 'o_exp_2_5y', score: 2 },
+        { id: 'o_exp_under_2y', score: 1 },
+        { id: 'o_exp_none', score: 0 }
+      ]
+    },
+    {
+      id: 'q_knowledge', kind: 'willingness', dimension: 'knowledge', explainKey: 'card-knowledge',
+      options: [
+        { id: 'o_know_solid', score: 3 },
+        { id: 'o_know_basic', score: 2 },
+        { id: 'o_know_limited', score: 1 },
+        { id: 'o_know_none', score: 0 }
+      ]
+    },
+    {
+      id: 'q_drawdown_tolerance', kind: 'willingness', dimension: 'drawdown_tolerance', explainKey: 'card-drawdown',
+      options: [
+        { id: 'o_dd_over_30', score: 3 },
+        { id: 'o_dd_20_30', score: 2 },
+        { id: 'o_dd_10_20', score: 1 },
+        { id: 'o_dd_under_10', score: 0 }
+      ]
+    },
+    {
+      id: 'q_fx_understanding', kind: 'willingness', dimension: 'fx_understanding', explainKey: 'card-fx-risk',
+      options: [
+        { id: 'o_fx_clear', score: 3 },
+        { id: 'o_fx_partial', score: 2 },
+        { id: 'o_fx_limited', score: 1 },
+        { id: 'o_fx_none', score: 0 }
+      ]
+    }
+  ];
+
+  // 分段边界：**下界含入**（score >= minScore 即归入该级），临界值只有一种归属（不变量 6）。
+  // 能力分域 0–15（5 题 × 3 分），意愿分域 0–12（4 题 × 3 分）。
+  var CAPACITY_LEVEL_BOUNDS = [
+    { level: 1, minScore: 0 }, { level: 2, minScore: 4 }, { level: 3, minScore: 7 },
+    { level: 4, minScore: 10 }, { level: 5, minScore: 13 }
+  ];
+  var WILLINGNESS_LEVEL_BOUNDS = [
+    { level: 1, minScore: 0 }, { level: 2, minScore: 3 }, { level: 3, minScore: 6 },
+    { level: 4, minScore: 9 }, { level: 5, minScore: 11 }
+  ];
+
+  // 硬封顶：关键短板优先于总分，只**降低**上限、绝不提高；高意愿不能抵消（不变量 1）。
+  // maxOptionScore 是该题的最差档分值：命中即把风险上限压到 maxLevel。
+  var RISK_HARD_CAPS = [
+    { code: 'hard_cap_emergency_fund', questionId: 'q_emergency_fund', maxOptionScore: 0, maxLevel: 2, explainKey: 'card-emergency-fund' },
+    { code: 'hard_cap_income_stability', questionId: 'q_income_stability', maxOptionScore: 0, maxLevel: 2, explainKey: 'card-income-stability' },
+    { code: 'hard_cap_liquidity_need', questionId: 'q_liquidity_need', maxOptionScore: 0, maxLevel: 2, explainKey: 'card-liquidity-need' },
+    { code: 'hard_cap_debt_pressure', questionId: 'q_debt_pressure', maxOptionScore: 0, maxLevel: 2, explainKey: 'card-debt-pressure' }
+  ];
+
+  // 目标模板：分母是**可投资资产**（D-011，不变量 2），cash 指投资池内的现金，不含安全储备。
+  // 每级 ΣtargetBps 恒为 10000；ΣminBps <= 10000 <= ΣmaxBps（否则区间无法同时满足）。
+  // 个股（stock）target 恒为 0：D-018 不做具体股票购买建议，只给用户既有持仓留容忍上限。
+  var TARGET_TEMPLATES = [
+    {
+      level: 1, templateVersion: RISK_TARGET_VERSION, classes: {
+        cash: { minBps: 4000, targetBps: 5000, maxBps: 6500 },
+        fixed_income: { minBps: 3000, targetBps: 4000, maxBps: 5500 },
+        broad_equity: { minBps: 0, targetBps: 1000, maxBps: 1500 },
+        theme_equity: { minBps: 0, targetBps: 0, maxBps: 500 },
+        stock: { minBps: 0, targetBps: 0, maxBps: 0 },
+        other: { minBps: 0, targetBps: 0, maxBps: 1000 }
+      }
+    },
+    {
+      level: 2, templateVersion: RISK_TARGET_VERSION, classes: {
+        cash: { minBps: 2500, targetBps: 3500, maxBps: 5000 },
+        fixed_income: { minBps: 3500, targetBps: 4500, maxBps: 6000 },
+        broad_equity: { minBps: 1000, targetBps: 1500, maxBps: 2500 },
+        theme_equity: { minBps: 0, targetBps: 500, maxBps: 1000 },
+        stock: { minBps: 0, targetBps: 0, maxBps: 0 },
+        other: { minBps: 0, targetBps: 0, maxBps: 1000 }
+      }
+    },
+    {
+      level: 3, templateVersion: RISK_TARGET_VERSION, classes: {
+        cash: { minBps: 1500, targetBps: 2000, maxBps: 3500 },
+        fixed_income: { minBps: 2000, targetBps: 3000, maxBps: 4500 },
+        broad_equity: { minBps: 3000, targetBps: 4000, maxBps: 5000 },
+        theme_equity: { minBps: 500, targetBps: 1000, maxBps: 2000 },
+        stock: { minBps: 0, targetBps: 0, maxBps: 1000 },
+        other: { minBps: 0, targetBps: 0, maxBps: 1000 }
+      }
+    },
+    {
+      level: 4, templateVersion: RISK_TARGET_VERSION, classes: {
+        cash: { minBps: 1000, targetBps: 1500, maxBps: 2500 },
+        fixed_income: { minBps: 1000, targetBps: 1500, maxBps: 3000 },
+        broad_equity: { minBps: 4500, targetBps: 5500, maxBps: 6500 },
+        theme_equity: { minBps: 1000, targetBps: 1500, maxBps: 2500 },
+        stock: { minBps: 0, targetBps: 0, maxBps: 1000 },
+        other: { minBps: 0, targetBps: 0, maxBps: 1000 }
+      }
+    },
+    {
+      level: 5, templateVersion: RISK_TARGET_VERSION, classes: {
+        cash: { minBps: 500, targetBps: 1000, maxBps: 2000 },
+        fixed_income: { minBps: 500, targetBps: 1000, maxBps: 2500 },
+        broad_equity: { minBps: 5500, targetBps: 6500, maxBps: 7500 },
+        theme_equity: { minBps: 1500, targetBps: 1500, maxBps: 3000 },
+        stock: { minBps: 0, targetBps: 0, maxBps: 1500 },
+        other: { minBps: 0, targetBps: 0, maxBps: 1000 }
+      }
+    }
+  ];
+
+  // 容忍带：端点**含入**区间（minBps <= pct <= maxBps → within），边界归属唯一。
+  var TOLERANCE_BANDS = ['below_min', 'within', 'above_max'];
+
+  var ASSESSMENT_VALID_DAYS = 365;      // 正常有效期一年（D-015）
+  var ASSESSMENT_EXPIRING_DAYS = 30;    // 到期前 30 天进入「即将到期」
+  var ASSESSMENT_STATUSES = ['valid', 'expiring_soon', 'expired'];
+
+  // 复评原因词表：市场涨跌**不在**其中（PRODUCT §8 / D-015），
+  // 不得凭行情波动触发降级或复评 —— 未知原因一律拒绝。
+  var REASSESS_REASONS = [
+    'initial', 'annual_expired', 'income_change', 'debt_change',
+    'overseas_status_change', 'major_goal_change', 'liquidity_change', 'manual'
+  ];
+
+  // 稳定错误码：5A 只冻结词表（HTTP 映射属 5B）；缺答 / 未知选项一律 fail closed，不猜默认值。
+  var RISK_ERROR_CODES = [
+    'invalid_answers', 'unknown_question', 'unknown_option', 'duplicate_answer', 'missing_answer',
+    'invalid_assessment_date', 'invalid_reassess_reason', 'invalid_rule_version',
+    'invalid_target_template', 'invalid_proportion', 'invalid_new_funds',
+    'invalid_snapshot_ref', 'invalid_assessment_ref', 'invalid_approved_instruments'
+  ];
+
+  // 建议契约（5D 实现算法、5B/5E 消费）：输入只带引用与用户判断，派生值一律由服务端重算。
+  var RECOMMENDATION_STATUSES = ['formal', 'estimate'];
+  var RECOMMENDATION_INPUT_KEYS = [
+    'snapshotRef', 'assessmentRef', 'targetVersion', 'ruleVersion', 'newFundsMinor', 'approvedInstruments'
+  ];
+  var RECOMMENDATION_OUTPUT_KEYS = [
+    'status', 'blockers', 'dataCutoff', 'currentAllocation', 'targetRanges',
+    'deviations', 'categoryAllocations', 'roundingNote', 'explainCodes', 'versions'
+  ];
+  // 排序与尾差的稳定键：类别恒按 RISK_CLASSES 序，缺口降序在前，同缺口按该序 → 与对象/数据库行序无关。
+  var ALLOCATION_ROUNDING_RULE = '缺口降序 → 同缺口按排列顺序 → 逐类别取整后余额给排序最前者';
+
+  function riskCopy(x) { return JSON.parse(JSON.stringify(x)); }
+
+  function isRiskObject(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
+
+  function isRiskNonEmptyString(v) { return typeof v === 'string' && v.trim() !== ''; }
+
+  function isRiskNonNegInt(v) {
+    return typeof v === 'number' && isFinite(v) && Math.floor(v) === v && v >= 0;
+  }
+
+  function isRiskHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
+
+  // 真实日历日校验（与 server/providers/contract.js 的 isDateString 同口径：月份范围 + 回读一致）。
+  // 只校验形状正则会放过 2026-02-30 这类不存在的日期（G4C-5 的教训）。
+  function isCalendarDate(v) {
+    if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+    var y = Number(v.slice(0, 4)), m = Number(v.slice(5, 7)), d = Number(v.slice(8, 10));
+    if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+    var dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+  }
+
+  function findRiskQuestion(id) {
+    for (var i = 0; i < RISK_QUESTIONS.length; i++) if (RISK_QUESTIONS[i].id === id) return RISK_QUESTIONS[i];
+    return null;
+  }
+
+  // 边界查表：下界含入，返回 <= score 的最大 level（越界向上封顶在最高级）。
+  function levelFromBounds(bounds, score) {
+    if (!isRiskNonNegInt(score)) return null;
+    var out = null;
+    for (var i = 0; i < bounds.length; i++) if (score >= bounds[i].minScore) out = bounds[i].level;
+    return out;
+  }
+
+  // 规则目录（只读副本）：5B 落库、5E 解释卡都从这里取唯一一份定义。
+  function riskCatalog() {
+    return riskCopy({
+      ruleVersion: RISK_RULE_VERSION,
+      targetVersion: RISK_TARGET_VERSION,
+      capacityDimensions: CAPACITY_DIMENSIONS,
+      willingnessDimensions: WILLINGNESS_DIMENSIONS,
+      questions: RISK_QUESTIONS,
+      capacityLevelBounds: CAPACITY_LEVEL_BOUNDS,
+      willingnessLevelBounds: WILLINGNESS_LEVEL_BOUNDS,
+      hardCaps: RISK_HARD_CAPS,
+      levels: RISK_LEVELS,
+      toleranceBands: TOLERANCE_BANDS,
+      validDays: ASSESSMENT_VALID_DAYS,
+      expiringDays: ASSESSMENT_EXPIRING_DAYS,
+      assessmentStatuses: ASSESSMENT_STATUSES,
+      reassessReasons: REASSESS_REASONS,
+      errorCodes: RISK_ERROR_CODES,
+      bpsTotal: BPS_TOTAL
+    });
+  }
+
+  // 答案校验：fail closed。detail 只报「第 N 项」或缺失数量，不回显用户输入原文。
+  function validateRiskAnswers(answers) {
+    if (!Array.isArray(answers)) {
+      return { ok: false, error: { code: 'invalid_answers', detail: 'answers 必须是数组' } };
+    }
+    var seen = {}, picked = [];
+    for (var i = 0; i < answers.length; i++) {
+      var row = answers[i];
+      if (!isRiskObject(row)) {
+        return { ok: false, error: { code: 'invalid_answers', detail: '第 ' + (i + 1) + ' 项不是对象' } };
+      }
+      if (!isRiskNonEmptyString(row.questionId)) {
+        return { ok: false, error: { code: 'invalid_answers', detail: '第 ' + (i + 1) + ' 项缺少 questionId' } };
+      }
+      var q = findRiskQuestion(row.questionId);
+      if (!q) {
+        return { ok: false, error: { code: 'unknown_question', detail: '第 ' + (i + 1) + ' 项不是本规则版本定义的题目' } };
+      }
+      if (seen[q.id]) {
+        return { ok: false, error: { code: 'duplicate_answer', detail: '第 ' + (i + 1) + ' 项重复回答同一题' } };
+      }
+      if (!isRiskNonEmptyString(row.optionId)) {
+        return { ok: false, error: { code: 'invalid_answers', detail: '第 ' + (i + 1) + ' 项缺少 optionId' } };
+      }
+      var opt = null;
+      for (var j = 0; j < q.options.length; j++) if (q.options[j].id === row.optionId) opt = q.options[j];
+      if (!opt) {
+        return { ok: false, error: { code: 'unknown_option', detail: '第 ' + (i + 1) + ' 项的选项不属于该题' } };
+      }
+      seen[q.id] = true;
+      picked.push({ questionId: q.id, optionId: opt.id, score: opt.score, kind: q.kind, dimension: q.dimension });
+    }
+    if (picked.length !== RISK_QUESTIONS.length) {
+      return { ok: false, error: { code: 'missing_answer', detail: '缺少 ' + (RISK_QUESTIONS.length - picked.length) + ' 道题的回答' } };
+    }
+    return { ok: true, answers: picked };
+  }
+
+  // 双评分 + 硬封顶 + 风险上限。上限恒为「较低的那一侧」，硬封顶只能再压低。
+  function scoreRiskAnswers(answers) {
+    var v = validateRiskAnswers(answers);
+    if (!v.ok) return v;
+    var capacityScore = 0, willingnessScore = 0, byQuestion = {};
+    v.answers.forEach(function (a) {
+      byQuestion[a.questionId] = a;
+      if (a.kind === 'capacity') capacityScore += a.score; else willingnessScore += a.score;
+    });
+    var capacityLevel = levelFromBounds(CAPACITY_LEVEL_BOUNDS, capacityScore);
+    var willingnessLevel = levelFromBounds(WILLINGNESS_LEVEL_BOUNDS, willingnessScore);
+    var ceiling = Math.min(capacityLevel, willingnessLevel);
+    var ceilingSource = capacityLevel === willingnessLevel ? 'equal'
+      : (capacityLevel < willingnessLevel ? 'capacity' : 'willingness');
+    var hardCaps = [];
+    RISK_HARD_CAPS.forEach(function (cap) {
+      var hit = byQuestion[cap.questionId];
+      if (hit && hit.score <= cap.maxOptionScore) {
+        hardCaps.push({ code: cap.code, maxLevel: cap.maxLevel, explainKey: cap.explainKey });
+        if (cap.maxLevel < ceiling) { ceiling = cap.maxLevel; ceilingSource = 'hard_cap'; }
+      }
+    });
+    return {
+      ok: true,
+      ruleVersion: RISK_RULE_VERSION,
+      capacityScore: capacityScore,
+      willingnessScore: willingnessScore,
+      capacityLevel: capacityLevel,
+      willingnessLevel: willingnessLevel,
+      hardCaps: hardCaps,
+      ceiling: ceiling,
+      ceilingSource: ceilingSource,
+      explainCodes: ['card-capacity-vs-willingness', 'card-lower-bound-rule'].concat(hardCaps.map(function (c) { return c.code; })),
+      scored: v.answers
+    };
+  }
+
+  // 有效期与复评状态：到期日**当天仍有效**（now <= expiry），次日失效；剩余 <= 30 天为即将到期。
+  function assessmentValidity(assessedAt, now) {
+    if (!isCalendarDate(assessedAt)) {
+      return { ok: false, error: { code: 'invalid_assessment_date', detail: '评估日期必须是真实存在的 YYYY-MM-DD' } };
+    }
+    if (!isCalendarDate(now)) {
+      return { ok: false, error: { code: 'invalid_assessment_date', detail: 'now 必须是真实存在的 YYYY-MM-DD' } };
+    }
+    var expiry = addCalendarDays(assessedAt, ASSESSMENT_VALID_DAYS);
+    var remainingDays = daysBetween(now, expiry);
+    var status = remainingDays < 0 ? 'expired' : (remainingDays <= ASSESSMENT_EXPIRING_DAYS ? 'expiring_soon' : 'valid');
+    return { ok: true, assessedAt: assessedAt, now: now, expiry: expiry, remainingDays: remainingDays, status: status };
+  }
+
+  // 日历日加减（纯 UTC 毫秒运算，不读系统时钟）。
+  function addCalendarDays(dateStr, days) {
+    if (!isCalendarDate(dateStr) || typeof days !== 'number' || Math.floor(days) !== days) return null;
+    var y = Number(dateStr.slice(0, 4)), m = Number(dateStr.slice(5, 7)), d = Number(dateStr.slice(8, 10));
+    var dt = new Date(Date.UTC(y, m - 1, d) + days * 86400000);
+    var mm = dt.getUTCMonth() + 1, dd = dt.getUTCDate();
+    return dt.getUTCFullYear() + '-' + (mm < 10 ? '0' : '') + mm + '-' + (dd < 10 ? '0' : '') + dd;
+  }
+
+  function isReassessReason(v) { return REASSESS_REASONS.indexOf(v) !== -1; }
+
+  // 目标模板合法性：类别不重不漏、0 <= min <= target <= max <= 100%、Σtarget 精确 100%、
+  // Σmin <= 100% <= Σmax。比例非法只报「第 N 类」或类别名，不回显输入原文。
+  function validateTargetTemplate(tpl) {
+    if (!isRiskObject(tpl) || !isRiskObject(tpl.classes)) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: '模板必须带 classes 对象' } };
+    }
+    var targetSum = 0, minSum = 0, maxSum = 0;
+    for (var i = 0; i < RISK_CLASSES.length; i++) {
+      var cls = RISK_CLASSES[i];
+      var row = tpl.classes[cls];
+      if (!isRiskObject(row)) {
+        return { ok: false, error: { code: 'invalid_target_template', detail: '缺少资产类别：' + cls } };
+      }
+      var keys = ['minBps', 'targetBps', 'maxBps'];
+      for (var k = 0; k < keys.length; k++) {
+        if (!isRiskNonNegInt(row[keys[k]]) || row[keys[k]] > BPS_TOTAL) {
+          return { ok: false, error: { code: 'invalid_proportion', detail: '类别 ' + cls + ' 的 ' + keys[k] + ' 非法' } };
+        }
+      }
+      if (row.minBps > row.targetBps || row.targetBps > row.maxBps) {
+        return { ok: false, error: { code: 'invalid_proportion', detail: '类别 ' + cls + ' 不满足 min <= target <= max' } };
+      }
+      minSum += row.minBps; targetSum += row.targetBps; maxSum += row.maxBps;
+    }
+    if (targetSum !== BPS_TOTAL) {
+      return { ok: false, error: { code: 'invalid_proportion', detail: '各类 targetBps 合计必须精确为 ' + BPS_TOTAL } };
+    }
+    if (minSum > BPS_TOTAL || maxSum < BPS_TOTAL) {
+      return { ok: false, error: { code: 'invalid_proportion', detail: '必须满足 Σmin <= ' + BPS_TOTAL + ' <= Σmax' } };
+    }
+    return { ok: true };
+  }
+
+  function targetTemplateForLevel(level) {
+    for (var i = 0; i < TARGET_TEMPLATES.length; i++) if (TARGET_TEMPLATES[i].level === level) return riskCopy(TARGET_TEMPLATES[i]);
+    return null;
+  }
+
+  // 容忍带：端点含入区间。
+  function compareToRange(pctBps, minBps, maxBps) {
+    if (!isRiskNonNegInt(pctBps) || !isRiskNonNegInt(minBps) || !isRiskNonNegInt(maxBps)) return null;
+    if (minBps > maxBps) return null;
+    if (pctBps < minBps) return 'below_min';
+    if (pctBps > maxBps) return 'above_max';
+    return 'within';
+  }
+
+  // 建议输入契约：只校验形状与引用完整性，不采信任何派生值（当前比例 / 分数 / 等级 / blocker 一律由服务端重算）。
+  function validateRecommendationRequest(payload) {
+    if (!isRiskObject(payload)) return { ok: false, error: { code: 'invalid_snapshot_ref', detail: '请求体必须是对象' } };
+    var snap = payload.snapshotRef;
+    if (!isRiskObject(snap) || !isRiskNonEmptyString(snap.closeId) || !isRiskNonEmptyString(snap.snapshotId) || !isRiskHex64(snap.payloadHash)) {
+      return { ok: false, error: { code: 'invalid_snapshot_ref', detail: 'snapshotRef 必须带 closeId / snapshotId / 64 位十六进制 payloadHash' } };
+    }
+    var at = payload.assessmentRef;
+    if (!isRiskObject(at) || !isRiskNonEmptyString(at.id) || !isRiskNonEmptyString(at.ruleVersion)) {
+      return { ok: false, error: { code: 'invalid_assessment_ref', detail: 'assessmentRef 必须带 id 与 ruleVersion' } };
+    }
+    if (at.ruleVersion !== RISK_RULE_VERSION) {
+      return { ok: false, error: { code: 'invalid_rule_version', detail: '评估所用规则版本不是当前可用版本' } };
+    }
+    if (payload.ruleVersion !== RISK_RULE_VERSION) {
+      return { ok: false, error: { code: 'invalid_rule_version', detail: 'ruleVersion 与当前规则版本不一致' } };
+    }
+    if (!isRiskNonEmptyString(payload.targetVersion)) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: 'targetVersion 必填' } };
+    }
+    if (!isRiskNonNegInt(payload.newFundsMinor)) {
+      return { ok: false, error: { code: 'invalid_new_funds', detail: 'newFundsMinor 必须是非负整数（最小货币单位）' } };
+    }
+    var map = payload.approvedInstruments;
+    if (map == null) return { ok: true, approvedInstruments: {} };
+    if (!isRiskObject(map)) {
+      return { ok: false, error: { code: 'invalid_approved_instruments', detail: 'approvedInstruments 必须是「类别 → 标的 id 数组」对象' } };
+    }
+    var out = {};
+    for (var i = 0; i < RISK_CLASSES.length; i++) {
+      var cls = RISK_CLASSES[i];
+      if (map[cls] == null) continue;
+      if (!Array.isArray(map[cls])) {
+        return { ok: false, error: { code: 'invalid_approved_instruments', detail: '类别 ' + cls + ' 的映射必须是数组' } };
+      }
+      for (var j = 0; j < map[cls].length; j++) {
+        if (!isRiskNonEmptyString(map[cls][j])) {
+          return { ok: false, error: { code: 'invalid_approved_instruments', detail: '类别 ' + cls + ' 第 ' + (j + 1) + ' 个标的不合法' } };
+        }
+      }
+      out[cls] = map[cls].slice();
+    }
+    for (var key in map) {
+      if (Object.prototype.hasOwnProperty.call(map, key) && RISK_CLASSES.indexOf(key) === -1) {
+        return { ok: false, error: { code: 'invalid_approved_instruments', detail: '出现未知资产类别：' + key } };
+      }
+    }
+    return { ok: true, approvedInstruments: out };
+  }
+
+  // 契约快照：5B / 5D / 5E 从这里取键集合与排序规则，避免各处硬编码分叉。
+  function recommendationContract() {
+    return riskCopy({
+      inputKeys: RECOMMENDATION_INPUT_KEYS,
+      outputKeys: RECOMMENDATION_OUTPUT_KEYS,
+      statuses: RECOMMENDATION_STATUSES,
+      allocationOrder: RISK_CLASSES,
+      roundingRule: ALLOCATION_ROUNDING_RULE,
+      toleranceBands: TOLERANCE_BANDS,
+      ruleVersion: RISK_RULE_VERSION,
+      targetVersion: RISK_TARGET_VERSION,
+      bpsTotal: BPS_TOTAL
+    });
+  }
+
   return {
     CURRENCIES: CURRENCIES,
     POOLS: POOLS,
@@ -1655,6 +2135,40 @@
     normalizeAssets: normalizeAssets,
     computeOverview: computeOverview,
     computeCloseChecklist: computeCloseChecklist,
-    emergencyCoverageMonths: emergencyCoverageMonths
+    emergencyCoverageMonths: emergencyCoverageMonths,
+    /* Phase 5A：风险问卷规则与配置契约（D-046）—— 规则数据与纯契约函数，无存储 / API / 页面依赖 */
+    RISK_RULE_VERSION: RISK_RULE_VERSION,
+    RISK_TARGET_VERSION: RISK_TARGET_VERSION,
+    BPS_TOTAL: BPS_TOTAL,
+    RISK_LEVELS: RISK_LEVELS,
+    CAPACITY_DIMENSIONS: CAPACITY_DIMENSIONS,
+    WILLINGNESS_DIMENSIONS: WILLINGNESS_DIMENSIONS,
+    RISK_QUESTIONS: RISK_QUESTIONS,
+    CAPACITY_LEVEL_BOUNDS: CAPACITY_LEVEL_BOUNDS,
+    WILLINGNESS_LEVEL_BOUNDS: WILLINGNESS_LEVEL_BOUNDS,
+    RISK_HARD_CAPS: RISK_HARD_CAPS,
+    TARGET_TEMPLATES: TARGET_TEMPLATES,
+    TOLERANCE_BANDS: TOLERANCE_BANDS,
+    ASSESSMENT_VALID_DAYS: ASSESSMENT_VALID_DAYS,
+    ASSESSMENT_EXPIRING_DAYS: ASSESSMENT_EXPIRING_DAYS,
+    ASSESSMENT_STATUSES: ASSESSMENT_STATUSES,
+    REASSESS_REASONS: REASSESS_REASONS,
+    RISK_ERROR_CODES: RISK_ERROR_CODES,
+    RECOMMENDATION_STATUSES: RECOMMENDATION_STATUSES,
+    RECOMMENDATION_INPUT_KEYS: RECOMMENDATION_INPUT_KEYS,
+    RECOMMENDATION_OUTPUT_KEYS: RECOMMENDATION_OUTPUT_KEYS,
+    ALLOCATION_ROUNDING_RULE: ALLOCATION_ROUNDING_RULE,
+    riskCatalog: riskCatalog,
+    isCalendarDate: isCalendarDate,
+    addCalendarDays: addCalendarDays,
+    validateRiskAnswers: validateRiskAnswers,
+    scoreRiskAnswers: scoreRiskAnswers,
+    assessmentValidity: assessmentValidity,
+    isReassessReason: isReassessReason,
+    validateTargetTemplate: validateTargetTemplate,
+    targetTemplateForLevel: targetTemplateForLevel,
+    compareToRange: compareToRange,
+    validateRecommendationRequest: validateRecommendationRequest,
+    recommendationContract: recommendationContract
   };
 });

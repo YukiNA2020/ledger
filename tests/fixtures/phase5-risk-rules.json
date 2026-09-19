@@ -1,0 +1,768 @@
+{
+  "fixtureVersion": 1,
+  "frozenAt": "2026-09-19",
+  "note": "Phase 5A 规则冻结快照（DECISIONS D-046）。运行时唯一来源是 js/domain.js；本文件是测试侧可复核副本，测试逐字段比对两者 —— 任何题目 / 分值 / 边界 / 模板改动都必须同时改这里，形成留痕。",
+  "ruleVersion": "risk-rules-v1",
+  "targetVersion": "risk-targets-v1",
+  "bpsTotal": 10000,
+  "capacityDimensions": [
+    "income_stability",
+    "emergency_fund",
+    "debt_pressure",
+    "horizon",
+    "liquidity_need"
+  ],
+  "willingnessDimensions": [
+    "experience",
+    "knowledge",
+    "drawdown_tolerance",
+    "fx_understanding"
+  ],
+  "questions": [
+    {
+      "id": "q_income_stability",
+      "kind": "capacity",
+      "dimension": "income_stability",
+      "explainKey": "card-income-stability",
+      "options": [
+        {
+          "id": "o_fixed_stable",
+          "score": 3
+        },
+        {
+          "id": "o_variable_predictable",
+          "score": 2
+        },
+        {
+          "id": "o_irregular",
+          "score": 1
+        },
+        {
+          "id": "o_no_stable_income",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_emergency_fund",
+      "kind": "capacity",
+      "dimension": "emergency_fund",
+      "explainKey": "card-emergency-fund",
+      "options": [
+        {
+          "id": "o_cover_12m_plus",
+          "score": 3
+        },
+        {
+          "id": "o_cover_6_12m",
+          "score": 2
+        },
+        {
+          "id": "o_cover_3_6m",
+          "score": 1
+        },
+        {
+          "id": "o_cover_under_3m",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_debt_pressure",
+      "kind": "capacity",
+      "dimension": "debt_pressure",
+      "explainKey": "card-debt-pressure",
+      "options": [
+        {
+          "id": "o_no_debt",
+          "score": 3
+        },
+        {
+          "id": "o_manageable",
+          "score": 2
+        },
+        {
+          "id": "o_heavy",
+          "score": 1
+        },
+        {
+          "id": "o_current_due_or_overdue",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_horizon",
+      "kind": "capacity",
+      "dimension": "horizon",
+      "explainKey": "card-horizon",
+      "options": [
+        {
+          "id": "o_horizon_10y_plus",
+          "score": 3
+        },
+        {
+          "id": "o_horizon_5_10y",
+          "score": 2
+        },
+        {
+          "id": "o_horizon_3_5y",
+          "score": 1
+        },
+        {
+          "id": "o_horizon_under_3y",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_liquidity_need",
+      "kind": "capacity",
+      "dimension": "liquidity_need",
+      "explainKey": "card-liquidity-need",
+      "options": [
+        {
+          "id": "o_no_need",
+          "score": 3
+        },
+        {
+          "id": "o_minor_need",
+          "score": 2
+        },
+        {
+          "id": "o_planned_1_3y",
+          "score": 1
+        },
+        {
+          "id": "o_large_within_1y",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_experience",
+      "kind": "willingness",
+      "dimension": "experience",
+      "explainKey": "card-experience",
+      "options": [
+        {
+          "id": "o_exp_5y_plus",
+          "score": 3
+        },
+        {
+          "id": "o_exp_2_5y",
+          "score": 2
+        },
+        {
+          "id": "o_exp_under_2y",
+          "score": 1
+        },
+        {
+          "id": "o_exp_none",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_knowledge",
+      "kind": "willingness",
+      "dimension": "knowledge",
+      "explainKey": "card-knowledge",
+      "options": [
+        {
+          "id": "o_know_solid",
+          "score": 3
+        },
+        {
+          "id": "o_know_basic",
+          "score": 2
+        },
+        {
+          "id": "o_know_limited",
+          "score": 1
+        },
+        {
+          "id": "o_know_none",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_drawdown_tolerance",
+      "kind": "willingness",
+      "dimension": "drawdown_tolerance",
+      "explainKey": "card-drawdown",
+      "options": [
+        {
+          "id": "o_dd_over_30",
+          "score": 3
+        },
+        {
+          "id": "o_dd_20_30",
+          "score": 2
+        },
+        {
+          "id": "o_dd_10_20",
+          "score": 1
+        },
+        {
+          "id": "o_dd_under_10",
+          "score": 0
+        }
+      ]
+    },
+    {
+      "id": "q_fx_understanding",
+      "kind": "willingness",
+      "dimension": "fx_understanding",
+      "explainKey": "card-fx-risk",
+      "options": [
+        {
+          "id": "o_fx_clear",
+          "score": 3
+        },
+        {
+          "id": "o_fx_partial",
+          "score": 2
+        },
+        {
+          "id": "o_fx_limited",
+          "score": 1
+        },
+        {
+          "id": "o_fx_none",
+          "score": 0
+        }
+      ]
+    }
+  ],
+  "capacityLevelBounds": [
+    {
+      "level": 1,
+      "minScore": 0
+    },
+    {
+      "level": 2,
+      "minScore": 4
+    },
+    {
+      "level": 3,
+      "minScore": 7
+    },
+    {
+      "level": 4,
+      "minScore": 10
+    },
+    {
+      "level": 5,
+      "minScore": 13
+    }
+  ],
+  "willingnessLevelBounds": [
+    {
+      "level": 1,
+      "minScore": 0
+    },
+    {
+      "level": 2,
+      "minScore": 3
+    },
+    {
+      "level": 3,
+      "minScore": 6
+    },
+    {
+      "level": 4,
+      "minScore": 9
+    },
+    {
+      "level": 5,
+      "minScore": 11
+    }
+  ],
+  "hardCaps": [
+    {
+      "code": "hard_cap_emergency_fund",
+      "questionId": "q_emergency_fund",
+      "maxOptionScore": 0,
+      "maxLevel": 2,
+      "explainKey": "card-emergency-fund"
+    },
+    {
+      "code": "hard_cap_income_stability",
+      "questionId": "q_income_stability",
+      "maxOptionScore": 0,
+      "maxLevel": 2,
+      "explainKey": "card-income-stability"
+    },
+    {
+      "code": "hard_cap_liquidity_need",
+      "questionId": "q_liquidity_need",
+      "maxOptionScore": 0,
+      "maxLevel": 2,
+      "explainKey": "card-liquidity-need"
+    },
+    {
+      "code": "hard_cap_debt_pressure",
+      "questionId": "q_debt_pressure",
+      "maxOptionScore": 0,
+      "maxLevel": 2,
+      "explainKey": "card-debt-pressure"
+    }
+  ],
+  "targetTemplates": [
+    {
+      "level": 1,
+      "templateVersion": "risk-targets-v1",
+      "classes": {
+        "cash": {
+          "minBps": 4000,
+          "targetBps": 5000,
+          "maxBps": 6500
+        },
+        "fixed_income": {
+          "minBps": 3000,
+          "targetBps": 4000,
+          "maxBps": 5500
+        },
+        "broad_equity": {
+          "minBps": 0,
+          "targetBps": 1000,
+          "maxBps": 1500
+        },
+        "theme_equity": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 500
+        },
+        "stock": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 0
+        },
+        "other": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        }
+      }
+    },
+    {
+      "level": 2,
+      "templateVersion": "risk-targets-v1",
+      "classes": {
+        "cash": {
+          "minBps": 2500,
+          "targetBps": 3500,
+          "maxBps": 5000
+        },
+        "fixed_income": {
+          "minBps": 3500,
+          "targetBps": 4500,
+          "maxBps": 6000
+        },
+        "broad_equity": {
+          "minBps": 1000,
+          "targetBps": 1500,
+          "maxBps": 2500
+        },
+        "theme_equity": {
+          "minBps": 0,
+          "targetBps": 500,
+          "maxBps": 1000
+        },
+        "stock": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 0
+        },
+        "other": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        }
+      }
+    },
+    {
+      "level": 3,
+      "templateVersion": "risk-targets-v1",
+      "classes": {
+        "cash": {
+          "minBps": 1500,
+          "targetBps": 2000,
+          "maxBps": 3500
+        },
+        "fixed_income": {
+          "minBps": 2000,
+          "targetBps": 3000,
+          "maxBps": 4500
+        },
+        "broad_equity": {
+          "minBps": 3000,
+          "targetBps": 4000,
+          "maxBps": 5000
+        },
+        "theme_equity": {
+          "minBps": 500,
+          "targetBps": 1000,
+          "maxBps": 2000
+        },
+        "stock": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        },
+        "other": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        }
+      }
+    },
+    {
+      "level": 4,
+      "templateVersion": "risk-targets-v1",
+      "classes": {
+        "cash": {
+          "minBps": 1000,
+          "targetBps": 1500,
+          "maxBps": 2500
+        },
+        "fixed_income": {
+          "minBps": 1000,
+          "targetBps": 1500,
+          "maxBps": 3000
+        },
+        "broad_equity": {
+          "minBps": 4500,
+          "targetBps": 5500,
+          "maxBps": 6500
+        },
+        "theme_equity": {
+          "minBps": 1000,
+          "targetBps": 1500,
+          "maxBps": 2500
+        },
+        "stock": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        },
+        "other": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        }
+      }
+    },
+    {
+      "level": 5,
+      "templateVersion": "risk-targets-v1",
+      "classes": {
+        "cash": {
+          "minBps": 500,
+          "targetBps": 1000,
+          "maxBps": 2000
+        },
+        "fixed_income": {
+          "minBps": 500,
+          "targetBps": 1000,
+          "maxBps": 2500
+        },
+        "broad_equity": {
+          "minBps": 5500,
+          "targetBps": 6500,
+          "maxBps": 7500
+        },
+        "theme_equity": {
+          "minBps": 1500,
+          "targetBps": 1500,
+          "maxBps": 3000
+        },
+        "stock": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1500
+        },
+        "other": {
+          "minBps": 0,
+          "targetBps": 0,
+          "maxBps": 1000
+        }
+      }
+    }
+  ],
+  "toleranceBands": [
+    "below_min",
+    "within",
+    "above_max"
+  ],
+  "assessment": {
+    "validDays": 365,
+    "expiringDays": 30,
+    "statuses": [
+      "valid",
+      "expiring_soon",
+      "expired"
+    ],
+    "reassessReasons": [
+      "initial",
+      "annual_expired",
+      "income_change",
+      "debt_change",
+      "overseas_status_change",
+      "major_goal_change",
+      "liquidity_change",
+      "manual"
+    ]
+  },
+  "errorCodes": [
+    "invalid_answers",
+    "unknown_question",
+    "unknown_option",
+    "duplicate_answer",
+    "missing_answer",
+    "invalid_assessment_date",
+    "invalid_reassess_reason",
+    "invalid_rule_version",
+    "invalid_target_template",
+    "invalid_proportion",
+    "invalid_new_funds",
+    "invalid_snapshot_ref",
+    "invalid_assessment_ref",
+    "invalid_approved_instruments"
+  ],
+  "recommendationContract": {
+    "inputKeys": [
+      "snapshotRef",
+      "assessmentRef",
+      "targetVersion",
+      "ruleVersion",
+      "newFundsMinor",
+      "approvedInstruments"
+    ],
+    "outputKeys": [
+      "status",
+      "blockers",
+      "dataCutoff",
+      "currentAllocation",
+      "targetRanges",
+      "deviations",
+      "categoryAllocations",
+      "roundingNote",
+      "explainCodes",
+      "versions"
+    ],
+    "statuses": [
+      "formal",
+      "estimate"
+    ],
+    "allocationOrder": [
+      "cash",
+      "fixed_income",
+      "broad_equity",
+      "theme_equity",
+      "stock",
+      "other"
+    ],
+    "roundingRule": "缺口降序 → 同缺口按排列顺序 → 逐类别取整后余额给排序最前者",
+    "toleranceBands": [
+      "below_min",
+      "within",
+      "above_max"
+    ],
+    "ruleVersion": "risk-rules-v1",
+    "targetVersion": "risk-targets-v1",
+    "bpsTotal": 10000
+  },
+  "samples": {
+    "S5_1": {
+      "note": "高意愿 + 应急金不足 + 收入不稳定：最终上限取较低的客观承受能力，不因意愿高而放宽",
+      "verifiesIn": "5A",
+      "answers": [
+        {
+          "questionId": "q_income_stability",
+          "optionId": "o_no_stable_income"
+        },
+        {
+          "questionId": "q_emergency_fund",
+          "optionId": "o_cover_under_3m"
+        },
+        {
+          "questionId": "q_debt_pressure",
+          "optionId": "o_no_debt"
+        },
+        {
+          "questionId": "q_horizon",
+          "optionId": "o_horizon_3_5y"
+        },
+        {
+          "questionId": "q_liquidity_need",
+          "optionId": "o_large_within_1y"
+        },
+        {
+          "questionId": "q_experience",
+          "optionId": "o_exp_5y_plus"
+        },
+        {
+          "questionId": "q_knowledge",
+          "optionId": "o_know_solid"
+        },
+        {
+          "questionId": "q_drawdown_tolerance",
+          "optionId": "o_dd_over_30"
+        },
+        {
+          "questionId": "q_fx_understanding",
+          "optionId": "o_fx_clear"
+        }
+      ],
+      "expect": {
+        "capacityScore": 4,
+        "willingnessScore": 12,
+        "capacityLevel": 2,
+        "willingnessLevel": 5,
+        "ceiling": 2,
+        "ceilingSource": "capacity",
+        "hardCaps": [
+          "hard_cap_emergency_fund",
+          "hard_cap_income_stability",
+          "hard_cap_liquidity_need"
+        ]
+      }
+    },
+    "S5_2": {
+      "note": "宽基权益低于目标区间、其他类别在区间内；输入本月新增资金 CNY 2,000 → 优先补宽基权益、金额守恒、不卖出",
+      "verifiesIn": "5D",
+      "asOf": "2026-09-30",
+      "riskCeiling": 3,
+      "targetVersion": "risk-targets-v1",
+      "newFundsMinor": 200000,
+      "currentAllocationBps": {
+        "cash": 5000,
+        "fixed_income": 3500,
+        "broad_equity": 800,
+        "theme_equity": 700,
+        "stock": 0,
+        "other": 0
+      },
+      "expect": {
+        "primaryCategory": "broad_equity",
+        "allocatedTotalMinor": 200000,
+        "sellOrders": []
+      }
+    },
+    "S5_3": {
+      "note": "行情过期 / 分类未确认 / 月结未完成（以及快照哈希异常、风险评估过期）→ 只给估算与待办，正式建议为空",
+      "verifiesIn": "5D",
+      "cases": [
+        "quote_stale",
+        "classification_unconfirmed",
+        "close_incomplete",
+        "baseline_hash_mismatch",
+        "assessment_expired"
+      ],
+      "expect": {
+        "status": "estimate",
+        "formalRecommendation": null
+      }
+    }
+  },
+  "boundaryMatrix": [
+    {
+      "case": "评分恰好落在分段下界",
+      "expect": "归入该级（下界含入）",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "全部最差档",
+      "expect": "能力 0 分 → L1、意愿 0 分 → L1，上限 1",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "全部最好档",
+      "expect": "能力 15 分 → L5、意愿 12 分 → L5，上限 5",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "高意愿 + 应急金不足 + 收入不稳定",
+      "expect": "上限取较低的能力侧，并列出硬封顶原因",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "问卷缺答",
+      "expect": "missing_answer，不猜默认答案",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "未知题目 / 未知选项 / 重复回答",
+      "expect": "unknown_question / unknown_option / duplicate_answer",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "目标模板比例非法或 target 合计不为 100%",
+      "expect": "invalid_proportion，fail closed",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "评估恰好到期（now == expiry）",
+      "expect": "当天仍有效（expiring_soon），次日 expired",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "市场涨跌作为复评原因",
+      "expect": "不在词表内，拒绝且不触发降级",
+      "verifiesIn": "5A"
+    },
+    {
+      "case": "0 元新增资金",
+      "expect": "结果明确、无负数",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "1 分 / 极小金额",
+      "expect": "尾差按稳定键处理并在输出中说明",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "新增资金超过可新增投资资金上限",
+      "expect": "取上限并明确提示，不静默当作可用",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "所有类别都在区间内",
+      "expect": "明确「在容忍带内」，不强造分配",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "多个类别同时低配",
+      "expect": "顺序与比例稳定，不受数据库行序影响",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "某类别高配",
+      "expect": "0 新增资金 + 风险提示，绝不返回负金额或卖出指令",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "无认可标的",
+      "expect": "类别偏离照常显示，具体证券映射为空",
+      "verifiesIn": "5C"
+    },
+    {
+      "case": "行情过期 / 分类未确认 / 月结未完成",
+      "expect": "仅估算与待办，正式建议为空",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "快照哈希异常",
+      "expect": "fail closed，不使用被篡改事实生成建议",
+      "verifiesIn": "5D"
+    },
+    {
+      "case": "风险评估过期",
+      "expect": "不生成正式建议，指向复评入口",
+      "verifiesIn": "5D"
+    }
+  ]
+}
