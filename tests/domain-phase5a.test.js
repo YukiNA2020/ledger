@@ -429,3 +429,236 @@ test('5A-18 范围守卫：零迁移、零新路由、零网络、零随机、�
     assert.strictEqual(seg.indexOf(frag), -1, 'Phase 5A 段落不得出现 ' + frag);
   });
 });
+
+/* ------------------- 7. 第二轮复核补口反例（G5A-1 / G5A-2 / G5A-3，2026-09-19） -------------------
+ * 上一轮 504/504 全绿却没通过验收，缺的不是主路径断言，而是**反向**断言：
+ * 「不许发生的事能不能真的不发生」。下面每一条对应 PHASE5A_ACCEPTANCE_GAPS.md 的一个修复门槛，
+ * 把实现退回旧版即会变红。
+ */
+
+// 冻结对象上的写入在严格模式抛 TypeError、非严格模式静默失败，两种都算「拒绝修改」。
+function tryMutate(fn) {
+  try { fn(); return 'silent'; } catch (e) { return 'threw'; }
+}
+
+test('5A-19 G5A-1 反例：原地修改对外规则对象不得改变评分，规则内容与版本必须同时不变', () => {
+  const answers = Domain.RISK_QUESTIONS.map((q) => ({ questionId: q.id, optionId: q.options[0].id }));
+  const before = Domain.scoreRiskAnswers(answers);
+  const tplBefore = Domain.targetTemplateForLevel(3);
+  const catBefore = Domain.riskCatalog();
+  const contractBefore = Domain.recommendationContract();
+  assert.strictEqual(before.capacityScore, 15, '前置：每题都选最优档 = 满分 15');
+
+  // 复现原文：改第二层的选项分值（只冻第一层就挡不住这一条）
+  const attempts = [
+    ['选项分值（复现原文）', () => { Domain.RISK_QUESTIONS[0].options[0].score = 0; }],
+    ['题目 id', () => { Domain.RISK_QUESTIONS[0].id = 'q_hacked'; }],
+    ['题目维度', () => { Domain.RISK_QUESTIONS[0].dimension = 'hacked'; }],
+    ['题库增删（push）', () => { Domain.RISK_QUESTIONS.push({ id: 'q_extra', kind: 'capacity', dimension: 'x', explainKey: 'x', options: [] }); }],
+    ['题库增删（delete）', () => { delete Domain.RISK_QUESTIONS[0]; }],
+    ['选项数组 push', () => { Domain.RISK_QUESTIONS[1].options.push({ id: 'o_extra', score: 3 }); }],
+    ['能力等级边界', () => { Domain.CAPACITY_LEVEL_BOUNDS[1].minScore = 0; }],
+    ['意愿等级边界', () => { Domain.WILLINGNESS_LEVEL_BOUNDS[0].minScore = 12; }],
+    ['硬封顶等级', () => { Domain.RISK_HARD_CAPS[0].maxLevel = 5; }],
+    ['硬封顶题目 id', () => { Domain.RISK_HARD_CAPS[0].questionId = 'q_horizon'; }],
+    ['目标模板比例', () => { Domain.TARGET_TEMPLATES[2].classes.cash.targetBps = 9999; }],
+    ['目标模板增类别', () => { Domain.TARGET_TEMPLATES[0].classes.crypto = { minBps: 0, targetBps: 0, maxBps: 0 }; }],
+    ['目标模板删类别', () => { delete Domain.TARGET_TEMPLATES[2].classes.stock; }],
+    ['资产类别词表', () => { Domain.RISK_CLASSES.push('crypto'); }],
+    ['错误码词表', () => { Domain.RISK_ERROR_CODES.push('fake_code'); }],
+    ['复评原因词表', () => { Domain.REASSESS_REASONS.push('market_move'); }]
+  ];
+  // 说明：`ASSESSMENT_VALID_DAYS` / `RISK_RULE_VERSION` 是常量**值**，Object.freeze 对它不适用；
+  // 而且给对外属性整体赋值本来就只影响调用方自己的视图，不影响内部逻辑（不变量 10 的守护点是
+  // 「内部逻辑不消费调用方可改的引用」）。这一类单独放在下面的 try/finally 里验证并保证复原。
+  attempts.forEach(([name, fn]) => {
+    const mode = tryMutate(fn);
+    assert.ok(mode === 'threw' || mode === 'silent', '修改尝试只允许被拒绝：' + name);
+  });
+
+  // 结果不变（这才是缺口真正要挡的：同版本、同答案 → 同结果）
+  const after = Domain.scoreRiskAnswers(answers);
+  assert.deepStrictEqual(after, before, '对外规则对象被改后评分必须完全不变');
+  assert.strictEqual(after.capacityScore, 15, '15 分不得变成 12 分');
+  assert.strictEqual(after.ruleVersion, 'risk-rules-v1');
+  assert.deepStrictEqual(Domain.targetTemplateForLevel(3), tplBefore, '模板查表必须完全不变');
+  assert.deepStrictEqual(Domain.riskCatalog(), catBefore, '规则目录必须完全不变');
+  assert.deepStrictEqual(Domain.recommendationContract(), contractBefore, '契约快照必须完全不变');
+  assert.strictEqual(Domain.validateTargetTemplate(tplBefore).ok, true, '内置模板仍须自校验通过');
+
+  // 「内容已变而版本保持原值」在这里结构性地不可能：内容必须仍与 fixture 冻结副本逐字段一致
+  assert.deepStrictEqual(Domain.RISK_QUESTIONS, FIXTURE.questions);
+  assert.deepStrictEqual(Domain.TARGET_TEMPLATES, FIXTURE.targetTemplates);
+  assert.deepStrictEqual(Domain.CAPACITY_LEVEL_BOUNDS, FIXTURE.capacityLevelBounds);
+  assert.deepStrictEqual(Domain.WILLINGNESS_LEVEL_BOUNDS, FIXTURE.willingnessLevelBounds);
+  assert.deepStrictEqual(Domain.RISK_HARD_CAPS, FIXTURE.hardCaps);
+  assert.deepStrictEqual(Domain.RISK_ERROR_CODES, FIXTURE.errorCodes);
+  assert.deepStrictEqual(Domain.REASSESS_REASONS, FIXTURE.assessment.reassessReasons);
+  // 版本字段：只看内部逻辑读到的值（对外属性属于调用方自己的视图，下面单独验证）
+  assert.strictEqual(Domain.riskCatalog().ruleVersion, FIXTURE.ruleVersion);
+  assert.strictEqual(Domain.riskCatalog().targetVersion, FIXTURE.targetVersion);
+  assert.strictEqual(after.ruleVersion, FIXTURE.ruleVersion);
+
+  // 深层冻结：逐层检查，不只第一层（复现原文改的正是第二层）
+  [
+    Domain.RISK_QUESTIONS, Domain.RISK_QUESTIONS[0], Domain.RISK_QUESTIONS[0].options, Domain.RISK_QUESTIONS[0].options[0],
+    Domain.CAPACITY_LEVEL_BOUNDS, Domain.CAPACITY_LEVEL_BOUNDS[1], Domain.WILLINGNESS_LEVEL_BOUNDS[4],
+    Domain.RISK_HARD_CAPS, Domain.RISK_HARD_CAPS[0],
+    Domain.TARGET_TEMPLATES, Domain.TARGET_TEMPLATES[2], Domain.TARGET_TEMPLATES[2].classes, Domain.TARGET_TEMPLATES[2].classes.cash,
+    Domain.RISK_CLASSES, Domain.RISK_LEVELS, Domain.RISK_ERROR_CODES, Domain.REASSESS_REASONS,
+    Domain.TOLERANCE_BANDS, Domain.ASSESSMENT_STATUSES, Domain.CAPACITY_DIMENSIONS, Domain.WILLINGNESS_DIMENSIONS,
+    Domain.RECOMMENDATION_INPUT_KEYS
+  ].forEach((o) => assert.strictEqual(Object.isFrozen(o), true, '规则对象必须冻结：' + JSON.stringify(o).slice(0, 40)));
+
+  // 内部逻辑不得消费调用方可改的引用：连对外键整体换掉也不得影响结果。
+  // 用 try/finally 保证**无论断言成败都复原**对外键（否则会污染同进程后续用例）。
+  const saved = {
+    RISK_QUESTIONS: Domain.RISK_QUESTIONS, TARGET_TEMPLATES: Domain.TARGET_TEMPLATES,
+    CAPACITY_LEVEL_BOUNDS: Domain.CAPACITY_LEVEL_BOUNDS, RISK_HARD_CAPS: Domain.RISK_HARD_CAPS,
+    RISK_ERROR_CODES: Domain.RISK_ERROR_CODES, RISK_RULE_VERSION: Domain.RISK_RULE_VERSION,
+    RISK_TARGET_VERSION: Domain.RISK_TARGET_VERSION, ASSESSMENT_VALID_DAYS: Domain.ASSESSMENT_VALID_DAYS
+  };
+  try {
+    tryMutate(() => {
+      Object.keys(saved).forEach((k) => { Domain[k] = Array.isArray(saved[k]) ? [] : (typeof saved[k] === 'string' ? 'hacked-version' : 1); });
+    });
+    assert.deepStrictEqual(Domain.scoreRiskAnswers(answers), before, '换掉对外键不得影响评分');
+    assert.deepStrictEqual(Domain.targetTemplateForLevel(3), tplBefore, '换掉对外键不得影响模板查表');
+    assert.strictEqual(Domain.validateTargetTemplate(tplBefore).ok, true, '换掉对外键不得影响模板校验');
+    assert.strictEqual(Domain.assessmentValidity('2026-01-01', '2026-06-01').expiry, '2027-01-01', '换掉对外键不得影响有效期');
+    // 契约校验用 fixture 里的版本值构造请求：内部版本不会因为对外属性被换掉而改变
+    assert.strictEqual(Domain.validateRecommendationRequest({
+      snapshotRef: { closeId: 'close-1', snapshotId: 'snap-1', payloadHash: 'a'.repeat(64) },
+      assessmentRef: { id: 'ra-1', ruleVersion: FIXTURE.ruleVersion },
+      targetVersion: FIXTURE.targetVersion,
+      ruleVersion: FIXTURE.ruleVersion,
+      newFundsMinor: 200000,
+      approvedInstruments: {}
+    }).ok, true, '换掉对外键不得影响契约校验');
+  } finally {
+    tryMutate(() => { Object.keys(saved).forEach((k) => { Domain[k] = saved[k]; }); });
+  }
+  Object.keys(saved).forEach((k) => {
+    assert.deepStrictEqual(Domain[k], saved[k], '本用例必须收尾复原对外键：' + k);
+  });
+  assert.deepStrictEqual(Domain.RISK_QUESTIONS, FIXTURE.questions, '复原后仍须等于冻结副本');
+});
+
+test('5A-20 G5A-2 反例：未知 / 空 / 错配 targetVersion 一律 fail closed', () => {
+  const req = sampleRequest();
+  assert.strictEqual(Domain.validateRecommendationRequest(req).ok, true, '前置：合法请求仍须通过');
+
+  const bad = [
+    'risk-targets-unknown', 'risk-targets-v2', 'risk-targets-v0', 'risk-targets-v1 ',
+    ' risk-targets-v1', 'Risk-Targets-V1', 'risk-targets-v1.0', 'risk-targets',
+    Domain.RISK_RULE_VERSION,                    // 交叉错配：拿规则版本当目标版本
+    '', '   ', null, true, 1, [], {}, undefined
+  ];
+  bad.forEach((v) => {
+    const r = Domain.validateRecommendationRequest(Object.assign({}, req, { targetVersion: v }));
+    assert.strictEqual(r.ok, false, '未知目标版本必须拒绝：' + JSON.stringify(v));
+    assert.strictEqual(r.error.code, 'invalid_target_template');
+  });
+
+  // 规则版本与目标版本不得互换（两个字段各自只认自己的版本）
+  const swapped = Object.assign({}, req, { targetVersion: Domain.RISK_RULE_VERSION, ruleVersion: Domain.RISK_TARGET_VERSION });
+  const sr = Domain.validateRecommendationRequest(swapped);
+  assert.strictEqual(sr.ok, false);
+  assert.strictEqual(sr.error.code, 'invalid_rule_version');
+
+  // 合法组合：唯一可用目标版本 + 当前规则版本
+  const good = Domain.validateRecommendationRequest(Object.assign({}, req, { targetVersion: Domain.RISK_TARGET_VERSION }));
+  assert.strictEqual(good.ok, true);
+  assert.strictEqual(Domain.RISK_TARGET_VERSION, FIXTURE.targetVersion, '目标版本必须与冻结副本一致');
+
+  // detail 不回显输入原文
+  const payload = '<script>alert(1)</script>';
+  const echoed = Domain.validateRecommendationRequest(Object.assign({}, req, { targetVersion: payload }));
+  assert.strictEqual(echoed.ok, false);
+  assert.strictEqual(echoed.error.detail.indexOf(payload), -1, 'detail 不得回显输入原文');
+});
+
+test('5A-21 G5A-3 反例：模板额外类别（含不可枚举键 / 原型链 / 异常形状）一律 fail closed', () => {
+  const base = () => JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+
+  // 1) 额外类别：比例本身"合法"也不得被静默忽略（复现原文）
+  const c1 = base();
+  c1.classes.crypto = { minBps: 0, targetBps: 0, maxBps: 10000 };
+  assert.strictEqual(Domain.validateTargetTemplate(c1).error.code, 'invalid_target_template');
+
+  // 2) 不可枚举的额外类别：defineProperty 藏起来的键同样要拦（Object.keys 看不到，必须用 getOwnPropertyNames）
+  const c2 = base();
+  Object.defineProperty(c2.classes, 'gold', { value: { minBps: 0, targetBps: 0, maxBps: 0 }, enumerable: false });
+  assert.strictEqual(Domain.validateTargetTemplate(c2).error.code, 'invalid_target_template');
+
+  // 3) 原型链上的额外类别：六类自有 + 原型挂 crypto
+  const c3 = base();
+  c3.classes = Object.assign(Object.create({ crypto: { minBps: 0, targetBps: 0, maxBps: 0 } }), c3.classes);
+  assert.strictEqual(Domain.validateTargetTemplate(c3).error.code, 'invalid_target_template');
+
+  // 4) 六类全部来自原型链：不是自有属性 → 与冻结词表不精确相等
+  const c4 = base();
+  c4.classes = Object.create(c4.classes);
+  assert.strictEqual(Domain.validateTargetTemplate(c4).error.code, 'invalid_target_template');
+
+  // 5) JSON 文本里写 "__proto__" 键（JSON.parse 会把它建成自有键）
+  const c5 = base();
+  c5.classes = JSON.parse('{"__proto__":{"minBps":0,"targetBps":0,"maxBps":0},' + JSON.stringify(base().classes).slice(1));
+  assert.strictEqual(Domain.validateTargetTemplate(c5).error.code, 'invalid_target_template');
+
+  // 6) 异常对象形状
+  assert.strictEqual(Domain.validateTargetTemplate({ level: 1, classes: [] }).error.code, 'invalid_target_template');
+  assert.strictEqual(Domain.validateTargetTemplate({ level: 1, classes: new Date() }).error.code, 'invalid_target_template');
+  assert.strictEqual(Domain.validateTargetTemplate({ level: 1, classes: 'cash' }).error.code, 'invalid_target_template');
+  assert.strictEqual(Domain.validateTargetTemplate({ level: 1, classes: null }).error.code, 'invalid_target_template');
+
+  // 7) 缺类别仍按原错误码拒绝（原有门槛不得因为新检查而松动）
+  const c6 = base();
+  delete c6.classes.cash;
+  assert.strictEqual(Domain.validateTargetTemplate(c6).error.code, 'invalid_target_template');
+
+  // 8) 零回归：内置五级模板与合法副本仍全部通过
+  Domain.TARGET_TEMPLATES.forEach((t) => {
+    assert.strictEqual(Domain.validateTargetTemplate(t).ok, true, '内置模板必须仍合法：L' + t.level);
+    assert.strictEqual(Domain.validateTargetTemplate(JSON.parse(JSON.stringify(t))).ok, true, '深拷贝副本必须仍合法：L' + t.level);
+  });
+  FIXTURE.targetTemplates.forEach((t) => assert.strictEqual(Domain.validateTargetTemplate(t).ok, true, 'fixture 模板必须仍合法：L' + t.level));
+});
+
+test('5A-22 补口零回归：三条缺口的修复不得改变任何既有正向结果', () => {
+  // 冻结 / 收紧校验之后，5A 承载的冻结样例必须逐字段不变（只有 S5_1 在 5A 可评分）
+  const r = Domain.scoreRiskAnswers(FIXTURE.samples.S5_1.answers);
+  const e = FIXTURE.samples.S5_1.expect;
+  assert.strictEqual(r.ok, true, 'S5_1 必须仍可评分');
+  assert.strictEqual(r.capacityScore, e.capacityScore);
+  assert.strictEqual(r.willingnessScore, e.willingnessScore);
+  assert.strictEqual(r.capacityLevel, e.capacityLevel);
+  assert.strictEqual(r.willingnessLevel, e.willingnessLevel);
+  assert.strictEqual(r.ceiling, e.ceiling);
+  assert.strictEqual(r.ceilingSource, e.ceilingSource);
+  assert.deepStrictEqual(r.hardCaps.map((c) => c.code), e.hardCaps);
+  assert.strictEqual(r.ruleVersion, FIXTURE.ruleVersion);
+  // S5_2 / S5_3 属 5D（算法与状态机），5A 不得把它们算成"已通过"
+  ['S5_2', 'S5_3'].forEach((k) => {
+    assert.strictEqual(FIXTURE.samples[k].verifiesIn, '5D', k + ' 的承载子阶段必须仍是 5D');
+    assert.strictEqual(FIXTURE.samples[k].answers, undefined, k + ' 在 5A 不该有可评分答案');
+    assert.strictEqual(FIXTURE.samples[k].expect.formalRecommendation === null
+      || typeof FIXTURE.samples[k].expect.primaryCategory === 'string', true, k + ' 的冻结期望仍在');
+  });
+  assert.strictEqual(FIXTURE.samples.S5_1.verifiesIn, '5A');
+  // 合法建议请求（含无映射 / 0 元新增资金）仍通过
+  const req = sampleRequest();
+  assert.strictEqual(Domain.validateRecommendationRequest(req).ok, true);
+  assert.strictEqual(Domain.validateRecommendationRequest(Object.assign({}, req, { approvedInstruments: undefined })).ok, true);
+  assert.strictEqual(Domain.validateRecommendationRequest(Object.assign({}, req, { newFundsMinor: 0 })).ok, true);
+  // 规则目录与模板查表仍是可写的深拷贝（调用方改自己的副本不受限制）
+  const cat = Domain.riskCatalog();
+  assert.strictEqual(Object.isFrozen(cat), false, '对外目录是深拷贝，不是冻结视图');
+  const tpl = Domain.targetTemplateForLevel(3);
+  assert.strictEqual(Object.isFrozen(tpl), false, '模板副本必须是可写的深拷贝');
+  cat.questions[0].options[0].score = 99;
+  tpl.classes.cash.targetBps = 9999;
+  assert.strictEqual(Domain.riskCatalog().questions[0].options[0].score, FIXTURE.questions[0].options[0].score);
+  assert.strictEqual(Domain.RISK_QUESTIONS[0].options[0].score, FIXTURE.questions[0].options[0].score);
+  assert.strictEqual(Domain.TARGET_TEMPLATES[2].classes.cash.targetBps, FIXTURE.targetTemplates[2].classes.cash.targetBps);
+});

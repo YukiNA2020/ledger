@@ -1818,6 +1818,25 @@
   // 排序与尾差的稳定键：类别恒按 RISK_CLASSES 序，缺口降序在前，同缺口按该序 → 与对象/数据库行序无关。
   var ALLOCATION_ROUNDING_RULE = '缺口降序 → 同缺口按排列顺序 → 逐类别取整后余额给排序最前者';
 
+  // 规则常量**深度冻结**（G5A-1 补口）：5A 的规则是「唯一机器可读定义」，
+  // 同一 RISK_RULE_VERSION 下相同答案必须永远算出相同结果；只要对外引用可写，
+  // 调用方一行原地赋值就能让 15 分变成 12 分而版本号不变（不变量 10 失效）。
+  // 冻结必须递归到嵌套层：只冻第一层等于没冻（`RISK_QUESTIONS[0].options[0].score = 0` 仍能生效）。
+  // 需要可写副本的调用方走 riskCatalog() / targetTemplateForLevel()——它们返回深拷贝。
+  function deepFreezeRisk(v) {
+    if (!v || typeof v !== 'object' || Object.isFrozen(v)) return v;
+    Object.freeze(v);
+    Object.keys(v).forEach(function (k) { deepFreezeRisk(v[k]); });
+    return v;
+  }
+
+  [
+    RISK_CLASSES, RISK_LEVELS, CAPACITY_DIMENSIONS, WILLINGNESS_DIMENSIONS,
+    RISK_QUESTIONS, CAPACITY_LEVEL_BOUNDS, WILLINGNESS_LEVEL_BOUNDS, RISK_HARD_CAPS,
+    TARGET_TEMPLATES, TOLERANCE_BANDS, ASSESSMENT_STATUSES, REASSESS_REASONS,
+    RISK_ERROR_CODES, RECOMMENDATION_STATUSES, RECOMMENDATION_INPUT_KEYS, RECOMMENDATION_OUTPUT_KEYS
+  ].forEach(deepFreezeRisk);
+
   function riskCopy(x) { return JSON.parse(JSON.stringify(x)); }
 
   function isRiskObject(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
@@ -1981,6 +2000,26 @@
     if (!isRiskObject(tpl) || !isRiskObject(tpl.classes)) {
       return { ok: false, error: { code: 'invalid_target_template', detail: '模板必须带 classes 对象' } };
     }
+    // 类别必须与冻结词表**精确相等**（G5A-3 补口）：下面的循环只保证「六类都在」，
+    // 挡不住多出来的类别（如 crypto）被静默忽略。两道检查缺一不可：
+    //   ① 自有键集合精确相等 —— 用 getOwnPropertyNames 而非 Object.keys，
+    //      否则可以用 defineProperty 藏一个不可枚举的类别绕过去；
+    //   ② 原型链上不得再挂可枚举键 —— Object.create({crypto:…}) 这类形状
+    //      （普通对象字面量的原型是 Object.prototype，其属性不可枚举，不会误伤）。
+    var ownNames = Object.getOwnPropertyNames(tpl.classes);
+    if (ownNames.length !== RISK_CLASSES.length) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: 'classes 的类别数量必须恰为 ' + RISK_CLASSES.length + ' 个' } };
+    }
+    for (var n = 0; n < ownNames.length; n++) {
+      if (RISK_CLASSES.indexOf(ownNames[n]) === -1) {
+        return { ok: false, error: { code: 'invalid_target_template', detail: '出现未冻结的资产类别：' + ownNames[n] } };
+      }
+    }
+    for (var key in tpl.classes) {
+      if (!Object.prototype.hasOwnProperty.call(tpl.classes, key)) {
+        return { ok: false, error: { code: 'invalid_target_template', detail: '资产类别不得来自原型链：' + key } };
+      }
+    }
     var targetSum = 0, minSum = 0, maxSum = 0;
     for (var i = 0; i < RISK_CLASSES.length; i++) {
       var cls = RISK_CLASSES[i];
@@ -2039,8 +2078,11 @@
     if (payload.ruleVersion !== RISK_RULE_VERSION) {
       return { ok: false, error: { code: 'invalid_rule_version', detail: 'ruleVersion 与当前规则版本不一致' } };
     }
-    if (!isRiskNonEmptyString(payload.targetVersion)) {
-      return { ok: false, error: { code: 'invalid_target_template', detail: 'targetVersion 必填' } };
+    // 目标模板版本必须**是当前可用版本**（G5A-2 补口）：5A 只冻结了 risk-targets-v1，
+    // 「非空字符串」不足以挡住 risk-targets-unknown —— 那样 5D 会把不存在的模板版本
+    // 当成正式建议的输入。将来支持历史模板时改为按显式版本目录解析，不得退回任意非空串。
+    if (!isRiskNonEmptyString(payload.targetVersion) || payload.targetVersion !== RISK_TARGET_VERSION) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: 'targetVersion 不是当前可用的目标模板版本' } };
     }
     if (!isRiskNonNegInt(payload.newFundsMinor)) {
       return { ok: false, error: { code: 'invalid_new_funds', detail: 'newFundsMinor 必须是非负整数（最小货币单位）' } };
