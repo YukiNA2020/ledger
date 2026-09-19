@@ -315,6 +315,20 @@ Phase 4E 退出证据（第二轮复核补口后更新）：全量 `node --test`
 
 ## 7. Phase 5｜风险与新增资金建议
 
+### Phase 5A｜规则冻结进度（2026-09-19，`2.4.0-phase5a`）
+
+Phase 5 拆为 5A–5E（见 [`PHASE5_BREAKDOWN.md`](./PHASE5_BREAKDOWN.md)）。5A 只冻结规则与领域契约，**零迁移、零 API、零页面**。口径见 `DECISIONS.md` **D-046**；规则数据与纯契约函数在 `js/domain.js`，冻结副本在 `tests/fixtures/phase5-risk-rules.json`。
+
+实测：全量 `node --test` **504/504**、5A 定向 **18/18**（非沙箱）、浏览器 wiring **24/24 × 2 轮干净环境**、schema 停在 **v7**、零真实网络请求。
+
+| 场景 | 5A 层状态 | 5A 证据 | 正式验收 |
+|---|---|---|---|
+| S5.1 能力约束意愿 | 规则侧已锁定 | `tests/domain-phase5a.test.js` 5A-8（fixture 样例）：高意愿（意愿 12 → L5）+ 应急金不足 + 收入不稳定 → 上限取能力侧 L2，三个硬封顶逐条列出 | 5B（领域 + 真实 HTTP + 浏览器三层） |
+| S5.2 新增资金优先 | 契约与排序 / 尾差规则已冻结 | 5A-16 输出契约与稳定排序规则；fixture `samples.S5_2` 记录 CNY 2,000 样例与期望（优先补宽基权益、金额守恒、无卖出） | 5D |
+| S5.3 数据门槛 | 门槛条件已枚举，门禁实现在既有 blocker 之上 | fixture `samples.S5_3` 列出 `quote_stale` / `classification_unconfirmed` / `close_incomplete` / `baseline_hash_mismatch` / `assessment_expired` 五个触发条件与「正式建议为空」期望 | 5D |
+
+**5A 不宣称任何场景已通过**：上表只说明规则层冻结到哪一步，S5.1–S5.3 的判定分别留待 5B / 5D。
+
 ### S5.1 能力约束意愿
 
 **Given** 风险意愿高但应急金不足、收入不稳定。  

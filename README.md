@@ -13,6 +13,7 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 - **v3 Phase 4C「持仓账本与证券事件」第三轮独立复核补口完成，等待复核确认（2026-09-18，`v2.3.9-phase4c`）**：在 G4C-1–11 基础上，根 `state` 必须是非数组对象；`assets` 完全缺失仍兼容旧备份，但显式存在时必须是非空对象。API 与仓储双层均在清库前拒绝 `state=[]`、`assets=null/[]/字符串/{}`，原事实保持不变。详见 [PHASE4C_ACCEPTANCE_GAPS.md](./PHASE4C_ACCEPTANCE_GAPS.md)。
 - **v3 Phase 4D「日终行情、汇率与失败兜底」第三轮独立复核补口完成，等待复核确认（2026-09-18，`v2.3.10-phase4d`）**：此前请求—结果一一绑定与 `asOf` 边界保持不变；本轮修复全量被手动值锁定时顶层 `reason` 误报 `no_targets`，现在有目标时返回实际原因 `manual_locked`，只有 `requested=0` 才使用 `no_targets`。当前全量 **452/452**、4D 编排层 **27/27**、4D 真实 HTTP **10/10**、浏览器 wiring **21/21**；schema 仍为 **v7**。
 - **v3 Phase 4E「估值下钻与收益归因」第二轮复核补口完成，等待独立复核确认（2026-09-19，`2.3.13-phase4e`）**：第一轮 G4E-1 的封存明细口径保持不变；本轮补齐**决策台读取快照时的完整性校验**。`GET /close-snapshots/:id` 现在复算 payload 原文 SHA-256 并返回 `hashValid` / `integrityStatus`；前端只有收到 `hashValid:true` 才使用封存明细，不一致或缺失校验结论时统一进入 `baseline_hash_mismatch`、清空 positions、不给任何归因行或合计。**零新数据源、零迁移**，schema 仍为 **v7**；当前全量 **486/486**、4E 定向 **34/34**、浏览器 wiring **24/24 × 2**。口径见 [DECISIONS.md](./DECISIONS.md) D-045 ①–⑨，复核记录见 `PHASE4E_ACCEPTANCE_GAPS.md`。
+- **v3 Phase 5A「风险问卷与配置规则冻结」完成，等待独立复核确认（2026-09-19，`2.4.0-phase5a`）**：在写数据库、API 和页面之前冻结 T-004 —— 9 道题（承受能力 5 / 承受意愿 4）与分值、等级边界（**下界含入**）、4 条**硬封顶**（只降不升、高意愿不能抵消关键短板）、5 级目标区间模板（Σtarget 精确 100%、**个股 target 恒为 0**）、容忍带（端点含入）、复评词表与 365/30 天有效期（**市场涨跌不触发复评**）、稳定错误码、建议输入输出契约与排序尾差规则。规则数据与纯契约函数在 `js/domain.js`，冻结副本在 `tests/fixtures/phase5-risk-rules.json`，测试见 `tests/domain-phase5a.test.js`。**零新迁移、零新 API、零新页面**，schema 仍为 **v7**；当前全量 **504/504**、5A 定向 **18/18**、浏览器 wiring **24/24 × 2**。口径见 [DECISIONS.md](./DECISIONS.md) D-046，子阶段拆解见 [PHASE5_BREAKDOWN.md](./PHASE5_BREAKDOWN.md)。
 - SQLite 已是唯一事实源；IndexedDB 不再承担 v3 事实源，服务不可达时前端进入只读降级，不做双写。
 - 本轮不从零重写：复用 `js/core.js` 中已经验证的解析、统计和账务口径。
 - 本仓库中的 v3 文档是交给后续执行 Agent 的唯一实施依据；下一阶段入口见 [NEXT_AGENT.md](./NEXT_AGENT.md)。
@@ -85,7 +86,7 @@ node server/main.js --no-open           # 不自动打开浏览器
 
 ```bash
 cd ledger
-node --test          # 371 项（2026-09-16 基线）
+node --test          # 504 项（2026-09-19 基线；须在非沙箱下运行，含 macOS Keychain 用例）
 
 # 浏览器接线验收必须先由本地服务托管，并使用临时数据目录：
 node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
@@ -96,4 +97,4 @@ node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
 
 ## 下一步
 
-Phase 4E 第二轮复核发现的“决策台不校验快照哈希”已补齐，当前全量 **486/486**、4E 定向 **34/34**、浏览器 wiring **24/24 × 2**。在独立复核确认前**不进入 Phase 5**；下一位只复核快照读取完整性与既有 4E 不变量，入口见 [NEXT_AGENT.md](./NEXT_AGENT.md)。Phase 4A 的正式验收仍为待定，行情自动抓取继续保持关闭。
+Phase 5A 已把风险问卷的规则与领域契约冻结（D-046），当前全量 **504/504**、5A 定向 **18/18**、浏览器 wiring **24/24 × 2**，schema 停在 **v7**。下一子阶段是 **5B：把冻结的规则做成可填写、可保存、可追溯、可到期的风险评估**（双评分领域函数、`risk_assessments` 持久化与迁移、`POST /api/v1/risk-assessments`、问卷 UI），入口与禁区见 [NEXT_AGENT.md](./NEXT_AGENT.md)。Phase 4E 的独立复核结论以 [PHASE4E_ACCEPTANCE_GAPS.md](./PHASE4E_ACCEPTANCE_GAPS.md) 为准；Phase 4A 的正式验收仍为待定，行情自动抓取继续保持关闭。
