@@ -5,6 +5,25 @@
 
 ---
 
+## 第 2 轮修复状态（2026-09-19，P1：决策台读取快照时未校验哈希）
+
+> 修复后基线：全量 `node --test` **486/486**；4E 定向 **34/34**（领域 25 + 真实 HTTP 9）；浏览器 wiring **24/24 × 2**（两个全新临时数据库）。版本 `2.3.13-phase4e`，schema 仍为 v7。
+
+| 编号 | 级别 | 原始结论（摘要） | 修复状态 |
+|---|---|---|---|
+| G4E-2 | P1 | 结账重算会校验快照哈希，但 `GET /close-snapshots/:id` 不返回完整性结论；前端丢弃包装信息并直接使用 payload，导致篡改后的价格参与归因、页面仍展示旧哈希，`baseline_hash_mismatch` 分支不可达 | ✅ **已修复** |
+
+修复闭环：
+
+1. `readCloseSnapshotHandler` 对数据库中的 `payloadJson` **原文**复算 SHA-256，与封存 `payloadHash` 比较，返回 `hashValid` 和 `integrityStatus`；接口仍返回原文与解析结果用于审计，但不再把“可读”混同为“可信”。
+2. 决策台缓存完整性状态，只有服务端明确返回 `hashValid:true` 才调用 `baselinePositionsFromSnapshot`。不一致或缺少校验结论时 fail closed：`positions=[]`、`detailsUnavailable='baseline_hash_mismatch'`，领域层返回 `rows=[]`，页面不生成归因合计。
+3. 真实 HTTP 反例直接篡改 `attributionPositions[0].priceMinor`、保留旧哈希：GET 返回 `hashValid:false / integrityStatus:'mismatch'`，同时证明读到的是被篡改原文；重结账仍为 `baseline_hash_mismatch` 且 rows 为空。
+4. wiring 新增第 24 项，模拟同一 GET 契约报告 mismatch 后打开决策台，断言完整性告警可见、归因行数为 0、合计数为 0；两个干净环境连续通过。
+
+结论：G4E-2 已闭合；未进入 Phase 5，等待独立复核确认。
+
+---
+
 ## 第 1 轮修复状态（2026-09-19，针对 4E 实现 `4e92350` + 文档 `3c824bc`，复核前基线 478/478 + wiring 23/23 × 2）
 
 > 修复后基线：全量 `node --test` **486/486**（478 零回归 + 4E 新增 8：领域 25、真实 HTTP 9）+ wiring **23/23 × 2**（干净环境连续两轮）。版本 `2.3.12-phase4e`（APP_VERSION 与 SW 缓存键同步）。

@@ -2,13 +2,13 @@
 
 > 文档用途：记录可复现的测试证据、覆盖范围、缺陷和发布判断。
 > 创建时间：2026-08-16
-> 最近更新：2026-09-18
+> 最近更新：2026-09-19
 
 ## 当前结论
 
-- **测试对象：** Phase 4E 第一轮独立复核补口（P0：封存快照没有真正作为归因基准，G4E-1）
-- **总体状态：** ✅ 复核缺口已修复，等待独立复核确认（复核前为「暂不通过验收、不进入 Phase 5」）。`node --test` **486/486**（非沙箱实跑）；4E 定向 **34/34**（领域 25 + 真实 HTTP 9）；浏览器 wiring **23/23 × 2**（干净环境连续两轮）。数据库 schema 仍为 **v7**。零真实网络请求。
-- **发布判断：** 归因期初腿现**只认封存明细**——结账时以基准月末 as-of 口径封存 `attributionPositions` 进快照 payload，重算时先校验快照原文 sha256 与封存哈希一致再读取；领域层不存在「从当前事实表按历史日期重算期初」的路径。`unavailable` 三态：`no_baseline` / `baseline_details_missing` / `baseline_hash_mismatch`，均整段不出归因、绝不倒算（D-045 ⑨）。其余口径冻结不变：D-044（行情手动兜底 + 自动抓取默认关闭）、D-036（Frankfurter pin ECB）、D-038（门禁）。**Phase 4A 仍为「契约完成、正式验收暂不通过」**；4B/4C 复核结论保持已修复状态。
+- **测试对象：** Phase 4E 第二轮独立复核补口（P1：决策台读取快照时未校验哈希，G4E-2）
+- **总体状态：** ✅ 复核缺口已修复，等待独立复核确认。`node --test` **486/486**（非沙箱实跑）；4E 定向 **34/34**（领域 25 + 真实 HTTP 9）；浏览器 wiring **24/24 × 2**（两个全新临时数据库）。数据库 schema 仍为 **v7**。零真实网络请求。
+- **发布判断：** 归因期初腿继续只认封存明细；本轮把相同完整性门禁贯通到读取链路：快照 GET 复算原文 SHA-256，决策台只有 `hashValid:true` 才使用 payload，否则统一 `baseline_hash_mismatch` 且不给归因行/合计。其余 D-045 口径不变；**Phase 4A 仍为「契约完成、正式验收暂不通过」**。
 - **Phase 4C/4D 结论：** G4C-1–12 补口完成；452/452 基线在本轮零回归。上一阶段（4E 首轮实现）结论存档：478/478、wiring 23/23，其「期初腿按历史日期重算」的口径**已被本轮取代**（见 `PHASE4E_ACCEPTANCE_GAPS.md` 与 CHANGELOG 2.3.12）。
 
 上一阶段（4B）结论存档：`node --test` 371/371、wiring 17/17（第三轮基线），详见 ROADMAP/ACCEPTANCE 的 4B 节与 `PHASE4B_ACCEPTANCE_GAPS.md`。
@@ -180,6 +180,19 @@
 
 > 上表的领域 21 项与「缺期初汇率 → missing_start_fx」用例的口径**已被下方补口节取代**（期初腿改读封存明细后，领域测试增至 25 项、真实 HTTP 增至 9 项）。
 
+### Phase 4E 第二轮复核补口证据（2026-09-19，G4E-2）
+
+| 范围 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 快照 GET 完整性状态 | `node --test tests/server-phase4e.test.js` | ✅ **9/9** | 正常快照返回 `hashValid:true / integrityStatus:'valid'`；直接改库把封存期初价改为 40.00、保留旧哈希后，GET 仍读出被篡改原文但明确返回 `false / 'mismatch'`，重结账同时保持 `baseline_hash_mismatch`、rows 为空 |
+| 前端 fail-closed wiring | `tests/app-wiring.html` | ✅ **24/24 × 2** | 新增第 24 项：快照读取报告 mismatch 后打开决策台，页面显示完整性告警，`data-attr-row` 与 `data-attr-totals` 均为 0；两个全新临时数据库连续通过 |
+| 4E 定向合计 | `node --test tests/domain-phase4e.test.js tests/server-phase4e.test.js` | ✅ **34/34** | 领域 25 + 真实 HTTP 9；本轮在既有真实篡改用例内增强读取接口断言，因此总数不虚增 |
+| 全量回归 | `node --test`（非沙箱，真实用户身份） | ✅ **486/486** | Keychain、回环服务、迁移 v7 与既有 4C/4D/4E 用例全部通过 |
+| 静态门禁 | `node --check js/app.js js/domain.js sw.js server/api.js tests/app-wiring.js` + `git diff --check` | ✅ | 无语法或空白错误；`APP_VERSION` 与 SW 缓存键均为 `2.3.13-phase4e` |
+| schema 与网络 | — | ✅ | schema 仍为 **v7**，未新增迁移、未接新数据源；自动测试零真实网络请求 |
+
+**第二轮补口合计：全量 486/486、4E 定向 34/34、浏览器 wiring 24/24 × 2。**
+
 ### Phase 4E 复核补口证据（2026-09-19，独立复核 G4E-1 后）
 
 | 范围 | 方法 | 结果 | 说明 |
@@ -196,6 +209,7 @@
 
 ### Phase 4E 复核补口过程中发现并修复的问题（2026-09-19）
 
+- **G4E-2（P1，读取完整性，第二轮复核发现）**：结账重算路径会校验快照原文哈希，但快照 GET 没有返回校验状态；前端只缓存解析后的 payload，导致篡改明细可参与决策台归因且 `baseline_hash_mismatch` 分支不可达。修复：GET 复算 SHA-256 并返回状态；前端只接受明确的 `hashValid:true`，否则 fail closed 且零行/零合计。**教训**：完整性约束必须覆盖每一个消费入口，不能只保护写入或重算路径。
 - **G4E-1（P0，财务口径，复核发现）**：封存快照没有真正作为归因基准——期初腿从当前事实表按历史日期重算。修复口径见 D-045 ⑨ 与 `PHASE4E_ACCEPTANCE_GAPS.md`。**教训**：封存的意义在于**连内容一起冻结**，只封存「日期 + ID + 哈希」而内容按当时事实重算，等于没封存；时间窗口测试只加「未来日期事实」测不出「回填旧日期事实」，反例要按复核复现链路逐字造。
 - **`checklist.facts.holdings` 不能直接当期初明细（设计发现）**：它是 Phase 3「结账时点最新价」口径（`findQuote` 无未来截断），8 月结账时可能把当时已可见的 9 月价格封存进去。修复：新增 `computeAttributionBaselinePositions`（as-of 口径）单独封存 `attributionPositions`，与 Phase 3 口径刻意分离。**教训**：同一张事实表在不同口径下（「当时最新」vs「as-of 截断」）产出不同结果，跨口径复用前必须先确认口径。
 - **前端把 closeId 误当快照 id（编码错误，wiring 抓出）**：`ensureAttributionSnapshot` 用 `baseline.id`（`close-…`）请求快照接口 → 404 → 归因卡进 error 态。修复：接口参数改用 `baseline.snapshot.id`（缓存键仍用 closeId）。**教训**：wiring 是这类「接口接错线」的唯一防线，归因场景等待条件要从「选择器存在」收紧为「合计 + 正确基准 + 明细就绪」。

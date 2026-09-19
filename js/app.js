@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.12-phase4e';
+  var APP_VERSION = '2.3.13-phase4e';
 
   /* ================= 状态 ================= */
   var state = {
@@ -27,8 +27,9 @@
     closes: [], closesLoaded: false, closesLoading: false, // Phase 3：月度结账历史
     baselineCloseId: null, // Phase 4E：收益归因选中的期初基准（结账快照 id，null = 用默认基准）
     // G4E-1（复核补口）：归因期初腿只认基准快照 payload 里封存的逐持仓明细。
-    // { closeId, status: 'idle'|'loading'|'ready'|'error', payload } —— payload 是快照原文对象。
-    attrSnap: { closeId: null, status: 'idle', payload: null },
+    // { closeId, status: 'idle'|'loading'|'ready'|'error', payload, hashValid }。
+    // payload 是快照原文对象；只有服务端明确返回 hashValid=true 时才允许用于归因。
+    attrSnap: { closeId: null, status: 'idle', payload: null, hashValid: null },
     // Phase 4B：标的目录（检索结果只存在内存里，不写事实源；事实源只有 instruments 表）
     instQuery: '', instResult: null, instBusy: false, instError: '',
     wiz: null
@@ -336,15 +337,22 @@
       (state.attrSnap.status === 'loading' || state.attrSnap.status === 'ready' || state.attrSnap.status === 'error')) {
       return;
     }
-    state.attrSnap = { closeId: wantId, status: 'loading', payload: null };
+    state.attrSnap = { closeId: wantId, status: 'loading', payload: null, hashValid: null };
     render();
     Store.getCloseSnapshot(wantSnapId).then(function (r) {
       if (state.attrSnap.closeId !== wantId) return; // 期间已切换基准，丢弃过期结果
-      state.attrSnap = { closeId: wantId, status: 'ready', payload: (r && r.snapshot && r.snapshot.payload) || null };
+      var snapshot = r && r.snapshot;
+      state.attrSnap = {
+        closeId: wantId,
+        status: 'ready',
+        payload: (snapshot && snapshot.payload) || null,
+        // fail closed：旧/异常响应没有完整性结论时，也不能把内容当作已校验快照使用。
+        hashValid: !!(snapshot && snapshot.hashValid === true)
+      };
       if (state.page === 'home') render();
     }).catch(function () {
       if (state.attrSnap.closeId !== wantId) return;
-      state.attrSnap = { closeId: wantId, status: 'error', payload: null };
+      state.attrSnap = { closeId: wantId, status: 'error', payload: null, hashValid: null };
       if (state.page === 'home') render();
     });
   }
@@ -593,12 +601,16 @@
       return '<div class="card" data-attribution="snapshot-loading">' + head + picker +
         '<div class="small muted" style="padding:6px 0">正在读取基准快照的封存明细…</div></div>';
     }
-    if (snapState.status === 'error' || !snapState.payload) {
+    if (snapState.status === 'error' || (!snapState.payload && snapState.hashValid !== false)) {
       return '<div class="card" data-attribution="snapshot-error">' + head + picker +
         '<div class="small muted" style="padding:6px 0;line-height:1.8">基准快照读取失败，暂时无法计算收益归因。' +
         '可稍后重试，或换一个基准月。</div></div>';
     }
-    var derived = Domain.baselinePositionsFromSnapshot(snapState.payload);
+    // 快照完整性失败时不把 payload 交给提取器：显式传空 positions + mismatch，
+    // 让领域层统一返回 rows=[]，页面上的 baseline_hash_mismatch 分支真正可达。
+    var derived = snapState.hashValid === true
+      ? Domain.baselinePositionsFromSnapshot(snapState.payload)
+      : { positions: [], unavailable: 'baseline_hash_mismatch' };
     var baselineArg = {
       asOf: baseline.dataCutoff,
       month: baseline.month,
@@ -4245,7 +4257,7 @@
     // 期初腿永远不按当前事实表重算。
     'attr:baseline': function (el) {
       state.baselineCloseId = el.value || null;
-      state.attrSnap = { closeId: null, status: 'idle', payload: null };
+      state.attrSnap = { closeId: null, status: 'idle', payload: null, hashValid: null };
       render();
       ensureAttributionSnapshot(false);
     },

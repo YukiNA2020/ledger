@@ -255,6 +255,8 @@ test('S4E.1 结账快照封存归因（真实入口）：基准取上一份已�
     snap.json.snapshot.payloadHash,
     'payloadJson 重新哈希必须等于封存哈希'
   );
+  assert.strictEqual(snap.json.snapshot.hashValid, true, '未篡改快照的读取接口必须报告哈希有效');
+  assert.strictEqual(snap.json.snapshot.integrityStatus, 'valid');
   const payload = JSON.parse(payloadJson);
   assert.deepStrictEqual(payload.attribution.rows, at.rows, '快照里的归因与结账响应必须一致');
   assert.strictEqual(payload.attribution.baseline.snapshotId, first.snapshot.id);
@@ -564,8 +566,18 @@ test('G4E-1 基准快照被篡改（内容与封存哈希不符）→ 显式 bas
   const raw = R.getCloseSnapshot(ctx.db, augTamper.snapshot.id);
   const tampered = JSON.parse(raw.payloadJson);
   tampered.checklist.facts.holdings[0].priceMinor = 1000;
+  tampered.attributionPositions[0].priceMinor = 4000;
   ctx.db.prepare('UPDATE close_snapshots SET payload_json = ? WHERE id = ?')
     .run(JSON.stringify(tampered), raw.id);
+
+  // P1 真实反例：读取接口必须自己复算原文 sha256，并把不一致状态交给决策台。
+  // 仍返回 payload 是为了保留审计/诊断能力，但 hashValid=false 表示它绝不能参与归因。
+  const readTampered = await get(port, '/api/v1/close-snapshots/' + raw.id);
+  assert.strictEqual(readTampered.status, 200);
+  assert.strictEqual(readTampered.json.snapshot.hashValid, false);
+  assert.strictEqual(readTampered.json.snapshot.integrityStatus, 'mismatch');
+  assert.strictEqual(readTampered.json.snapshot.payload.attributionPositions[0].priceMinor, 4000,
+    '反例必须证明接口确实读到了被篡改的原文，而不是偶然读取旧缓存');
 
   const recomputed = await closeMonth(port, '2026-09');
   assert.strictEqual(recomputed.attribution.unavailable, 'baseline_hash_mismatch',

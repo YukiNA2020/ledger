@@ -1212,6 +1212,36 @@
       }
     });
 
+    await check('篡改快照打开决策台：完整性失败时不给任何归因行', async function () {
+      // 真实数据库篡改与 GET 的 hashValid=false 由 server-phase4e.test.js 覆盖；这里锁定浏览器
+      // 收到同一接口契约后的 fail-closed 行为，避免再出现「使用篡改值计算、仍展示旧哈希」。
+      var originalGetCloseSnapshot = Store.getCloseSnapshot;
+      Store.getCloseSnapshot = function (id) {
+        return originalGetCloseSnapshot(id).then(function (body) {
+          body.snapshot.hashValid = false;
+          body.snapshot.integrityStatus = 'mismatch';
+          if (body.snapshot.payload && body.snapshot.payload.attributionPositions &&
+              body.snapshot.payload.attributionPositions[0]) {
+            body.snapshot.payload.attributionPositions[0].priceMinor = 1;
+          }
+          return body;
+        });
+      };
+      try {
+        clickAction('[data-action="nav:close"]'); // 强刷列表并作废归因快照缓存
+        clickAction('[data-action="nav:home"]');
+        await waitFor(function () {
+          return document.querySelector('#view [data-attribution="baseline-mismatch"]');
+        }, 8000, '篡改快照的完整性告警');
+        equal(document.querySelectorAll('#view [data-attr-row]').length, 0,
+          '完整性失败时不得生成任何归因行');
+        equal(document.querySelectorAll('#view [data-attr-totals]').length, 0,
+          '完整性失败时不得生成归因合计');
+      } finally {
+        Store.getCloseSnapshot = originalGetCloseSnapshot;
+      }
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();

@@ -1204,6 +1204,11 @@ function readCloseSnapshotHandler(ctx, rawId, res) {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return fail(res, 400, 'invalid_id', '快照 id 不合法', false);
   const row = R.getCloseSnapshot(ctx.db, id);
   if (!row) return fail(res, 404, 'snapshot_not_found', '快照不存在：' + id, false);
+  // D-045 ⑨：读取方只有在「原文 sha256 == 封存哈希」时才能使用快照内容。
+  // 结账重算路径已有同一校验；只读接口也必须返回校验结论，否则浏览器会把篡改后的
+  // payload 与旧 payloadHash 一起展示，造成「看似可追溯、实际已失真」。
+  const actualPayloadHash = crypto.createHash('sha256').update(row.payloadJson).digest('hex');
+  const hashValid = !!row.payloadHash && actualPayloadHash === row.payloadHash;
   let payload = null;
   try {
     payload = JSON.parse(row.payloadJson);
@@ -1219,6 +1224,8 @@ function readCloseSnapshotHandler(ctx, rawId, res) {
       capturedAt: row.capturedAt,
       snapshotType: row.snapshotType,
       payloadHash: row.payloadHash,
+      hashValid: hashValid,
+      integrityStatus: hashValid ? 'valid' : 'mismatch',
       payloadJson: row.payloadJson,
       payload: payload
     }
