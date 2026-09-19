@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.3.11-phase4e';
+  var APP_VERSION = '2.3.12-phase4e';
 
   /* ================= 状态 ================= */
   var state = {
@@ -26,6 +26,9 @@
     pendingRecurring: 0, // 待生成的周期账笔数（首页横幅）
     closes: [], closesLoaded: false, closesLoading: false, // Phase 3：月度结账历史
     baselineCloseId: null, // Phase 4E：收益归因选中的期初基准（结账快照 id，null = 用默认基准）
+    // G4E-1（复核补口）：归因期初腿只认基准快照 payload 里封存的逐持仓明细。
+    // { closeId, status: 'idle'|'loading'|'ready'|'error', payload } —— payload 是快照原文对象。
+    attrSnap: { closeId: null, status: 'idle', payload: null },
     // Phase 4B：标的目录（检索结果只存在内存里，不写事实源；事实源只有 instruments 表）
     instQuery: '', instResult: null, instBusy: false, instError: '',
     wiz: null
@@ -312,9 +315,37 @@
       state.closesLoaded = true;
       state.closesLoading = false;
       if (state.page === 'close' || state.page === 'home') render();
+      // 强刷（例如刚结完账）之后基准快照可能更新，归因明细缓存作废，重新读取。
+      if (state.page === 'home') ensureAttributionSnapshot(force === true);
     }).catch(function () {
       state.closesLoaded = true;
       state.closesLoading = false;
+    });
+  }
+
+  // G4E-1：按当前选中的期初基准读取其封存快照 payload。
+  // 归因的期初腿只认这份封存明细（数量/价格/汇率/事件计数），绝不按当前事实表重算期初。
+  // 注意：缓存键用 closeId（基准选择器的值），但快照接口的参数是 snapshot.id —— 两者不同。
+  function ensureAttributionSnapshot(invalidate) {
+    if (!state.closesLoaded || state.page !== 'home') return;
+    var baseline = pickBaseline(state.closes || []);
+    var wantId = baseline ? baseline.id : null;
+    var wantSnapId = baseline && baseline.snapshot ? baseline.snapshot.id : null;
+    if (!wantId || !wantSnapId) return;
+    if (!invalidate && state.attrSnap.closeId === wantId &&
+      (state.attrSnap.status === 'loading' || state.attrSnap.status === 'ready' || state.attrSnap.status === 'error')) {
+      return;
+    }
+    state.attrSnap = { closeId: wantId, status: 'loading', payload: null };
+    render();
+    Store.getCloseSnapshot(wantSnapId).then(function (r) {
+      if (state.attrSnap.closeId !== wantId) return; // 期间已切换基准，丢弃过期结果
+      state.attrSnap = { closeId: wantId, status: 'ready', payload: (r && r.snapshot && r.snapshot.payload) || null };
+      if (state.page === 'home') render();
+    }).catch(function () {
+      if (state.attrSnap.closeId !== wantId) return;
+      state.attrSnap = { closeId: wantId, status: 'error', payload: null };
+      if (state.page === 'home') render();
     });
   }
 
@@ -334,8 +365,10 @@
         esc(e && e.message || e) + '<div class="small muted" style="margin-top:8px">数据未受影响，可返回首页重试</div>' +
         '<button class="btn primary" style="margin-top:12px" onclick="location.hash=\'home\'">回首页</button></div>';
     }
-    // Phase 4E：决策台要展示收益归因、结账页要展示历史结账，都需要快照列表
+    // Phase 4E：决策台要展示收益归因、结账页要展示历史结账，都需要快照列表；
+    // 归因还需要基准快照的封存明细（G4E-1）。
     if (page === 'home' || page === 'close') ensureClosesLoaded(false);
+    if (page === 'home') ensureAttributionSnapshot(false);
     window.scrollTo(0, 0);
   }
 
@@ -544,21 +577,6 @@
     }
 
     var baseline = pickBaseline(closes);
-    var baselineArg = baseline && baseline.snapshot && baseline.dataCutoff
-      ? {
-        asOf: baseline.dataCutoff,
-        month: baseline.month,
-        closeId: baseline.id,
-        snapshotId: baseline.snapshot.id,
-        payloadHash: baseline.snapshot.payloadHash,
-        status: baseline.status
-      }
-      : null;
-    var at = Domain.computeReturnAttribution(state.assets, {
-      now: todayDateStr(),
-      settings: state.settings,
-      baseline: baselineArg
-    });
 
     var options = closes.map(function (x) {
       return '<option value="' + esc(x.id) + '"' + (baseline && x.id === baseline.id ? ' selected' : '') + '>' +
@@ -567,6 +585,46 @@
     var picker = '<div class="small muted" style="margin-top:6px">期初基准</div>' +
       '<select id="attr-baseline" data-change="attr:baseline" data-baseline="' + esc(baseline ? baseline.id : '') + '">' +
       options + '</select>';
+
+    // G4E-1：等基准快照的封存明细就绪后才计算归因 —— 期初腿只认封存事实，
+    // 不按当前事实表重算，所以明细没到之前不能出任何数字。
+    var snapState = (state.attrSnap && state.attrSnap.closeId === baseline.id) ? state.attrSnap : null;
+    if (!snapState || snapState.status === 'loading') {
+      return '<div class="card" data-attribution="snapshot-loading">' + head + picker +
+        '<div class="small muted" style="padding:6px 0">正在读取基准快照的封存明细…</div></div>';
+    }
+    if (snapState.status === 'error' || !snapState.payload) {
+      return '<div class="card" data-attribution="snapshot-error">' + head + picker +
+        '<div class="small muted" style="padding:6px 0;line-height:1.8">基准快照读取失败，暂时无法计算收益归因。' +
+        '可稍后重试，或换一个基准月。</div></div>';
+    }
+    var derived = Domain.baselinePositionsFromSnapshot(snapState.payload);
+    var baselineArg = {
+      asOf: baseline.dataCutoff,
+      month: baseline.month,
+      closeId: baseline.id,
+      snapshotId: baseline.snapshot.id,
+      payloadHash: baseline.snapshot.payloadHash,
+      status: baseline.status,
+      positions: derived.positions,
+      detailsUnavailable: derived.unavailable
+    };
+    var at = Domain.computeReturnAttribution(state.assets, {
+      now: todayDateStr(),
+      settings: state.settings,
+      baseline: baselineArg
+    });
+
+    if (at.unavailable === 'baseline_details_missing') {
+      return '<div class="card" data-attribution="baseline-missing">' + head + picker +
+        '<div class="small muted" style="padding:6px 0;line-height:1.8">这份基准快照没有封存逐持仓的明细' +
+        '（旧版本生成的快照），期初基准不可用，因此不给归因数字。<br>对基准月重新结账即可补全。</div></div>';
+    }
+    if (at.unavailable === 'baseline_hash_mismatch') {
+      return '<div class="card" data-attribution="baseline-mismatch">' + head + picker +
+        '<div class="small muted" style="padding:6px 0;line-height:1.8">基准快照的内容与封存哈希不一致，' +
+        '这份快照不能作为期初基准，因此不给归因数字。<br>请检查数据是否被修改过，或对基准月重新结账。</div></div>';
+    }
 
     if (at.unavailable === 'no_baseline') {
       return '<div class="card" data-attribution="no-baseline">' + head + picker +
@@ -4183,7 +4241,14 @@
   var changes = {
     // 收益归因：切换期初基准快照。只改本地选中项，重渲染后由 pickBaseline 优先采用；
     // 估值与归因都在前端按 Domain 单一实现重算，不向后端写任何东西。
-    'attr:baseline': function (el) { state.baselineCloseId = el.value || null; render(); },
+    // G4E-1：切换后必须改读**新基准的封存快照明细**（异步读取，期间归因卡显示加载态），
+    // 期初腿永远不按当前事实表重算。
+    'attr:baseline': function (el) {
+      state.baselineCloseId = el.value || null;
+      state.attrSnap = { closeId: null, status: 'idle', payload: null };
+      render();
+      ensureAttributionSnapshot(false);
+    },
     'filter:type': function (el) { state.listFilters.type = el.value; render(); filterSheet(); },
     'filter:account': function (el) { state.listFilters.account = el.value; render(); filterSheet(); },
     'filter:category': function (el) { state.listFilters.category = el.value; render(); filterSheet(); },

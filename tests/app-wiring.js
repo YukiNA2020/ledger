@@ -1106,20 +1106,19 @@
       })[0];
       assert(other && other.snapshot, '前置：应还有另一个更早的、带快照的结账月');
 
-      // 决策台缓存了上一版的结账列表：先经 nav:close 强制刷新，再回决策台看归因
+      // 决策台缓存了上一版的结账列表：先经 nav:close 强制刷新，再回决策台看归因。
+      // G4E-1 后归因卡要异步读取基准快照的封存明细，因此直接等「合计 + 正确基准」出现。
       clickAction('[data-action="nav:home"]');
       await waitFor(function () { return document.querySelector('#view [data-action="nav:close"]'); }, 8000, '决策台结账入口');
       clickAction('#view [data-action="nav:close"]');
       clickAction('[data-action="nav:home"]');
       await waitFor(function () {
-        var s = document.querySelector('#view #attr-baseline');
-        return s && s.options.length >= 2;
-      }, 8000, '期初基准选择器（含补造的结账月）');
+        var t2 = document.querySelector('#view [data-attr-totals]');
+        return t2 && t2.getAttribute('data-baseline-id') === expected.id;
+      }, 8000, '归因合计（基准 = 上月快照，封存明细已就绪）');
 
       var totals = document.querySelector('#view [data-attr-totals]');
       assert(totals, '归因卡片必须给出合计');
-      equal(totals.getAttribute('data-baseline-id'), expected.id,
-        '默认期初基准必须是「早于本月的最近一个已结账月」，而不是最早那一个');
       equal(totals.getAttribute('data-baseline-hash'), expected.snapshot.payloadHash,
         '归因必须挂到该基准的快照哈希上（事后可追溯）');
 
@@ -1170,6 +1169,47 @@
       equal(Number(t3.getAttribute('data-price')) + Number(t3.getAttribute('data-fx')) +
         Number(t3.getAttribute('data-unattributed')), Number(t3.getAttribute('data-change')),
         '换基准后恒等式必须仍然成立');
+
+      // G4E-1 反例：结账后回填旧业务日期的价格，归因期初必须仍取封存快照里的价格日期。
+      // 真实回填链路的金额级断言由 tests/server-phase4e.test.js 覆盖；这里锁定前端读取的是快照 payload。
+      var selBack = document.querySelector('#view #attr-baseline');
+      selBack.value = expected.id; // 上面切换过基准，先切回默认基准再验证
+      selBack.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(function () {
+        var t4 = document.querySelector('#view [data-attr-totals]');
+        return t4 && t4.getAttribute('data-baseline-id') === expected.id;
+      }, 8000, '切回默认基准');
+      var stNow = await apiState();
+      var ins0 = ((stNow.assets && stNow.assets.instruments) || [])[0];
+      if (ins0) {
+        var backfillDate = other.month + '-15';
+        var bf = await fetch('/api/v1/quotes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': Store.readSessionToken() },
+          body: JSON.stringify({ instrumentId: ins0.id, priceMinor: 77700, priceDate: backfillDate })
+        });
+        assert(bf.status === 201 || bf.status === 409, '回填旧日期价格应被接受或被合并策略拒绝，实际 ' + bf.status);
+        clickAction('[data-action="nav:close"]'); // 强刷结账列表并作废归因明细缓存
+        clickAction('[data-action="nav:home"]');
+        await waitFor(function () {
+          var t4 = document.querySelector('#view [data-attr-totals]');
+          return t4 && t4.getAttribute('data-baseline-id') === expected.id;
+        }, 8000, '回填后归因卡恢复显示');
+        var sealed = await fetch('/api/v1/close-snapshots/' + expected.snapshot.id)
+          .then(function (r) { return r.json(); });
+        var sealedPositions = (sealed.snapshot.payload.attributionPositions) || [];
+        assert(sealedPositions.length > 0 || document.querySelectorAll('#view [data-attr-row]').length === 0,
+          '基准快照必须封存了逐持仓明细（attributionPositions）');
+        var rowsAfter = document.querySelectorAll('#view [data-attr-row]');
+        for (var k = 0; k < rowsAfter.length; k++) {
+          var rowId = rowsAfter[k].getAttribute('data-attr-row');
+          var sealedRow = sealedPositions.filter(function (p) { return p.instrumentId === rowId; })[0];
+          if (sealedRow) {
+            equal(rowsAfter[k].getAttribute('data-start-price-date'), String(sealedRow.priceDate || ''),
+              '期初价格日期必须等于封存明细，不能是回填的 ' + backfillDate);
+          }
+        }
+      }
     });
 
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）

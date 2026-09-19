@@ -711,23 +711,50 @@ function createHandler(ctx) {
     // 与 D-034 ③「结账相关口径以封存事实为准、不按今天的口径倒推」同纪律。
     // 没有任何更早的结账记录时 baseline = null，领域层整段不出归因（unavailable='no_baseline'），
     // 宁可说"还没有可比的已结账月"，也不编一个基准出来。
+    // G4E-1（复核补口）：基准的**内容**也必须来自封存快照 —— 先按 sha256 校验快照原文与封存哈希一致，
+    // 再提取封存的逐持仓明细（数量/价格/汇率/事件计数）交给领域层。校验失败或明细缺失时显式标注
+    // detailsUnavailable，绝不从当前事实表按历史日期重算期初（回填旧日期事实不得改写已结账月）。
     const priorCloses = R.listMonthlyCloses(ctx.db).filter((c) => String(c.month) < String(month));
     const prior = priorCloses.length ? priorCloses[0] : null;
-    const attributionBaseline = prior && prior.dataCutoff
-      ? {
+    let attributionBaseline = null;
+    if (prior && prior.dataCutoff && prior.snapshot) {
+      attributionBaseline = {
         asOf: prior.dataCutoff,
         month: prior.month,
         closeId: prior.id,
-        snapshotId: prior.snapshot ? prior.snapshot.id : null,
-        payloadHash: prior.snapshot ? prior.snapshot.payloadHash : null,
-        status: prior.status
+        snapshotId: prior.snapshot.id,
+        payloadHash: prior.snapshot.payloadHash,
+        status: prior.status,
+        positions: null,
+        detailsUnavailable: null
+      };
+      const raw = R.getCloseSnapshot(ctx.db, prior.snapshot.id);
+      if (!raw || !raw.payloadJson) {
+        attributionBaseline.detailsUnavailable = 'baseline_details_missing';
+      } else {
+        const actualHash = crypto.createHash('sha256').update(raw.payloadJson).digest('hex');
+        if (prior.snapshot.payloadHash && actualHash !== prior.snapshot.payloadHash) {
+          attributionBaseline.detailsUnavailable = 'baseline_hash_mismatch';
+        } else {
+          let priorPayload = null;
+          try { priorPayload = JSON.parse(raw.payloadJson); } catch (_) { priorPayload = null; }
+          const derived = priorPayload
+            ? Domain.baselinePositionsFromSnapshot(priorPayload)
+            : { positions: null, unavailable: 'baseline_details_missing' };
+          if (derived.unavailable) attributionBaseline.detailsUnavailable = derived.unavailable;
+          else attributionBaseline.positions = derived.positions;
+        }
       }
-      : null;
+    }
     const attribution = Domain.computeReturnAttribution(state.assets, {
       now: asOf,
       settings: settings,
       baseline: attributionBaseline
     });
+    // G4E-1：把「基准月末时点的逐持仓明细」也封存进本期快照（as-of 口径，绝不取未来价格），
+    // 作为**下一期**归因的期初基准事实。checklist.facts.holdings 是 Phase 3「结账时点最新价」
+    // 口径，不能拿来做期初，因此这里单独算一份。
+    const attributionPositions = Domain.computeAttributionBaselinePositions(state.assets, asOf);
 
     const nowIso = new Date().toISOString();
     const closeId = R.getMonthlyCloseByMonth(ctx.db, month) || newResourceId('close');
@@ -740,8 +767,10 @@ function createHandler(ctx) {
       checklist: checklist,
       emergencyCoverageMonths: emergencyMonths,
       emergency: emergency,
-      // Phase 4E 追加字段（纯追加）：旧快照没有这个键，读取方必须容忍它缺失。
-      attribution: attribution
+      // Phase 4E 追加字段（纯追加）：旧快照没有这些键，读取方必须容忍它们缺失。
+      // attributionPositions：基准月末时点的逐持仓明细（as-of 口径），供下期归因作期初基准。
+      attribution: attribution,
+      attributionPositions: attributionPositions
     });
     const payloadHash = crypto.createHash('sha256').update(payloadJson).digest('hex');
 

@@ -51,12 +51,25 @@ function fixtureAssets(modify) {
   return a;
 }
 
+// 期初基准 = 已结账月快照的封存明细（G4E-1 复核补口）：期初腿只认这份事实，
+// 不从当前事实表按历史日期重算。默认值对应 fixtureAssets 的期初事实：
+// 8 月末 10 股 × 5000（USD，manual）× 7.00。
+const BASELINE_POSITIONS = [
+  {
+    accountId: 'acc-broker', instrumentId: 'ins-voo', quantity: '10',
+    priceMinor: 5000, priceCurrency: 'USD', priceDate: BASE, priceProvider: 'manual',
+    fxRateDecimal: '7.00', fxRateDate: BASE, fxProvider: 'manual',
+    eventCounts: { buy: 0, sell: 0, dividend: 0, fee: 0 }
+  }
+];
+
 const BASELINE = {
   asOf: BASE,
   month: '2026-08',
   closeId: 'close-2026-08',
   snapshotId: 'snap-2026-08',
-  payloadHash: 'deadbeef'
+  payloadHash: 'deadbeef',
+  positions: BASELINE_POSITIONS
 };
 
 function drilldownOf(assets, opts) {
@@ -333,7 +346,12 @@ test('computeReturnAttribution：缺期初价格 → 不分解，但能算出的
   const a = fixtureAssets((x) => {
     x.quotes = [{ instrumentId: 'ins-voo', priceMinor: 5500, currency: 'USD', priceDate: NOW, provider: 'manual' }];
   });
-  const r = attributionOf(a).rows[0];
+  // 封存明细里价格缺失（结账时就是估算快照）：期初定不了价
+  const r = attributionOf(a, {
+    baseline: Object.assign({}, BASELINE, {
+      positions: [Object.assign({}, BASELINE_POSITIONS[0], { priceMinor: null, priceDate: null, priceProvider: null })]
+    })
+  }).rows[0];
   assert.ok(r.boundaries.includes('missing_start_quote'));
   assert.strictEqual(r.attributable, false);
   assert.strictEqual(r.priceEffectCnyMinor, null);
@@ -347,7 +365,12 @@ test('computeReturnAttribution：缺期初汇率 → 不分解，绝不用 1:1 �
   const a = fixtureAssets((x) => {
     x.fxRates = [{ base: 'USD', quote: 'CNY', rateDecimal: '7.10', rateDate: NOW, provider: 'manual' }];
   });
-  const r = attributionOf(a).rows[0];
+  // 老快照没封存汇率字段：期初汇率就是没有，不能用期末 7.10 或 1:1 顶替
+  const r = attributionOf(a, {
+    baseline: Object.assign({}, BASELINE, {
+      positions: [Object.assign({}, BASELINE_POSITIONS[0], { fxRateDecimal: null, fxRateDate: null, fxProvider: null })]
+    })
+  }).rows[0];
   assert.ok(r.boundaries.includes('missing_start_fx'));
   assert.strictEqual(r.attributable, false);
   assert.strictEqual(r.startRateDecimal, null);
@@ -400,10 +423,14 @@ test('computeReturnAttribution：期末清仓 → position_closed；无期初买
       quantity: '10', priceMinor: 5200, occurredAt: '2026-09-10', currency: 'USD'
     });
   });
-  const ro = attributionOf(opened).rows[0];
+  // 基准快照里没有这条持仓（封存事实里确实没有）→ position_opened
+  const ro = attributionOf(opened, {
+    baseline: Object.assign({}, BASELINE, { positions: [] })
+  }).rows[0];
   assert.ok(ro.boundaries.includes('position_opened'));
   assert.strictEqual(ro.startQuantity, '0');
-  assert.strictEqual(ro.startValueCnyMinor, 0);
+  assert.strictEqual(ro.startValueCnyMinor, 0, '0 股的期初估值恒为 0（数学事实），ΔV = 期末值');
+  assert.strictEqual(ro.valueChangeCnyMinor, 390500, '变化额照样给出（期末 10×5500×7.10）');
   assert.strictEqual(ro.attributable, false);
 });
 
@@ -411,7 +438,10 @@ test('computeReturnAttribution：期间重录期初 → opening_rebased（数量
   const a = fixtureAssets((x) => {
     x.holdings = [{ id: 'h-voo', accountId: 'acc-broker', instrumentId: 'ins-voo', quantity: '10', costMinor: 45000, asOf: '2026-09-10' }];
   });
-  const at = attributionOf(a);
+  // 基准快照封存时这条持仓还不存在 → 期初 0；同时基准日之后重录了期初 → rebased
+  const at = attributionOf(a, {
+    baseline: Object.assign({}, BASELINE, { positions: [] })
+  });
   const r = at.rows[0];
   assert.ok(r.boundaries.includes('opening_rebased'));
   assert.ok(r.boundaries.includes('position_opened'));
@@ -477,16 +507,26 @@ test('computeReturnAttribution：重算旧月份不受结账之后的行情与�
       quantity: '5', priceMinor: 6000, occurredAt: '2026-10-15', currency: 'USD'
     });
   });
+  // 7 月封存明细里这条持仓没封存到价格（当时就是估算快照）→ 期初定不了价：
+  // 显式标注，绝不拿 8 月的数据顶替
   const at = Domain.computeReturnAttribution(a, {
     now: BASE,
-    baseline: { asOf: '2026-07-31', month: '2026-07' }
+    baseline: {
+      asOf: '2026-07-31', month: '2026-07',
+      positions: [{
+        accountId: 'acc-broker', instrumentId: 'ins-voo', quantity: '10',
+        priceMinor: null, priceCurrency: null, priceDate: null, priceProvider: null,
+        fxRateDecimal: null, fxRateDate: null, fxProvider: null,
+        eventCounts: { buy: 0, sell: 0, dividend: 0, fee: 0 }
+      }]
+    }
   });
   const r = at.rows[0];
   assert.strictEqual(r.endPriceDate, BASE, '期末价必须取 ≤ 8 月末的那一条，而不是 9 月的新价');
   assert.strictEqual(r.endPriceMinor, 5000);
   assert.strictEqual(r.endRateDate, BASE);
   assert.strictEqual(r.endQuantity, '10', '结账之后才发生的事件不得进入本期');
-  // 7 月末还没有任何报价 → 期初定不了价：显式标注，绝不拿 8 月的数据顶替
+  assert.strictEqual(r.startQuantity, '10', '期初数量来自封存明细');
   assert.ok(r.boundaries.includes('missing_start_quote'));
   assert.strictEqual(r.attributable, false);
   assert.strictEqual(r.startPriceMinor, null);
@@ -504,6 +544,82 @@ test('computeReturnAttribution：baseline 原样回显（asOf/月/关账 id/快�
     closeId: 'close-2026-08',
     snapshotId: 'snap-2026-08',
     payloadHash: 'deadbeef',
-    status: 'formal'
+    status: 'formal',
+    positionsCount: 1,
+    detailsUnavailable: null
   });
+});
+
+/* ---------------- G4E-1 复核补口：期初腿只认封存明细 ---------------- */
+
+test('G4E-1 computeAttributionBaselinePositions：基准月末 as-of 口径，绝不取未来价格', () => {
+  const a = fixtureAssets(); // 事实表里同时存在 9 月末的价格/汇率
+  const positions = Domain.computeAttributionBaselinePositions(a, BASE);
+  assert.strictEqual(positions.length, 1);
+  assert.strictEqual(positions[0].quantity, '10');
+  assert.strictEqual(positions[0].priceMinor, 5000, '只许用 ≤ 基准月末的价格，而不是全局最新');
+  assert.strictEqual(positions[0].priceDate, BASE);
+  assert.strictEqual(positions[0].priceProvider, 'manual');
+  assert.strictEqual(positions[0].fxRateDecimal, '7.00');
+  assert.strictEqual(positions[0].fxRateDate, BASE);
+  assert.deepStrictEqual(positions[0].eventCounts, { buy: 0, sell: 0, dividend: 0, fee: 0 });
+  // 这份明细喂回归因，必须得到与 BASELINE 相同的结果（封存 → 复算闭环）
+  const at = Domain.computeReturnAttribution(a, {
+    now: NOW,
+    baseline: Object.assign({}, BASELINE, { positions: positions })
+  });
+  assert.strictEqual(at.unavailable, null);
+  assert.strictEqual(at.rows[0].valueChangeCnyMinor, 40500);
+  assert.strictEqual(at.rows[0].attributable, true);
+});
+
+test('G4E-1 调用方给不出封存明细 → 整段不出归因，绝不从当前事实表重算期初', () => {
+  const a = fixtureAssets(); // 事实表里有完整的 8 月末价格/汇率/期初持仓 —— 也不许用
+  const at = Domain.computeReturnAttribution(a, {
+    now: NOW,
+    baseline: { asOf: BASE, month: '2026-08', closeId: 'close-2026-08', payloadHash: 'deadbeef' }
+  });
+  assert.strictEqual(at.unavailable, 'baseline_details_missing');
+  assert.deepStrictEqual(at.rows, [], '没有封存明细就不给任何归因行');
+  assert.strictEqual(at.totals.valueChangeCnyMinor, 0);
+  assert.strictEqual(at.baseline.detailsUnavailable, null, 'detailsUnavailable 未声明时由领域层判定');
+});
+
+test('G4E-1 基准快照哈希校验失败 / 调用方声明的不可用原因 → 原样透传', () => {
+  const a = fixtureAssets();
+  const mismatch = Domain.computeReturnAttribution(a, {
+    now: NOW,
+    baseline: Object.assign({}, BASELINE, { detailsUnavailable: 'baseline_hash_mismatch' })
+  });
+  assert.strictEqual(mismatch.unavailable, 'baseline_hash_mismatch');
+  assert.deepStrictEqual(mismatch.rows, []);
+  assert.strictEqual(mismatch.baseline.detailsUnavailable, 'baseline_hash_mismatch');
+});
+
+test('G4E-1 结账后回填旧业务日期事实 → 期初腿纹丝不动（领域层反例固化）', () => {
+  // 复核复现链路：8 月末价格 50.00 已封存 → 结账后回填 8-31 价格 40.00、汇率 6.50、
+  // 8 月中的买入事件。期初必须仍是封存的 50.00 / 7.00 / 10 股，归因结果不变。
+  const a = fixtureAssets((x) => {
+    x.quotes[0].priceMinor = 4000; // 回填旧价格（比封存值便宜）
+    x.fxRates[0].rateDecimal = '6.50'; // 回填旧汇率
+    x.securityEvents.push({ // 回填 8 月内的买入事件
+      id: 'e-backfill', accountId: 'acc-broker', instrumentId: 'ins-voo', eventType: 'buy',
+      quantity: '5', priceMinor: 4000, occurredAt: '2026-08-20', currency: 'USD'
+    });
+  });
+  const at = attributionOf(a);
+  const r = at.rows[0];
+  assert.strictEqual(r.startQuantity, '10', '期初数量 = 封存值，不随回填漂移');
+  assert.strictEqual(r.startPriceMinor, 5000, '期初价格 = 封存值');
+  assert.strictEqual(r.startPriceDate, BASE);
+  assert.strictEqual(r.startRateDecimal, '7.00', '期初汇率 = 封存值');
+  assert.strictEqual(r.startValueCnyMinor, 350000);
+  // 回填的 8-20 事件早于期初快照日（8-31）：按 D-042 ⑦ 视为已含在封存数量内，
+  // 期末推导仍是 10 股 → 不制造任何新边界，归因完全不受回填影响
+  assert.strictEqual(r.endQuantity, '10');
+  assert.deepStrictEqual(r.boundaries, [], '回填旧日期事实不得制造任何新边界');
+  assert.strictEqual(r.attributable, true);
+  assert.strictEqual(r.periodEventCounts.buy, 0, '回填事件已含在期初封存数量内，不再计入期间事件');
+  assert.strictEqual(r.valueChangeCnyMinor, 40500);
+  assert.strictEqual(r.priceEffectCnyMinor + r.fxEffectCnyMinor, r.valueChangeCnyMinor);
 });

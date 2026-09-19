@@ -403,7 +403,7 @@ test('S4E.1 归因不新增第二套"能不能给正式建议"的判定：缺行
   assert.ok(!codes.includes('no_baseline'));
 });
 
-test('S4E.1 纯手动汇率只有"当前一行"：历史期初汇率缺失，显式标注而不是插值', async (t) => {
+test('S4E.1/G4E-1 期初汇率以封存快照为准：手动汇率被顶掉也不影响已结账月的期初', async (t) => {
   const ctx = setup('ledger-p4e-manualfx-');
   const srv = await startServer(ctx);
   t.after(() => srv.close().then(() => ctx.close()));
@@ -424,16 +424,187 @@ test('S4E.1 纯手动汇率只有"当前一行"：历史期初汇率缺失，显
 
   const second = await closeMonth(port, '2026-09');
   const row = second.attribution.rows[0];
+  // G4E-1：8 月快照封存的明细里 fxRateDecimal = '7.00'，期初汇率取封存值，
+  // 而不是按当前事实表重查（那里已经只剩 7.10 一行）——这正是封存基准的意义。
+  assert.strictEqual(row.startRateDecimal, '7.00', '期初汇率来自封存明细，不随事实表漂移');
+  assert.strictEqual(row.startRateDate, A_END);
   assert.strictEqual(row.endRateDecimal, '7.10');
   assert.strictEqual(row.endRateDate, B_END);
-  assert.strictEqual(row.startRateDecimal, null, '历史期初汇率查不到就是查不到');
-  assert.ok(row.boundaries.includes('missing_start_fx'));
-  assert.strictEqual(row.attributable, false);
-  assert.strictEqual(row.priceEffectCnyMinor, null);
-  assert.strictEqual(row.fxEffectCnyMinor, null);
-  assert.strictEqual(row.valueChangeCnyMinor, null);
+  assert.deepStrictEqual(row.boundaries, [], '封存明细齐备时不再出现 missing_start_fx');
+  assert.strictEqual(row.attributable, true);
+  assert.strictEqual(row.startValueCnyMinor, 350000);
+  assert.strictEqual(row.endValueCnyMinor, 390500);
+  assert.strictEqual(row.valueChangeCnyMinor, 40500);
+  assert.strictEqual(row.priceEffectCnyMinor, 35000);
+  assert.strictEqual(row.fxEffectCnyMinor, 5500);
   // 归因缺基准 ≠ 正式建议被阻止：这两件事由不同的机制负责
-  assert.strictEqual(second.close.status, 'formal', '归因缺期初汇率不应把本期估值降级为估算');
+  assert.strictEqual(second.close.status, 'formal', '归因口径不应把本期估值降级为估算');
   assert.strictEqual(second.attribution.valuation.canAdvise, true);
   assert.ok(!second.attribution.blockers.some((b) => b.code === 'missing_start_fx'));
+});
+
+test('G4E-1 结账后回填旧业务日期的价格与汇率 → 归因期初纹丝不动、快照哈希不变（真实 HTTP 反例）', async (t) => {
+  const ctx = setup('ledger-p4e-backfill-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  const { instrumentId } = await seedPortfolio(port);
+  await addQuote(port, instrumentId, 5000, A_END);
+  await addQuote(port, instrumentId, 5500, B_END);
+  seedFxHistory(ctx, [
+    { rateDate: A_END, rateDecimal: '7.00' },
+    { rateDate: B_END, rateDecimal: '7.10' }
+  ]);
+  await closeMonth(port, '2026-08');
+  const augClose = (await get(port, '/api/v1/monthly-closes')).json.items.find((c) => c.month === '2026-08');
+  const firstSnapshotId = augClose.snapshot.id;
+  const firstSnapshotHash = augClose.snapshot.payloadHash;
+  const second = await closeMonth(port, '2026-09');
+  const before = second.attribution;
+  assert.strictEqual(before.rows[0].startPriceMinor, 5000);
+  assert.strictEqual(before.totals.valueChangeCnyMinor, 40500);
+
+  // —— 复核复现链路：结账后回填 8 月末的价格 40.00 与汇率 6.50（业务日期都早于结账时刻）——
+  await addQuote(port, instrumentId, 4000, A_END);
+  seedFxHistory(ctx, [{ rateDate: A_END, rateDecimal: '6.50' }]);
+
+  // 快照本身：ID、哈希、payload 一个字节都不变（封存事实不可被回填改写）
+  const snapA = await get(port, '/api/v1/close-snapshots/' + firstSnapshotId);
+  assert.strictEqual(snapA.json.snapshot.payloadHash, firstSnapshotHash, '回填不得改写基准快照的哈希');
+
+  // 重算 9 月归因：期初腿必须仍取封存的 5000 / 7.00 / 10 股
+  const recomputed = await closeMonth(port, '2026-09');
+  assert.deepStrictEqual(
+    recomputed.attribution.rows,
+    before.rows,
+    '回填旧日期价格/汇率后，归因行必须与回填前逐字段一致（期初腿只认封存明细）'
+  );
+  const row = recomputed.attribution.rows[0];
+  assert.strictEqual(row.startPriceMinor, 5000, '期初价格 = 封存值 50.00，而不是回填的 40.00');
+  assert.strictEqual(row.startPriceDate, A_END);
+  assert.strictEqual(row.startRateDecimal, '7.00', '期初汇率 = 封存值 7.00，而不是回填的 6.50');
+  assert.strictEqual(row.startQuantity, '10');
+  assert.strictEqual(row.valueChangeCnyMinor, 40500, '估值变化不随回填漂移');
+  assert.strictEqual(row.priceEffectCnyMinor, 35000);
+  assert.strictEqual(row.fxEffectCnyMinor, 5500);
+  assert.strictEqual(row.attributable, true);
+});
+
+test('G4E-1 结账后回填旧业务日期的证券事件与期初持仓 → 归因期初仍是封存值', async (t) => {
+  const ctx = setup('ledger-p4e-backfill2-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  const { accountId, instrumentId } = await seedPortfolio(port);
+  await addQuote(port, instrumentId, 5000, A_END);
+  await addQuote(port, instrumentId, 5500, B_END);
+  seedFxHistory(ctx, [
+    { rateDate: A_END, rateDecimal: '7.00' },
+    { rateDate: B_END, rateDecimal: '7.10' }
+  ]);
+  await closeMonth(port, '2026-08');
+  const second = await closeMonth(port, '2026-09');
+  const before = second.attribution;
+
+  // 回填 8 月内的买入事件：早于期初快照日（8-31）的事件按 D-042 ⑦ 视为已含在封存数量内
+  const ev = await post(port, '/api/v1/security-events', {
+    accountId: accountId, instrumentId: instrumentId, eventType: 'buy',
+    quantity: '5', priceMinor: 4000, occurredAt: '2026-08-20', currency: 'USD'
+  });
+  assert.strictEqual(ev.status, 201, '回填旧日期事件应能录入');
+
+  // 回填一份 asOf 落在归因窗口内的期初持仓（9-15）：触发 opening_rebased 边界
+  const rebasedOpening = await post(port, '/api/v1/portfolio-openings', {
+    accountId: accountId, instrumentId: instrumentId, quantity: '20', asOf: '2026-09-15'
+  });
+  if (rebasedOpening.status === 201) {
+    const recomputed = await closeMonth(port, '2026-09');
+    const row = recomputed.attribution.rows[0];
+    assert.strictEqual(row.startQuantity, '10', '期初数量 = 封存值，不随回填漂移');
+    assert.strictEqual(row.startPriceMinor, 5000);
+    assert.ok(row.boundaries.includes('opening_rebased'), '期初重录要显式标注为边界');
+    assert.strictEqual(row.attributable, false, '数量跳档不能被拆成价格/汇率影响');
+    assert.strictEqual(
+      recomputed.attribution.totals.valueChangeCnyMinor,
+      recomputed.attribution.totals.priceEffectCnyMinor +
+        recomputed.attribution.totals.fxEffectCnyMinor +
+        recomputed.attribution.totals.unattributedChangeCnyMinor
+    );
+  } else {
+    assert.strictEqual(rebasedOpening.status, 409, '同键期初重复录入应被去重规则拒绝（D-031/D-042）');
+    assert.strictEqual(rebasedOpening.json.error.code, 'duplicate_opening');
+  }
+
+  // 8-20 事件被视为已含在期初封存数量内：期末仍是 10 股，归因逐字段不变
+  const recomputed2 = await closeMonth(port, '2026-09');
+  assert.deepStrictEqual(recomputed2.attribution.rows, before.rows);
+});
+
+test('G4E-1 基准快照被篡改（内容与封存哈希不符）→ 显式 baseline_hash_mismatch，不给归因', async (t) => {
+  const ctx = setup('ledger-p4e-tamper-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  const { instrumentId } = await seedPortfolio(port);
+  await addQuote(port, instrumentId, 5000, A_END);
+  await addQuote(port, instrumentId, 5500, B_END);
+  seedFxHistory(ctx, [
+    { rateDate: A_END, rateDecimal: '7.00' },
+    { rateDate: B_END, rateDecimal: '7.10' }
+  ]);
+  await closeMonth(port, '2026-08');
+  await closeMonth(port, '2026-09');
+
+  // 直接改库模拟篡改：payload 换成价格更低的版本，payload_hash 保持原值
+  const closesTamper = (await get(port, '/api/v1/monthly-closes')).json.items;
+  const augTamper = closesTamper.find((c) => c.month === '2026-08');
+  const raw = R.getCloseSnapshot(ctx.db, augTamper.snapshot.id);
+  const tampered = JSON.parse(raw.payloadJson);
+  tampered.checklist.facts.holdings[0].priceMinor = 1000;
+  ctx.db.prepare('UPDATE close_snapshots SET payload_json = ? WHERE id = ?')
+    .run(JSON.stringify(tampered), raw.id);
+
+  const recomputed = await closeMonth(port, '2026-09');
+  assert.strictEqual(recomputed.attribution.unavailable, 'baseline_hash_mismatch',
+    '快照内容与封存哈希不一致时必须显式报错，不能拿篡改后的明细算归因');
+  assert.deepStrictEqual(recomputed.attribution.rows, []);
+  assert.strictEqual(recomputed.attribution.baseline.detailsUnavailable, 'baseline_hash_mismatch');
+});
+
+test('G4E-1 老快照缺封存逐持仓明细 → 显式 baseline_details_missing，不静默倒算', async (t) => {
+  const ctx = setup('ledger-p4e-nodetail-');
+  const srv = await startServer(ctx);
+  t.after(() => srv.close().then(() => ctx.close()));
+  const port = srv.port;
+
+  const { instrumentId } = await seedPortfolio(port);
+  await addQuote(port, instrumentId, 5000, A_END);
+  await addQuote(port, instrumentId, 5500, B_END);
+  seedFxHistory(ctx, [
+    { rateDate: A_END, rateDecimal: '7.00' },
+    { rateDate: B_END, rateDecimal: '7.10' }
+  ]);
+  await closeMonth(port, '2026-08');
+  await closeMonth(port, '2026-09');
+
+  // 把 8 月快照的 payload 换成没有 attributionPositions 键的旧形状（哈希同步更新，模拟合法旧快照）
+  const closes = (await get(port, '/api/v1/monthly-closes')).json.items;
+  const aug = closes.find((c) => c.month === '2026-08');
+  const raw = R.getCloseSnapshot(ctx.db, aug.snapshot.id);
+  const oldShape = JSON.parse(raw.payloadJson);
+  delete oldShape.attributionPositions;
+  delete oldShape.attribution;
+  const oldJson = JSON.stringify(oldShape);
+  const oldHash = crypto.createHash('sha256').update(oldJson).digest('hex');
+  ctx.db.prepare('UPDATE close_snapshots SET payload_json = ?, payload_hash = ? WHERE id = ?')
+    .run(oldJson, oldHash, raw.id);
+
+  const recomputed = await closeMonth(port, '2026-09');
+  assert.strictEqual(recomputed.attribution.unavailable, 'baseline_details_missing',
+    '基准明细拿不到就整段不出归因，绝不按当前事实表倒算期初');
+  assert.deepStrictEqual(recomputed.attribution.rows, []);
+  assert.strictEqual(recomputed.attribution.baseline.detailsUnavailable, 'baseline_details_missing');
 });

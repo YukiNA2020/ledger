@@ -1064,10 +1064,14 @@
         priceMinor: q ? q.priceMinor : null,
         priceCurrency: q ? q.currency : null,
         priceDate: q ? q.priceDate : null,
+        priceProvider: q ? q.provider : null,
         priceStatus: q ? q.status : 'missing_quote',
         fxRateDecimal: rate ? rate.rateDecimal : null,
         fxRateDate: rate ? rate.rateDate : null,
         fxProvider: rate ? rate.provider : null,
+        // Phase 4E 复核补口（G4E-1）：把事件计数也封存进快照，归因的 periodEventCounts
+        // 才能完全来自封存事实；老快照没有这个键，读取方必须容忍它缺失（输出 null）。
+        eventCounts: h.counts || null,
         asOf: h.openingAsOf != null ? h.openingAsOf : (h.asOf || null),
         valueMinor: minor,
         valueCnyMinor: conv.status === 'missing_fx' ? null : conv.valueMinor,
@@ -1265,6 +1269,76 @@
     };
   }
 
+  // computeAttributionBaselinePositions(assets, asOf) — 结账时计算「基准月末时点的逐持仓明细」，
+  // 由调用方封存进快照 payload（键 attributionPositions），作为下期归因的期初基准事实（G4E-1）。
+  // 口径：数量 = holdingsAsOf 在基准月末重放；价格/汇率 = as-of 查询（绝不取业务日期在未来的行）——
+  // 与 checklist.facts.holdings（结账时点最新价的 Phase 3 语义）**刻意不同**：期初明细必须是
+  // 基准月末的真实状态，不能用当时已经可见的未来价格。
+  function computeAttributionBaselinePositions(assets, asOf) {
+    var limit = String(asOf);
+    var a = normalizeAssets(assets);
+    return holdingsAsOf(a.holdings, a.securityEvents, limit).holdings.map(function (h) {
+      if (!h || !h.accountId || !h.instrumentId) return null;
+      var q = findQuoteAsOf(a.quotes, h.instrumentId, limit);
+      var cur = q && q.currency ? q.currency : null;
+      var rate = !cur ? null
+        : cur === 'CNY' ? { rateDecimal: '1', rateDate: null, provider: null }
+          : findFxRateAsOf(a.fxRates, cur, 'CNY', limit);
+      return {
+        accountId: h.accountId,
+        instrumentId: h.instrumentId,
+        quantity: h.quantity,
+        priceMinor: q ? q.priceMinor : null,
+        priceCurrency: cur,
+        priceDate: q ? q.priceDate : null,
+        priceProvider: q ? q.provider : null,
+        fxRateDecimal: rate ? rate.rateDecimal : null,
+        fxRateDate: rate ? rate.rateDate : null,
+        fxProvider: rate ? rate.provider : null,
+        eventCounts: h.counts || null
+      };
+    }).filter(Boolean);
+  }
+
+  // baselinePositionsFromSnapshot(payload) — 从封存快照 payload 提取归因期初明细（G4E-1）。
+  // 快照在结账时封存了逐持仓的数量/价格/汇率/事件计数事实（checklist.facts.holdings）；
+  // 这是**唯一**的读取实现：结账路径（server/api.js）与前端基准切换（js/app.js）都必须经过它，
+  // 保证「期初腿用封存事实」只有一份判定。
+  // 返回 { positions: [...], unavailable: null }；payload 缺封存明细 →
+  // { positions: null, unavailable: 'baseline_details_missing' }（调用方不得改从事实表重算）。
+  function baselinePositionsFromSnapshot(payload) {
+    // 归因期初明细封存在快照 payload 的 attributionPositions 键（as-of 口径的基准月末逐持仓事实）；
+    // checklist.facts.holdings 是 Phase 3 的「结账时点最新价」口径，不能拿来做期初。
+    var positions = payload && Array.isArray(payload.attributionPositions)
+      ? payload.attributionPositions : null;
+    if (!positions) return { positions: null, unavailable: 'baseline_details_missing' };
+    var normalized = positions.filter(function (p) {
+      return p && (p.instrumentId || p.accountId);
+    }).map(function (p) {
+      return {
+        accountId: p.accountId == null ? null : String(p.accountId),
+        instrumentId: p.instrumentId == null ? null : String(p.instrumentId),
+        quantity: p.quantity == null ? null : String(p.quantity),
+        priceMinor: typeof p.priceMinor === 'number' && isFinite(p.priceMinor) ? p.priceMinor : null,
+        priceCurrency: p.priceCurrency || null,
+        priceDate: p.priceDate || null,
+        priceProvider: p.priceProvider || null,
+        fxRateDecimal: p.fxRateDecimal == null ? null : String(p.fxRateDecimal),
+        fxRateDate: p.fxRateDate || null,
+        fxProvider: p.fxProvider || null,
+        eventCounts: p.eventCounts && typeof p.eventCounts === 'object'
+          ? {
+            buy: p.eventCounts.buy | 0,
+            sell: p.eventCounts.sell | 0,
+            dividend: p.eventCounts.dividend | 0,
+            fee: p.eventCounts.fee | 0
+          }
+          : null
+      };
+    });
+    return { positions: normalized, unavailable: null };
+  }
+
   // computeReturnAttribution(assets, { now, settings, baseline }) — 4E 收益归因。
   // baseline 来自**已结账月快照**（D-034 ③ 的封存事实口径）：{ asOf, month, closeId, snapshotId, payloadHash }。
   // 没有 baseline 就逐行标注 no_baseline —— 宁可说不出来，也不给一个按今天口径倒推的假基准。
@@ -1275,8 +1349,11 @@
   // 汇率影响取**残差**，于是「价格影响 + 汇率影响 = 估值变化」逐行恒等，舍入缺口只落在汇率一侧，
   // 不会留下"归因不出来的差额"。两侧都是整数最小货币单位，全程不经浮点。
   //
-  // 期初数量 Q0 由 holdingsAsOf 在基准日重放事件求得（复用 deriveHoldings，不另写加减）；
-  // 期初价格与汇率走 as-of 查询（绝不返回基准日之后的行）。**绝不插值、绝不用 1:1 兜底。**
+  // 期初腿**只**认封存明细（D-045 复核补口 G4E-1）：期初数量、价格、汇率全部来自
+  // baseline.positions（封存快照 payload 的逐持仓事实，由 baselinePositionsFromSnapshot 提取），
+  // 绝不从当前事实表按历史日期重算 —— 结账之后补录旧业务日期的行情/汇率/事件/期初，
+  // 不得改写已结账月的期初值。调用方给不出封存明细时整段不出归因并显式说明原因，
+  // 绝不静默倒算。**绝不插值、绝不用 1:1 兜底。**
   // 不能分解的情形逐条写进 row.boundaries 并计入 totals.unattributedChangeCnyMinor；
   // 但只要能算出两端估值就照样给 ΔV ——「分解不了」与「算不出变化」是两件事。
   function computeReturnAttribution(assets, opts) {
@@ -1293,10 +1370,8 @@
     a.assetAccounts.forEach(function (x) { if (x && x.id) accountMap[x.id] = x; });
     a.instruments.forEach(function (x) { if (x && x.id) instrumentMap[x.id] = x; });
 
-    // 两端都按 as-of 截断，本期归因因此只依赖窗口内的事实：重算旧月份必然得到同一个结果，
-    // 也不会把结账之后才发生的行情或事件算进本期。
+    // 期末腿按今天（或查询日）as-of 截断；期初腿来自封存明细（见 startUnavailable）。
     var endSide = holdingsAsOf(a.holdings, a.securityEvents, now).holdings;
-    var startSide = baselineAsOf ? holdingsAsOf(a.holdings, a.securityEvents, baselineAsOf).holdings : [];
     var endByKey = {}, startByKey = {}, keys = [], keySeen = {};
     function indexInto(map, list) {
       list.forEach(function (h) {
@@ -1307,32 +1382,43 @@
       });
     }
     indexInto(endByKey, endSide);
-    indexInto(startByKey, startSide);
+
+    // G4E-1：期初腿的数据来源判定。只有拿到封存明细（baseline.positions 是数组）
+    // 才允许算归因；给不出明细就是「基准明细不可用」，绝不退回事实表重算。
+    var startUnavailable = null;
+    if (baselineAsOf) {
+      if (baseline.detailsUnavailable) startUnavailable = String(baseline.detailsUnavailable);
+      else if (!Array.isArray(baseline.positions)) startUnavailable = 'baseline_details_missing';
+      else indexInto(startByKey, baseline.positions);
+    }
 
     var ZERO_COUNTS = { buy: 0, sell: 0, dividend: 0, fee: 0 };
 
     // 没有基准日就**整段不出归因**（rows 为空 + unavailable 说明），而不是把期初数量当成 0 ——
-    // "期初 0"会读成"你当时没有持仓"，那正是要避免的假基准。有基准日时，"期初查不到这一条"
-    // 才是真实推断（事实按基准日截断后确实还不存在），可以放心用 '0' + position_opened 表达。
-    var rows = baselineAsOf ? keys.map(function (key) {
+    // "期初 0"会读成"你当时没有持仓"，那正是要避免的假基准。基准明细拿不到同理：
+    // startUnavailable 非空时 rows 为空并显式说明原因（baseline_details_missing / baseline_hash_mismatch），
+    // 绝不按今天的口径倒推期初。有封存明细时，"期初没有这一条"才是真实推断
+    //（基准快照封存的事实里确实没有），可以放心用 '0' + position_opened 表达。
+    var rows = baselineAsOf && !startUnavailable ? keys.map(function (key) {
       var end = endByKey[key] || null;
-      var start = startByKey[key] || null;
+      var start = startByKey[key] || null; // 封存期初明细；null = 基准快照里没有这条持仓
       var accountId = (end && end.accountId) || (start && start.accountId);
       var instrumentId = (end && end.instrumentId) || (start && start.instrumentId);
       var acct = accountMap[accountId];
       var ins = instrumentMap[instrumentId];
       var endQuantity = end ? end.quantity : '0';
-      var startQuantity = start ? start.quantity : '0';
+      var startQuantity = start ? (start.quantity != null ? start.quantity : '0') : '0';
       var endCounts = (end && end.counts) || ZERO_COUNTS;
-      var startCounts = (start && start.counts) || ZERO_COUNTS;
+      // 期初事件计数来自封存明细；老快照没封存时为 null —— periodEventCounts 输出 null，
+      // 不用当前事实表补算（补算就会随回填漂移）。
+      var startCounts = start ? (start.eventCounts || null) : ZERO_COUNTS;
 
-      // 期末腿也走 as-of（只认查询日当天及之前的事实），期初腿同理：两腿同一套查询语义，
-      // 差别只在日期。now = 今天且没有未来日期的事实行时，期末腿与决策台的当前估值逐分一致
-      //（自测里有专门断言）；结账快照用月末 asOf，于是"重算旧月份"得到的是历史结果而不是今天的结果。
+      // 期末腿走 as-of（只认查询日当天及之前的事实）：now = 今天且没有未来日期的事实行时，
+      // 期末腿与决策台的当前估值逐分一致（自测里有专门断言）。期初腿不用查 —— 封存明细自带
+      // 当时的价格与汇率事实。
       var q1 = findQuoteAsOf(a.quotes, instrumentId, now);
-      var q0 = findQuoteAsOf(a.quotes, instrumentId, baselineAsOf);
       var endCur = q1 && q1.currency != null ? q1.currency : null;
-      var startCur = q0 && q0.currency != null ? q0.currency : null;
+      var startCur = start ? (start.priceCurrency || null) : null;
       var endFx = null;
       if (endCur) {
         var endRaw = endCur === 'CNY'
@@ -1348,10 +1434,18 @@
         }
       }
       var startFx = null;
-      if (startCur) {
-        startFx = startCur === 'CNY'
-          ? { rateDecimal: '1', rateDate: null, provider: null }
-          : findFxRateAsOf(a.fxRates, startCur, 'CNY', baselineAsOf);
+      if (start) {
+        if (start.fxRateDecimal != null) {
+          startFx = {
+            rateDecimal: String(start.fxRateDecimal),
+            rateDate: start.fxRateDate || null,
+            provider: start.fxProvider || null,
+            status: null
+          };
+        } else if (startCur === 'CNY') {
+          // 老快照没封存汇率字段时，CNY→CNY 的恒等汇率是数学事实，不是插值兜底。
+          startFx = { rateDecimal: '1', rateDate: null, provider: null, status: null };
+        }
       }
 
       var row = {
@@ -1364,9 +1458,10 @@
         exposureMarket: ins && isExposureMarket(ins.exposureMarket) ? ins.exposureMarket : null,
         startQuantity: startQuantity,
         endQuantity: endQuantity,
-        startPriceMinor: q0 ? q0.priceMinor : null,
-        startPriceDate: q0 ? q0.priceDate : null,
-        startPriceProvider: q0 ? q0.provider : null,
+        // 期初价格/汇率直接来自封存明细（不再查事实表）；老快照没封存的字段如实输出 null。
+        startPriceMinor: start ? (start.priceMinor == null ? null : start.priceMinor) : null,
+        startPriceDate: start ? (start.priceDate || null) : null,
+        startPriceProvider: start ? (start.priceProvider || null) : null,
         endPriceMinor: q1 ? q1.priceMinor : null,
         endPriceDate: q1 ? q1.priceDate : null,
         endPriceProvider: q1 ? q1.provider : null,
@@ -1386,7 +1481,7 @@
         attributable: false,
         boundaries: [],
         notes: [],
-        periodEventCounts: {
+        periodEventCounts: startCounts == null ? null : {
           buy: endCounts.buy - startCounts.buy,
           sell: endCounts.sell - startCounts.sell,
           dividend: endCounts.dividend - startCounts.dividend,
@@ -1395,9 +1490,10 @@
       };
 
       if (!ins) row.boundaries.push('instrument_missing');
-      if (baselineAsOf && !q0) row.boundaries.push('missing_start_quote');
+      if (start && start.quantity == null) row.boundaries.push('holding_invalid');
+      if (start && start.priceMinor == null) row.boundaries.push('missing_start_quote');
       if (!q1) row.boundaries.push('missing_end_quote');
-      if (startCur && !startFx) row.boundaries.push('missing_start_fx');
+      if (startCur && startCur !== 'CNY' && !startFx) row.boundaries.push('missing_start_fx');
       if (endCur && !endFx) row.boundaries.push('missing_end_fx');
       if (startCur && endCur && startCur !== endCur) row.boundaries.push('currency_changed');
       if (endQuantity === '0') row.boundaries.push('position_closed');
@@ -1415,9 +1511,14 @@
       if (ins && ins.classificationStatus !== 'confirmed') row.notes.push('classification_unconfirmed');
 
       // 两端都能定价时才给 ΔV：「分解不了」与「算不出变化」是两件事。
+      // 期初侧：基准快照里没有这条持仓 → 0 股的估值恒为 0（数学事实），ΔV = 期末值；
+      // 有这条但价格/汇率封存不全 → 定不了价，变化额也不给。
       var l0 = null, l1 = null, v0 = null, v1 = null;
-      if (q0 && startFx) {
-        l0 = mulMinor(startQuantity, q0.priceMinor);
+      if (start == null) {
+        l0 = 0;
+        v0 = 0;
+      } else if (start.priceMinor != null && startFx && start.quantity != null) {
+        l0 = mulMinor(startQuantity, start.priceMinor);
         if (l0 != null) v0 = mulByRate(l0, startFx.rateDecimal);
       }
       if (q1 && endFx) {
@@ -1479,11 +1580,15 @@
         closeId: baseline.closeId || null,
         snapshotId: baseline.snapshotId || null,
         payloadHash: baseline.payloadHash || null,
-        status: baseline.status || null
+        status: baseline.status || null,
+        positionsCount: Array.isArray(baseline.positions) ? baseline.positions.length : null,
+        detailsUnavailable: baseline.detailsUnavailable || null
       } : null,
       rows: rows,
-      // 整段不可用的原因（目前只有一种）：界面据此说"还没有可比的已结账月"，不给任何数字。
-      unavailable: baselineAsOf ? null : 'no_baseline',
+      // 整段不可用的原因：no_baseline（没有更早的已结账月）/ baseline_details_missing
+      // （基准快照给不出封存的逐持仓明细）/ baseline_hash_mismatch（快照内容与封存哈希不符）。
+      // 界面据此说"为什么算不了"，不给任何按今天口径倒推的数字。
+      unavailable: !baselineAsOf ? 'no_baseline' : startUnavailable,
       totals: totals,
       valuation: {
         valuationStatus: overview.valuationStatus,
@@ -1537,6 +1642,8 @@
     convertToCny: convertToCny,
     MARKET_UNSPECIFIED: MARKET_UNSPECIFIED,
     computeAssetDrilldown: computeAssetDrilldown,
+    computeAttributionBaselinePositions: computeAttributionBaselinePositions,
+    baselinePositionsFromSnapshot: baselinePositionsFromSnapshot,
     computeReturnAttribution: computeReturnAttribution,
     daysBetween: daysBetween,
     isStaleDays: isStaleDays,
