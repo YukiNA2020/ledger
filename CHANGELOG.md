@@ -20,6 +20,29 @@
 - **空白 provider 不再冒充来源**：provider 必须在 `trim()` 后仍非空，quote/fx 构造与直接结果校验使用同一口径。
 - **纠正 T-002 与 4A 验收状态**：T-002 改为“汇率已定、行情待 4D 前决定”；D-038 只代表启用门禁，不再被写成已经选定行情源。4A 标记为“契约完成、正式验收暂不通过”。
 
+## [2.4.1-phase5a] - 2026-09-19
+
+Phase 5A 第一轮独立复核缺口补口（[`PHASE5A_ACCEPTANCE_GAPS.md`](./PHASE5A_ACCEPTANCE_GAPS.md) G5A-1 / G5A-2 / G5A-3）。三条缺口的共同点是「主路径测试全绿，但反向检查能复现」——因此本轮不只改实现，还补上**改回旧实现即变红**的反例。**仍是零迁移、零 API、零页面**：schema 保持 v7，延后写入登记 `POST /api/v1/risk-assessments` 仍为 501。措辞是「补口完成，等待独立复核确认」，不是「Phase 5 已通过」，也不进入 5B。
+
+### 修复
+
+- **G5A-1（P0）规则常量可被运行时改写 → 同一规则版本下相同答案算出不同结果**：`Domain.RISK_QUESTIONS` / `TARGET_TEMPLATES` / 等级边界 / 硬封顶等对外规则对象此前以可变数组直接导出，调用方一行 `Domain.RISK_QUESTIONS[0].options[0].score = 0` 就能把 15 分变成 12 分，而版本号仍是 `risk-rules-v1`。现在 5A 段落新增 `deepFreezeRisk` 并对 16 个对外规则常量**递归**冻结（覆盖题目 → 选项数组 → 选项、模板 → 类别表 → 类别行、边界条目、各词表）；内部评分与查表逻辑不再消费可写引用。`riskCatalog()` / `targetTemplateForLevel()` 继续返回**可写的深拷贝**（不是冻结视图），调用方改自己的副本不受限制。
+- **G5A-2（P1）未知 `targetVersion` 被建议契约接受**：`validateRecommendationRequest` 此前只要求 `targetVersion` 是非空字符串，`risk-targets-unknown` 会返回 `ok:true`。现在要求 `targetVersion === RISK_TARGET_VERSION`，未知 / 空 / 大小写或空格变体 / 与规则版本交叉错配一律 `invalid_target_template`（`ruleVersion` 错配仍是 `invalid_rule_version`）。
+- **G5A-3（P1）目标模板的额外资产类别未被拒绝**：`validateTargetTemplate` 此前只逐类检查六个已知类别是否齐备，加入 `crypto` 后仍返回 `ok:true`。现在用 `Object.getOwnPropertyNames(tpl.classes)` 要求类别数量恰为六且全部在 `RISK_CLASSES` 内（挡住 `Object.keys` 看不到的不可枚举键），并拒绝来自原型链的可枚举类别（`Object.create({crypto:…})`）；缺失与额外均返回稳定错误码 `invalid_target_template`。内置五级模板与 fixture 模板仍全部通过。
+
+### 新增
+
+- `tests/domain-phase5a.test.js` 新增 4 项反例（5A-19 / 5A-20 / 5A-21 / 5A-22，5A 定向 18 → **22 项**）：19 条原地修改尝试后评分与查表结果必须不变、规则内容仍须逐字段等于冻结副本、逐层 `Object.isFrozen`、连对外键整体换掉也不得影响内部结果；未知 / 空 / 错配目标版本 17 个反例；模板额外类别（不可枚举键 / 原型链 / 六类全继承 / JSON `__proto__` / 四种异常对象形状）；以及补口零回归（S5.1 冻结样例逐字段不变，S5_2 / S5_3 仍标注承载 5D、5A 不宣称其通过）。
+
+### 变更
+
+- `APP_VERSION` 与 SW 缓存键升至 `2.4.1-phase5a`（复核补口单独占一个版本；`js/domain.js` 是前端缓存资源，必须升版）。
+
+### 证据
+
+- 全量 `node --test` **508/508**（486 项 Phase 1–4E 基线**零回归** + 22 项 5A）、5A 定向 **22/22**，非沙箱实跑；浏览器 wiring **24/24 × 2 轮干净环境**；schema 停在 **v7**；零真实网络请求。
+- **反例有效性实测**：把 `tests/domain-phase5a.test.js` 的 domain 指回 `2.4.0-phase5a` 的实现后，5A-19 / 5A-20 / 5A-21（以及被连带污染的 5A-22）**全部变红**，原有 18 项保持全绿——证明新增用例确实锁住了这三条缺口，而不是「怎么改都绿」。
+
 ## [2.4.0-phase5a] - 2026-09-19
 
 Phase 5A｜风险问卷与配置规则冻结：在写数据库、API 和页面之前，把「题目、评分、目标区间与版本机制」定成唯一可执行定义（T-004 由「待定」转为「已定」，落地 DECISIONS D-046）。**本版本不建表、不开接口、不改页面**：schema 保持 v7，延后写入登记 `POST /api/v1/risk-assessments` 仍为 501。
