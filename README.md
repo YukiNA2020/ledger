@@ -4,6 +4,11 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 
 ## 当前状态
 
+- **最新：Phase 5A 已完整通过（`2.4.6-phase5a`），可以进入 5B**：G5A-1～12 全部闭合。最终复核除确认答案/模板自有字段与评分顺序确定性外，又锁住当前 `targetVersion` 下每个等级的唯一冻结模板，拒绝超过 JavaScript 安全整数范围的 `newFundsMinor`，并禁止未来评估日期被标成有效。5A 定向 **33/33**、全量 **519/519**、浏览器 wiring **24/24 × 2**；schema 仍为 v7，风险评估 API 仍为 501，零迁移、零 API、零页面。
+- **历史：Phase 5A 第四轮复核缺口 G5A-7 已补口（`2.4.4-phase5a`）**：认可标的数组只接受普通稠密自有数据索引，原型索引、访问器、稀疏槽位和额外属性全部 fail closed。当轮 5A 定向 **27/27**、全量 **513/513**。
+- **历史：Phase 5A 第三轮复核缺口 G5A-6 已补口（`2.4.3-phase5a`）**：`approvedInstruments` 现在只消费自有类别并拒绝自定义原型，不能再把继承值伪装成用户认可标的。当轮 5A 定向 **26/26**、全量 **512/512**。
+- **历史：Phase 5A 第二轮复核缺口 G5A-4/5 已补口（`2.4.2-phase5a`）**：模板校验绑定合法等级与当前目标版本；建议请求和两类引用对象执行精确键白名单。当轮 5A 定向 **25/25**、全量 **511/511**。
+
 - 已完成：原小账本 `v2.0.0-rc.3`，包含手动记账、多源账单导入、跨源核对、预算和消费体检等能力。
 - **v3 Phase 1「资产领域基础」已完成并验收（2026-09-14，`v2.1.0-phase1`）**：资产领域模型与 CNY/HKD/USD 折算聚合（`js/domain.js`）、首页资产决策台（空状态/估算口径/正式口径）、原首页下沉为现金流页、备份 Schema v2（旧 v1 备份仍可恢复）。
 - **v3 Phase 2「本地服务与 SQLite」已完成并验收（2026-09-14，`v2.2.1-phase2`）**：只监听 `127.0.0.1` 的本地服务与 `/api/v1`、SQLite 事实源（迁移器 + repository）、本地版本备份与恢复（每日 ≥1 份、保留 30 份、覆盖前强制备份）、macOS 登录启动脚本、Keychain 适配器、前端存储门面 `js/store.js`。补充验收发现的三个阻塞缺陷（SW 旧令牌、保存失败误报成功、恢复前无备份）已修复。
@@ -52,6 +57,7 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 - [NEXT_AGENT.md](./NEXT_AGENT.md)：下一位执行 Agent 的当前任务、边界和可复制指令。
 - [STATUS.md](./STATUS.md)：旧版开发状态与历史证据；新状态以本 README 和 ROADMAP 为准。
 - [TEST.md](./TEST.md)：旧版测试证据与验收入口。
+- [PHASE1_5A_REVIEW.md](./PHASE1_5A_REVIEW.md)：2026-09-20 对 Phase 1–5A 的完整状态复核、门禁与剩余阻塞。
 
 旧的 `Ledger_Plan.md`、`Ledger_PRD.md`、`Ledger_Implementation_Roadmap.md` 和 `docs/stages/` 保留为 v1/v2 历史档案，不再定义 v3 产品范围。
 
@@ -86,7 +92,7 @@ node server/main.js --no-open           # 不自动打开浏览器
 
 ```bash
 cd ledger
-node --test          # 504 项（2026-09-19 基线；须在非沙箱下运行，含 macOS Keychain 用例）
+node --test          # 519 项（2026-09-20 基线；须在非沙箱下运行，含 macOS Keychain 用例）
 
 # 浏览器接线验收必须先由本地服务托管，并使用临时数据目录：
 node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
@@ -97,4 +103,6 @@ node server/main.js --data-dir "$(mktemp -d)" --port 8499 --no-open
 
 ## 下一步
 
-Phase 5A 已把风险问卷的规则与领域契约冻结（D-046），当前全量 **508/508**、5A 定向 **22/22**、浏览器 wiring **24/24 × 2**，schema 停在 **v7**。**下一步不是 5B，而是对第 1 轮独立复核三条缺口（G5A-1/2/3）的补口做独立复核**（自己重跑最小复现 + 反向验证「把实现改回旧版即变红」），结论写入 [PHASE5A_ACCEPTANCE_GAPS.md](./PHASE5A_ACCEPTANCE_GAPS.md)；复核通过后再进入 **5B：把冻结的规则做成可填写、可保存、可追溯、可到期的风险评估**（双评分领域函数、`risk_assessments` 持久化与迁移、`POST /api/v1/risk-assessments`、问卷 UI），入口与禁区见 [NEXT_AGENT.md](./NEXT_AGENT.md)。Phase 4E 的独立复核结论以 [PHASE4E_ACCEPTANCE_GAPS.md](./PHASE4E_ACCEPTANCE_GAPS.md) 为准；Phase 4A 的正式验收仍为待定，行情自动抓取继续保持关闭。
+进入 **Phase 5B**：新增 `risk_assessments` 持久化、迁移 v8、风险评估 API 与问卷 UI；服务端必须从原始答案重算，不能采信客户端分数或等级。5B 版本从 `2.4.7-phase5b` 开始。
+
+当前 Phase 1–5A 的完整状态见 [PHASE1_5A_REVIEW.md](./PHASE1_5A_REVIEW.md)。Phase 5A 最终全量 **519/519**、定向 **33/33**、浏览器 wiring **24/24 × 2**，schema 停在 **v7**，已通过验收。Phase 4A 的正式验收仍因行情源证据门禁未闭合而待定，自动行情继续关闭；4B–4E 的补口状态以各自验收缺口文档为准。

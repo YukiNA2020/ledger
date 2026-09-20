@@ -268,15 +268,19 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 ### Phase 5A｜规则冻结与领域契约
 
-状态：**规则冻结完成 + 第 1 轮独立复核缺口（G5A-1/2/3）补口完成（2026-09-19，`2.4.1-phase5a`），等待独立复核确认**（不是「已通过」，也不进入 5B）。口径冻结见 `DECISIONS.md` **D-046**（含补口条款），T-004 由「待定」改为「✅ 已定」。
+最终收口：G5A-8/9 已独立确认；最终复核新增并闭合 G5A-10/11/12——当前 `targetVersion` 绑定每个等级的唯一冻结模板，`newFundsMinor` 必须是非负安全整数，未来评估日 fail closed；规则图交叉引用也已固化。`2.4.6-phase5a` 下 5A 定向 33/33、全量 519/519、浏览器 wiring 24/24 × 2，Phase 5A 已通过，可进入 5B。
+历史补口：第四轮复核发现的 G5A-7 已在 `2.4.4-phase5a` 修复，认可标的数组只接受普通稠密自有数据索引；当轮 5A 定向 27/27、全量 513/513，后续完整复核已确认闭合。
+历史补口：第三轮复核发现的 G5A-6 已在 `2.4.3-phase5a` 修复，`approvedInstruments` 只消费自有类别并拒绝自定义原型；当轮 5A 定向 26/26、全量 512/512，后续复核已确认对象层闭合。
+
+状态：**已通过（2026-09-20，`2.4.6-phase5a`）**。G5A-1～12 全部闭合，下一子阶段为 5B。
 
 交付物：
 
 - `js/domain.js` 新增「风险问卷规则与配置契约（Phase 5A，D-046）」段落：9 道题（能力 5 / 意愿 4）与选项分值、等级边界（**下界含入**）、4 条硬封顶、5 级目标模板（六类 `minBps/targetBps/maxBps`，Σtarget 精确 100%、**个股 target 恒为 0**）、容忍带（**端点含入**）、复评词表与 365 天 / 30 天有效期、稳定错误码、建议输入输出契约与排序尾差规则；纯契约函数 `validateRiskAnswers` / `scoreRiskAnswers` / `assessmentValidity` / `addCalendarDays` / `isCalendarDate` / `validateTargetTemplate` / `targetTemplateForLevel` / `compareToRange` / `validateRecommendationRequest` / `recommendationContract` / `riskCatalog`（既有函数签名与语义未改动）。**补口**：新增 `deepFreezeRisk` 递归冻结 16 个对外规则常量（只冻第一层挡不住 `RISK_QUESTIONS[0].options[0].score = 0`）；
 - `tests/fixtures/phase5-risk-rules.json`：规则冻结副本（题库 / 分值 / 边界 / 硬封顶 / 模板 / 复评词表 / 错误码 / 建议契约）+ S5.1 / S5.2 / S5.3 样例 + 19 条边界与反例矩阵（逐条标注承载子阶段）；测试逐字段比对 domain 常量，改规则必须同时改 fixture；
-- `tests/domain-phase5a.test.js`：**22 项**，覆盖 fixture ↔ domain 逐字段一致、题库结构完整性、模板守恒与单调性、阈值逐点归属、硬封顶只降不升、缺答 / 未知题目 / 未知选项 / 重复回答 fail closed（detail 不回显输入原文）、确定性与答案排列顺序无关、有效期三态边界（含闰年与伪日历日）、建议契约正反例、容忍带端点归属、范围守卫（零迁移 / 零新路由 / 零网络 / 零随机 / 不读系统时钟），**以及第 1 轮复核三条缺口（G5A-1/2/3）的反向用例 5A-19～5A-22 —— 改回旧实现即变红**。
+- `tests/domain-phase5a.test.js`：**33 项**；5A-28 锁住答案行/模板行原型链与访问器注入，5A-29 锁住完整评分结果的顺序确定性，5A-30 锁住规则图引用，5A-31/32/33 锁住唯一冻结模板、安全整数金额与未来评估日。
 
-退出证据（2026-09-19 实跑）：全量 `node --test` **508/508**（486 基线零回归 + 22 项 5A）、5A 定向 **22/22**，非沙箱实跑；浏览器 wiring **24/24 × 2 轮干净环境**（5A 零前端逻辑改动，属回归确认）；schema 停在 **v7**——**零新迁移、零新 API、零新页面**；自动测试零真实网络请求。`APP_VERSION` 与 SW 缓存键升至 `2.4.1-phase5a`（`js/domain.js` 属前端缓存资源，必须升版；复核补口单独占一个版本）。
+退出证据（2026-09-20 实跑）：全量 `node --test` **519/519**、5A 定向 **33/33**，非沙箱实跑；浏览器 wiring 在两个全新临时数据目录均为 **24/24**；schema 停在 **v7**——**零新迁移、零新 API、零新页面**；自动测试零真实网络请求。`APP_VERSION` 与 SW 缓存键升至 `2.4.6-phase5a`。
 
 复核记录：`2.4.0-phase5a` 的第 1 轮独立复核结论为**暂不通过**（G5A-1 P0：规则常量可被原地修改；G5A-2 P1：未知 `targetVersion` 被接受；G5A-3 P1：模板额外类别未被拒绝），原文与逐条补口状态见 [`PHASE5A_ACCEPTANCE_GAPS.md`](./PHASE5A_ACCEPTANCE_GAPS.md)。
 

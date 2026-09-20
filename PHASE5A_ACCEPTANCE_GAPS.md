@@ -3,9 +3,299 @@
 > 复核日期：2026-09-19  
 > 复核对象：`2.4.0-phase5a`（提交 `6efbb16` + `39dcbcf`）  
 > 复核范围：`PHASE5_BREAKDOWN.md` §4、`DECISIONS.md` D-046、`ACCEPTANCE.md` S5.1–S5.3 中属于 5A 的规则与契约部分  
-> 本轮结论：**暂不通过验收，不进入 Phase 5B。**
+> 最终结论（2026-09-20）：**Phase 5A 通过，可进入 Phase 5B。**
 
 ## 补口轮次与逐条状态（倒序，最新在上）
+
+### 最终完整复核与收口（2026-09-20，`2.4.6-phase5a`）
+
+> 结论：**G5A-1～12 全部闭合，Phase 5A 退出条件满足；下一阶段入口切换为 Phase 5B。**
+
+- **G5A-8 / G5A-9 独立复核通过：** 重造答案与模板的继承字段、访问器、额外字段、异常数组反例均 fail closed；同一答案的不同排列直接深比较完整评分结果一致，调用方数组不被修改。
+- **G5A-10（本轮发现并闭合）：** `validateTargetTemplate()` 此前只验证比例自洽，允许在 `risk-targets-v1` 下提交另一套仍合计 100% 的比例。现在结构与比例校验通过后，还必须逐类别、逐字段等于该等级在当前 `targetVersion` 中的唯一冻结模板；同版本不能偷换配置。
+- **G5A-11（本轮发现并闭合）：** `newFundsMinor` 此前接受超过 `Number.MAX_SAFE_INTEGER` 的整数值，后续金额分配存在精度风险。现在所有 5A 非负整数入口统一要求安全整数；最大安全整数通过，超界值返回 `invalid_new_funds`。
+- **G5A-12（本轮发现并闭合）：** `assessmentValidity()` 此前把晚于 `now` 的评估日期标成有效。现在未来评估日统一返回 `invalid_assessment_date`，当天与历史评估仍按冻结的 365/30 天口径计算。
+- **规则图完整性：** 新增 5A-30，锁住每题恰有 0/1/2/3 四档、能力/意愿最大分 15/12、等级边界不越域，以及硬封顶的 code 唯一、题目/分值/等级/解释卡引用全部可解析。
+- **反向验证：** 补口前实现会接受“同版本替换比例”“不安全整数金额”和“未来评估日期”；新 5A-31/32/33 对应锁死。此前 5A-28/29 的反向验证继续有效。
+
+最终实测：5A 定向 **33/33**；沙箱外全量 **519/519**；浏览器 wiring **24/24 × 2 个全新临时数据目录**；`node --check js/app.js js/domain.js sw.js` 与 `git diff --check` 通过。schema 仍为 **v7**，`POST /api/v1/risk-assessments` 仍为延后登记 501；零迁移、零 API、零页面、零真实网络请求。`APP_VERSION` 与 SW 缓存键升至 `2.4.6-phase5a`。
+
+### 第五轮完整复核缺口补口（2026-09-20，`2.4.5-phase5a`）
+
+> 状态：**G5A-8 / G5A-9 补口完成，等待独立复核确认；5A 仍不进入 5B。**
+
+- **G5A-8：** 答案容器现在只接受普通稠密自有数据数组；答案行必须精确包含自有数据属性 `questionId` / `optionId`。目标模板顶层、`classes` 与每个比例行应用同一精确自有字段契约；自定义原型、继承字段、访问器、额外字符串/Symbol 属性全部 fail closed，不执行 getter。`Object.create(null)` 的 JSON 等价纯数据对象继续允许。
+- **G5A-9：** `validateRiskAnswers()` 校验后按冻结 `RISK_QUESTIONS` 顺序重建答案；`scoreRiskAnswers()` 的完整返回值（包括 `scored`）不再依赖调用方排列顺序，也不修改调用方数组。
+- **反向验证：** 把 5A-28/29 指向本轮补口前的 `HEAD:js/domain.js`，两项均稳定失败：旧实现接受继承答案字段，且正序/倒序评分的 `scored` 顺序不同。
+
+实测：5A 定向 **29/29**；沙箱外全量 **515/515**；浏览器 wiring **24/24 × 2 个全新临时数据目录**；schema 仍为 **v7**，`POST /api/v1/risk-assessments` 仍为延后登记 501。零迁移、零 API、零页面、零真实网络。`APP_VERSION` 与 SW 缓存键升至 `2.4.5-phase5a`。
+
+### 第五轮完整独立复核（2026-09-19，复核工作区 `2.4.4-phase5a`）
+
+> 结论：**G5A-7 补口通过；完整复核新发现 G5A-8 / G5A-9。5A 仍暂不通过，不能进入 5B。**
+
+| ID | 优先级 | 复核结论 | 独立实测 |
+|---|---:|---|---|
+| G5A-7 | P0 | ✅ 补口通过 | 自定义数组原型、继承索引、无 `slice` 原型、稀疏数组、额外字符串/Symbol 属性和访问器均稳定拒绝；普通/空数组通过 |
+| G5A-8 | P1 | ❌ 新缺口 | 风险答案行和目标模板比例行仍会读取原型链字段；没有自有 `questionId/optionId` 或 `minBps/targetBps/maxBps` 的对象可被判为合法 |
+| G5A-9 | P1 | ❌ 新缺口 | 同一组答案仅改变数组顺序时，评分主体相同但返回的 `scored` 数组顺序变化，完整结果不能逐字段复算；现有测试先排序再比较，掩盖了该差异 |
+
+#### G5A-8｜答案与模板行未执行自有字段契约（P1）
+
+建议契约经过多轮补口后已采用普通对象、精确键和自有值规则，但 5A 的另外两个入口仍使用宽松属性读取：
+
+- `validateRiskAnswers()` 仅用 `row.questionId` / `row.optionId` 读取答案，因此两个字段全部来自原型链、答案行自身没有任何数据时仍通过。
+- `validateTargetTemplate()` 对每个类别行用 `row.minBps` / `targetBps` / `maxBps` 读取比例，因此三个字段来自不可枚举原型属性时仍通过。
+
+独立复现结果：
+
+```text
+inherited-answer-row = {"ok":true,...}
+inherited-template-row = {"ok":true}
+```
+
+修复门槛：
+
+- 答案容器必须是普通稠密数组；每个答案行必须是普通自有数据对象，精确包含 `questionId` / `optionId`，不得读取原型链、访问器或额外派生分数字段。
+- 模板自身、`classes` 和每个类别比例行使用一致的普通对象/精确键规则；比例必须来自自有数据属性，不执行 getter。
+- 非法结构返回当前稳定错误码，不得抛异常；同时保留正常 JSON 对象和 null-prototype 数据对象是否允许的明确决定。
+
+#### G5A-9｜答案顺序改变会改变完整评分结果（P1）
+
+`scoreRiskAnswers()` 的分数、等级和封顶不依赖答案顺序，但 `scored` 直接沿用输入顺序。相同九道题的答案正序与倒序会得到不同 JSON：
+
+```text
+answer-order-full-equal = false
+first = q_income_stability / q_fx_understanding
+```
+
+现有 5A-11 在比较前调用 `stripScored()` 对该数组排序，因此测试标题声称“与答案排列顺序无关”，实际只证明除 `scored` 外的字段无关。这与 5A 的“相同语义输入得到逐字段稳定结果”和后续持久化可复算目标不一致。
+
+修复门槛：
+
+- `validateRiskAnswers()` 或 `scoreRiskAnswers()` 按冻结题库顺序规范化 `scored`，不能依赖调用方数组顺序。
+- 新反例直接 `deepStrictEqual(scoreRiskAnswers(a), scoreRiskAnswers(reverse(a)))`，不得在断言前对返回值二次排序。
+- 确认规范化不修改调用方数组，并保持 S5.1 样例逐字段不变或按明确版本化契约更新。
+
+#### 第五轮测试证据
+
+```text
+node --test tests/domain-phase5a.test.js
+27/27 通过
+
+node --test
+513/513 通过（非沙箱、真实用户身份）
+```
+
+全量回归证明普通路径无回归，但当前 27 项没有覆盖 G5A-8，并主动规避了 G5A-9 的完整结果差异。schema 仍为 v7；零迁移、零 API、零页面。本轮只追加复核记录，没有修改实现代码或进入 5B。
+
+### 第四轮独立复核缺口补口（2026-09-19，`2.4.4-phase5a`）
+
+> 状态：**G5A-7 补口完成，等待独立复核确认；5A 仍不进入 5B。**
+
+- 认可标的列表只接受原型严格为 `Array.prototype` 的普通数组。
+- 数组必须稠密且只有 `length` 与自有数字索引；额外字符串键、不可枚举键、Symbol、稀疏槽位和访问器一律拒绝。
+- 校验通过后从属性描述符中的自有数据值构造新数组，不调用可能被替换的实例 `slice()`，非法形状稳定返回 `invalid_approved_instruments`。
+- 5A-27 覆盖继承索引、无 `slice` 原型、稀疏数组、额外属性、Symbol、抛错 getter，以及普通/空数组正例；指向补口前实现时稳定失败。
+
+定向测试 **27/27**，沙箱外全量 **513/513**；版本升至 `2.4.4-phase5a`。schema 仍为 v7，零迁移、零 API、零页面、零真实网络。
+
+### 第四轮独立复核（2026-09-19，复核工作区 `2.4.3-phase5a` 补口）
+
+> 结论：**G5A-6 的映射对象层补口有效，但数组元素层仍可被原型链注入；新记 G5A-7。5A 暂不通过，不能进入 5B。**
+
+| ID | 优先级 | 复核结论 | 独立实测 |
+|---|---:|---|---|
+| G5A-6 | P0 | ✅ 对象层闭合 | 继承的已知/未知类别、自定义原型、不可枚举/Symbol 原型属性均拒绝；普通对象、空对象和 null-prototype 空映射正常通过 |
+| G5A-7 | P0 | ❌ 新缺口 | 类别值数组允许自定义原型；继承的数组索引会被读取并经 `slice()` 复制为认可标的，另一种原型形状会直接抛 `TypeError` 而非 fail closed |
+
+#### G5A-7｜认可标的数组仍可通过原型索引注入（P0）
+
+`approvedInstruments` 映射本身现已要求普通对象或 null-prototype 对象，但每个类别对应的数组只检查 `Array.isArray()`。数组可以保持 `Array.isArray === true` 的同时改写原型，并从原型继承索引值。当前循环通过 `map[cls][j]` 读取该继承值，随后 `slice()` 又会把它复制成自有元素，最终仍把未由用户提交的标的变成“用户认可标的”。
+
+最小复现：
+
+```js
+const proto = Object.create(Array.prototype);
+Object.defineProperty(proto, '0', {
+  value: 'inst-inherited-array-slot',
+  enumerable: false
+});
+const injected = [];
+injected.length = 1;
+Object.setPrototypeOf(injected, proto);
+
+// 把 injected 放入 approvedInstruments.broad_equity 后，当前错误结果为：
+// { ok: true, approvedInstruments: { broad_equity: ['inst-inherited-array-slot'] } }
+```
+
+若把数组原型直接改为不继承 `Array.prototype` 的对象，前置逐项校验仍可能通过，但执行 `map[cls].slice()` 时会抛 `TypeError: ...slice is not a function`，同样违反非法输入必须返回稳定错误码而不是抛栈的 fail-closed 契约。
+
+修复门槛：
+
+- 类别数组只接受原型严格为 `Array.prototype` 的普通数组，或逐项要求索引为数组自有属性并使用不依赖实例原型的复制方式。
+- 稀疏数组、自定义数组原型、继承索引、额外字符串/Symbol 属性必须有明确且一致的拒绝规则。
+- 非法数组形状一律返回 `invalid_approved_instruments`，不得抛异常。
+- 增加普通数组、空数组正例，以及上述继承索引和无 `slice` 原型的攻击性反例。
+
+测试证据：5A 定向 **26/26**；沙箱外全量 **512/512**。当前用例没有深入校验认可标的数组本身的原型与自有索引，因此全量绿色不能覆盖 G5A-7。本轮只追加复核证据，没有修改实现代码或进入 5B。
+
+### 第三轮独立复核缺口补口（2026-09-19，`2.4.3-phase5a`）
+
+> 状态：**G5A-6 补口完成，等待独立复核确认；5A 仍不进入 5B。**
+
+- `hasExactRiskKeys` 现在只接受原型为 `Object.prototype` 或 `null` 的纯数据对象，完整拒绝自定义原型（包括不可枚举属性与 Symbol）。
+- `approvedInstruments` 先按 `RISK_CLASSES` 做精确键校验，再只读取自有类别；继承的已知/未知类别都不能进入结果。
+- 5A-26 覆盖继承的已知类别、未知类别、不可枚举原型属性、Symbol 原型属性、普通空映射、自有合法映射与无原型空映射。
+- 反向验证指向补口前实现时 5A-26 稳定失败：继承的 `broad_equity` 被错误接受并产出未认可标的。
+
+定向测试 **26/26**，沙箱外全量 **512/512**；版本升至 `2.4.3-phase5a`。schema 仍为 v7，零迁移、零 API、零页面、零真实网络。
+
+### 第三轮独立复核（2026-09-19，复核工作区 `2.4.2-phase5a` 补口）
+
+> 结论：**G5A-4 / G5A-5 主补口复核通过；新发现 G5A-6，5A 仍暂不通过，不进入 5B。**
+
+| ID | 优先级 | 复核结论 | 独立实测 |
+|---|---:|---|---|
+| G5A-4 | P1 | ✅ 补口通过 | 缺失、字符串、越界、小数 `level` 以及未知、空格/大小写变体 `templateVersion` 均拒绝；五个内置模板继续通过 |
+| G5A-5 | P1 | ✅ 主补口通过 | 顶层请求、`snapshotRef`、`assessmentRef` 的额外自有键、不可枚举自有键、Symbol 键和可枚举原型链注入均拒绝；合法输入保持通过 |
+| G5A-6 | P0 | ❌ 新缺口 | `approvedInstruments` 会读取原型链继承的已知类别并把其中标的复制为“用户认可”；同一白名单助手还漏过不可枚举的原型属性 |
+
+#### G5A-6｜原型链可注入“用户认可标的”（P0）
+
+`validateRecommendationRequest()` 对顶层和两个引用对象使用 `hasExactRiskKeys()`，但 `approvedInstruments` 仍沿用“按类别直接读取 + `for...in` 只检查自有未知键”的旧逻辑。若映射对象从原型继承 `broad_equity`，函数会通过 `map[cls]` 读到继承数组并复制到输出；随后的循环遇到继承键反而因为 `hasOwnProperty === false` 跳过拒绝。结果是调用方没有提交任何自有映射，却得到一个“已认可标的”。这直接违反“只映射用户认可标的”的 Phase 5 不变量。
+
+最小复现：
+
+```js
+const Domain = require('./js/domain.js');
+const approvedInstruments = Object.create({
+  broad_equity: ['inst-not-approved']
+});
+const result = Domain.validateRecommendationRequest({
+  snapshotRef: { closeId: 'c', snapshotId: 's', payloadHash: 'a'.repeat(64) },
+  assessmentRef: { id: 'r', ruleVersion: Domain.RISK_RULE_VERSION },
+  targetVersion: Domain.RISK_TARGET_VERSION,
+  ruleVersion: Domain.RISK_RULE_VERSION,
+  newFundsMinor: 1,
+  approvedInstruments
+});
+
+console.log(result);
+// { ok: true, approvedInstruments: { broad_equity: ['inst-not-approved'] } }
+```
+
+同一轮还确认 `hasExactRiskKeys()` 只用 `for...in` 检查原型链，因此不可枚举的原型属性能够绕过其“拒绝原型链注入”的声明：
+
+```js
+const proto = {};
+Object.defineProperty(proto, 'capacityScore', { value: 999, enumerable: false });
+const payload = Object.assign(Object.create(proto), validRequest);
+Domain.validateRecommendationRequest(payload); // 仍为 ok:true
+```
+
+第二条当前不会进入返回值，但说明精确白名单助手并不真正精确；未来调用方读取继承属性时会重新出现同类问题。
+
+修复门槛：
+
+- `approvedInstruments` 必须只消费自有属性；已知类别来自原型链时也必须拒绝，不能复制成认可映射。
+- 对象契约明确只接受普通自有数据对象，或完整检查整个原型链的字符串键、不可枚举键与 Symbol；不能只检查 `for...in` 可见部分。
+- 增加继承的已知/未知类别、不可枚举原型属性、Symbol 原型属性，以及普通空映射/自有合法映射的正反例。
+- 修复后再次确认无认可映射仍返回 `{}`，不会静默生成任何标的。
+
+#### 第三轮测试证据
+
+```text
+node --test tests/domain-phase5a.test.js
+25/25 通过
+
+node --test
+511/511 通过（非沙箱、真实用户身份）
+```
+
+当前 25 项没有覆盖 G5A-6，因此全量绿色不构成该缺口的闭合证据。schema 仍为 v7；本轮只更新复核记录，没有修改实现代码或进入 5B。
+
+### 第二轮独立复核缺口补口（2026-09-19，`2.4.2-phase5a`）
+
+> 状态：**G5A-4 / G5A-5 补口完成，等待独立复核确认；5A 仍不进入 5B。** 本轮不改任何题目、分值、边界、硬封顶或目标比例。
+
+| ID | 状态 | 修复与反例 |
+|---|---|---|
+| G5A-4 | ✅ 已补口 | `validateTargetTemplate` 要求 `level` 是 `RISK_LEVELS` 中的整数且 `templateVersion === RISK_TARGET_VERSION`；5A-23 覆盖缺失、字符串、越界、小数、未知版本及空格/大小写变体，五个内置模板与 fixture 仍通过 |
+| G5A-5 | ✅ 已补口 | 建议请求执行冻结的顶层键白名单：五个核心键必填，`approvedInstruments` 可选；两个引用对象也执行精确键集合；额外自有键、不可枚举键及原型链注入均 fail closed。5A-24 覆盖反例，5A-25 锁定合法输入零回归 |
+
+实测：5A 定向 **25/25**；沙箱外全量 **511/511**；schema 仍为 v7，零迁移、零 API、零页面、零真实网络。反向验证把新测试指向本轮修改前的 `HEAD:js/domain.js`：5A-23 / 5A-24 均失败，5A-25 通过。`APP_VERSION` 与 SW 缓存键同步升至 `2.4.2-phase5a`。
+
+### 第二轮独立复核（2026-09-19，复核 `2.4.1-phase5a`）
+
+> 结论：**G5A-1 / G5A-2 / G5A-3 补口复核通过；新发现 G5A-4 / G5A-5，5A 仍暂不通过，不进入 5B。**
+
+| ID | 优先级 | 复核结论 | 独立实测 |
+|---|---:|---|---|
+| G5A-1 | P0 | ✅ 补口通过 | 依次尝试修改选项分值、目标比例、硬封顶等级和资产类别词表，评分仍为 15、嵌套对象 `Object.isFrozen === true`；整体替换导出键不改变内部闭包引用，新增 5A-19 通过 |
+| G5A-2 | P1 | ✅ 补口通过 | `risk-targets-unknown` 返回 `invalid_target_template`；空值、空白、大小写/空格变体和交叉错配由 5A-20 覆盖 |
+| G5A-3 | P1 | ✅ 补口通过 | 普通额外类别 `crypto` 返回 `invalid_target_template`；不可枚举键、原型链、JSON `__proto__` 和异常对象形状由 5A-21 覆盖 |
+| G5A-4 | P1 | ❌ 新缺口 | `validateTargetTemplate` 不验证模板自身的 `level` 与 `templateVersion`；`level=999` 且 `templateVersion='risk-targets-unknown'` 仍返回 `{ok:true}` |
+| G5A-5 | P1 | ❌ 新缺口 | `validateRecommendationRequest` 没有执行冻结的 `RECOMMENDATION_INPUT_KEYS` 白名单；夹带 `capacityScore`、`currentAllocation` 等派生字段仍返回 `{ok:true}` |
+
+#### G5A-4｜目标模板元数据未纳入合法性校验（P1）
+
+`validateTargetTemplate()` 已严格验证六类比例，却完全忽略 `tpl.level` 和 `tpl.templateVersion`。这使未知风险等级与未知目标版本可以被判为“合法模板”，与 D-046 ⑤/⑦的“5 级模板 + 版本绑定”冲突。
+
+最小复现：
+
+```js
+const Domain = require('./js/domain.js');
+const template = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+template.level = 999;
+template.templateVersion = 'risk-targets-unknown';
+console.log(Domain.validateTargetTemplate(template)); // { ok: true }
+```
+
+修复门槛：
+
+- `level` 必须是 `RISK_LEVELS` 中唯一合法的整数等级；不得接受字符串、越界值或缺失值。
+- `templateVersion` 必须解析到当前明确支持的目标版本；5A 只有 `RISK_TARGET_VERSION`，因此应精确相等。
+- 增加缺失、未知、类型错误、空格/大小写变体的反例，并确认五个内置模板仍通过。
+
+#### G5A-5｜建议输入键集合只声明、未执行（P1）
+
+D-046 ⑥与 `RECOMMENDATION_INPUT_KEYS` 都冻结了“输入只含引用与用户判断”，但 `validateRecommendationRequest()` 只逐项读取已知字段，不拒绝额外顶层键。客户端可以夹带 `capacityScore`、`riskCeiling`、`currentAllocation` 或 `blockers` 等服务端应重算的派生值，校验仍成功。即使后续实现选择忽略这些字段，契约也不再是声明的白名单，5B/5D 容易误用客户端派生事实。
+
+最小复现：
+
+```js
+const Domain = require('./js/domain.js');
+const result = Domain.validateRecommendationRequest({
+  snapshotRef: { closeId: 'c', snapshotId: 's', payloadHash: 'a'.repeat(64) },
+  assessmentRef: { id: 'r', ruleVersion: Domain.RISK_RULE_VERSION },
+  targetVersion: Domain.RISK_TARGET_VERSION,
+  ruleVersion: Domain.RISK_RULE_VERSION,
+  newFundsMinor: 1,
+  approvedInstruments: {},
+  capacityScore: 999,
+  currentAllocation: { crypto: 10000 }
+});
+console.log(result); // { ok: true, approvedInstruments: {} }
+```
+
+修复门槛：
+
+- 请求体自有键集合必须与 `RECOMMENDATION_INPUT_KEYS` 契约一致；若 `approvedInstruments` 允许省略，应把“必填键”和“可选键”在机器契约中分别冻结。
+- 未知键、不可枚举键和原型链注入均 fail closed，错误 detail 不回显载荷原文。
+- `snapshotRef` / `assessmentRef` 是否也要求精确键集合，应在本轮一并冻结并用反例锁定，避免派生分数或完整快照被夹带进引用对象。
+
+#### 第二轮测试证据
+
+```text
+node --test tests/domain-phase5a.test.js
+22/22 通过
+
+node --test
+508/508 通过（非沙箱、真实用户身份）
+```
+
+schema 仍为 v7；风险评估 API 仍未实现；本轮未修改实现代码。全量绿色不覆盖 G5A-4/5，因为当前 22 项没有对应反例。
 
 ### 第 1 轮复核缺口补口（2026-09-19，`2.4.1-phase5a`）
 

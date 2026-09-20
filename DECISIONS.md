@@ -60,6 +60,16 @@
 > D-046 实现补充（2026-09-19，第一轮独立复核前）：规则常量与纯契约函数位于 `js/domain.js` 的「风险问卷规则与配置契约（Phase 5A，D-046）」段落（导出于 `Domain.RISK_*` / `Domain.validateRiskAnswers` / `Domain.scoreRiskAnswers` / `Domain.assessmentValidity` / `Domain.validateTargetTemplate` / `Domain.compareToRange` / `Domain.validateRecommendationRequest` / `Domain.recommendationContract`）；`tests/domain-phase5a.test.js` 含范围守卫，断言 5A 期间迁移版本停在 v7、`server/api.js` 未新增风险路由。
 > D-046 补口（2026-09-19，第一轮独立复核 G5A-1/2/3 后，`2.4.1-phase5a`）：① **对外规则常量必须深度冻结** —— `Object.freeze` 只冻第一层等于没冻，必须递归到题目 → 选项数组 → 选项（以及边界 / 硬封顶 / 模板 / 类别 → 类别行 / 各词表），内部评分与查表逻辑**不得消费调用方可写的引用**，否则同一 `ruleVersion` 下相同答案能算出不同结果；需要可写副本的调用方走 `riskCatalog()` / `targetTemplateForLevel()`（返回深拷贝，不是冻结视图）。② **`targetVersion` 必须是当前可用版本**（`=== RISK_TARGET_VERSION`），「非空字符串」不足以挡住 `risk-targets-unknown`；将来支持历史模板时必须按显式版本目录解析，不得退回任意非空串。③ **目标模板的资产类别必须与 `RISK_CLASSES` 精确相等**：用 `Object.getOwnPropertyNames` 要求类别数量恰为六且全部在词表内（否则可用 `defineProperty` 藏一个不可枚举类别绕过），并拒绝来自原型链的可枚举类别（`Object.create({crypto:…})`）；缺失与额外一律 fail closed、稳定错误码 `invalid_target_template`。三条缺口均属「测试全绿但不等于通过验收」——修复同时必须补**反向**断言（把实现退回旧版即变红）。
 
+> D-046 第二轮补口（2026-09-19，G5A-4/5，`2.4.2-phase5a`）：① 目标模板合法性同时校验元数据，`level` 必须是 `RISK_LEVELS` 中的整数且 `templateVersion === RISK_TARGET_VERSION`；② 建议输入执行精确键白名单，五个核心顶层键必填、`approvedInstruments` 可选，`snapshotRef` 与 `assessmentRef` 也只允许各自冻结的引用键；额外自有键（含不可枚举键）及原型链注入一律 fail closed。
+
+> D-046 第三轮补口（2026-09-19，G5A-6，`2.4.3-phase5a`）：建议契约对象只接受普通对象或 `Object.create(null)` 纯数据对象；任何自定义原型一律拒绝。`approvedInstruments` 只消费自有资产类别，继承的已知类别也不得被复制成“用户认可标的”。
+
+> D-046 第四轮补口（2026-09-19，G5A-7，`2.4.4-phase5a`）：认可标的类别值只接受普通稠密数组及自有数据索引；拒绝自定义数组原型、继承索引、稀疏槽位、访问器与额外字符串/Symbol 属性。复制不得依赖数组实例原型方法，非法形状统一返回 `invalid_approved_instruments`。
+
+> D-046 第五轮补口（2026-09-20，G5A-8/9，`2.4.5-phase5a`）：① 风险答案数组必须是普通稠密自有数据数组，答案行、目标模板顶层、`classes` 与比例行只接受精确自有数据字段；自定义原型、继承字段、访问器及额外字符串/Symbol 属性一律 fail closed，允许 `Object.create(null)` 的 JSON 等价纯数据对象。② 答案校验后按冻结题库顺序规范化，完整评分结果（含 `scored`）不得受调用方数组顺序影响，也不得修改调用方输入。
+
+> D-046 最终收口（2026-09-20，G5A-10/11/12，`2.4.6-phase5a`）：① `targetVersion` 不仅绑定版本名，也绑定该版本下每个等级的**唯一完整模板内容**；结构与比例合法但任一 `minBps / targetBps / maxBps` 不等于冻结定义时仍 fail closed，禁止同版本偷换比例。② `newFundsMinor` 与 5A 其他非负整数入口必须是 JavaScript 安全整数，避免金额在进入 5D 前已经丢失精度。③ `assessedAt` 不得晚于调用方注入的 `now`，未来评估日返回 `invalid_assessment_date`。④ 规则图测试锁住每题 0–3 四档、双评分最大值、等级边界与硬封顶交叉引用。G5A-1～12 全部闭合后，Phase 5A 于本版本通过验收。
+
 ## 2. 架构默认值
 
 这些不是产品价值本身，但执行 Agent 应按默认值实现；如技术证据显示不合适，可提交文档变更说明。

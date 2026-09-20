@@ -1844,10 +1844,51 @@
   function isRiskNonEmptyString(v) { return typeof v === 'string' && v.trim() !== ''; }
 
   function isRiskNonNegInt(v) {
-    return typeof v === 'number' && isFinite(v) && Math.floor(v) === v && v >= 0;
+    return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
   }
 
   function isRiskHex64(v) { return typeof v === 'string' && /^[0-9a-f]{64}$/i.test(v); }
+
+  // 对象契约采用显式白名单：只允许 Object.prototype / null 原型、可枚举自有数据属性和精确键集合。
+  function hasExactRiskKeys(v, allowed, required) {
+    if (!isRiskObject(v)) return false;
+    var proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return false;
+    var own = Object.getOwnPropertyNames(v);
+    if (typeof Object.getOwnPropertySymbols === 'function' && Object.getOwnPropertySymbols(v).length) return false;
+    for (var i = 0; i < own.length; i++) {
+      if (allowed.indexOf(own[i]) === -1) return false;
+      var descriptor = Object.getOwnPropertyDescriptor(v, own[i]);
+      if (!descriptor || !descriptor.enumerable || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return false;
+    }
+    for (var j = 0; j < required.length; j++) {
+      if (!Object.prototype.hasOwnProperty.call(v, required[j])) return false;
+    }
+    for (var key in v) if (!Object.prototype.hasOwnProperty.call(v, key)) return false;
+    return true;
+  }
+
+  function copyRiskDenseDataArray(v) {
+    if (!Array.isArray(v) || Object.getPrototypeOf(v) !== Array.prototype) return null;
+    if (typeof Object.getOwnPropertySymbols === 'function' && Object.getOwnPropertySymbols(v).length) return null;
+    var names = Object.getOwnPropertyNames(v);
+    if (names.length !== v.length + 1 || names.indexOf('length') === -1) return null;
+    var copy = [];
+    for (var i = 0; i < v.length; i++) {
+      var descriptor = Object.getOwnPropertyDescriptor(v, String(i));
+      if (!descriptor || !descriptor.enumerable || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return null;
+      copy.push(descriptor.value);
+    }
+    return copy;
+  }
+
+  // 认可标的列表必须是普通、稠密、只含自有数据索引的数组；不读取实例方法或继承槽位。
+  function copyRiskStringArray(v) {
+    var copy = copyRiskDenseDataArray(v);
+    if (copy === null) return null;
+    for (var i = 0; i < copy.length; i++) if (!isRiskNonEmptyString(copy[i])) return null;
+    return copy;
+  }
 
   // 真实日历日校验（与 server/providers/contract.js 的 isDateString 同口径：月份范围 + 回读一致）。
   // 只校验形状正则会放过 2026-02-30 这类不存在的日期（G4C-5 的教训）。
@@ -1896,14 +1937,15 @@
 
   // 答案校验：fail closed。detail 只报「第 N 项」或缺失数量，不回显用户输入原文。
   function validateRiskAnswers(answers) {
-    if (!Array.isArray(answers)) {
+    var answerRows = copyRiskDenseDataArray(answers);
+    if (answerRows === null) {
       return { ok: false, error: { code: 'invalid_answers', detail: 'answers 必须是数组' } };
     }
-    var seen = {}, picked = [];
-    for (var i = 0; i < answers.length; i++) {
-      var row = answers[i];
-      if (!isRiskObject(row)) {
-        return { ok: false, error: { code: 'invalid_answers', detail: '第 ' + (i + 1) + ' 项不是对象' } };
+    var seen = {}, pickedByQuestion = {};
+    for (var i = 0; i < answerRows.length; i++) {
+      var row = answerRows[i];
+      if (!hasExactRiskKeys(row, ['questionId', 'optionId'], ['questionId', 'optionId'])) {
+        return { ok: false, error: { code: 'invalid_answers', detail: '第 ' + (i + 1) + ' 项必须只含自有 questionId / optionId' } };
       }
       if (!isRiskNonEmptyString(row.questionId)) {
         return { ok: false, error: { code: 'invalid_answers', detail: '第 ' + (i + 1) + ' 项缺少 questionId' } };
@@ -1924,11 +1966,13 @@
         return { ok: false, error: { code: 'unknown_option', detail: '第 ' + (i + 1) + ' 项的选项不属于该题' } };
       }
       seen[q.id] = true;
-      picked.push({ questionId: q.id, optionId: opt.id, score: opt.score, kind: q.kind, dimension: q.dimension });
+      pickedByQuestion[q.id] = { questionId: q.id, optionId: opt.id, score: opt.score, kind: q.kind, dimension: q.dimension };
     }
-    if (picked.length !== RISK_QUESTIONS.length) {
-      return { ok: false, error: { code: 'missing_answer', detail: '缺少 ' + (RISK_QUESTIONS.length - picked.length) + ' 道题的回答' } };
+    if (answerRows.length !== RISK_QUESTIONS.length) {
+      return { ok: false, error: { code: 'missing_answer', detail: '缺少 ' + (RISK_QUESTIONS.length - answerRows.length) + ' 道题的回答' } };
     }
+    var picked = [];
+    for (var p = 0; p < RISK_QUESTIONS.length; p++) picked.push(pickedByQuestion[RISK_QUESTIONS[p].id]);
     return { ok: true, answers: picked };
   }
 
@@ -1977,6 +2021,9 @@
     if (!isCalendarDate(now)) {
       return { ok: false, error: { code: 'invalid_assessment_date', detail: 'now 必须是真实存在的 YYYY-MM-DD' } };
     }
+    if (daysBetween(now, assessedAt) > 0) {
+      return { ok: false, error: { code: 'invalid_assessment_date', detail: '评估日期不得晚于 now' } };
+    }
     var expiry = addCalendarDays(assessedAt, ASSESSMENT_VALID_DAYS);
     var remainingDays = daysBetween(now, expiry);
     var status = remainingDays < 0 ? 'expired' : (remainingDays <= ASSESSMENT_EXPIRING_DAYS ? 'expiring_soon' : 'valid');
@@ -1997,34 +2044,23 @@
   // 目标模板合法性：类别不重不漏、0 <= min <= target <= max <= 100%、Σtarget 精确 100%、
   // Σmin <= 100% <= Σmax。比例非法只报「第 N 类」或类别名，不回显输入原文。
   function validateTargetTemplate(tpl) {
-    if (!isRiskObject(tpl) || !isRiskObject(tpl.classes)) {
+    if (!hasExactRiskKeys(tpl, ['level', 'templateVersion', 'classes'], ['level', 'templateVersion', 'classes'])
+      || !hasExactRiskKeys(tpl.classes, RISK_CLASSES, RISK_CLASSES)) {
       return { ok: false, error: { code: 'invalid_target_template', detail: '模板必须带 classes 对象' } };
     }
-    // 类别必须与冻结词表**精确相等**（G5A-3 补口）：下面的循环只保证「六类都在」，
-    // 挡不住多出来的类别（如 crypto）被静默忽略。两道检查缺一不可：
-    //   ① 自有键集合精确相等 —— 用 getOwnPropertyNames 而非 Object.keys，
-    //      否则可以用 defineProperty 藏一个不可枚举的类别绕过去；
-    //   ② 原型链上不得再挂可枚举键 —— Object.create({crypto:…}) 这类形状
-    //      （普通对象字面量的原型是 Object.prototype，其属性不可枚举，不会误伤）。
-    var ownNames = Object.getOwnPropertyNames(tpl.classes);
-    if (ownNames.length !== RISK_CLASSES.length) {
-      return { ok: false, error: { code: 'invalid_target_template', detail: 'classes 的类别数量必须恰为 ' + RISK_CLASSES.length + ' 个' } };
+    // 模板比例与元数据必须一起绑定：未知等级或版本不能借一组合法比例冒充受支持模板。
+    if (!isRiskNonNegInt(tpl.level) || RISK_LEVELS.indexOf(tpl.level) === -1) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: 'level 不是当前支持的风险等级' } };
     }
-    for (var n = 0; n < ownNames.length; n++) {
-      if (RISK_CLASSES.indexOf(ownNames[n]) === -1) {
-        return { ok: false, error: { code: 'invalid_target_template', detail: '出现未冻结的资产类别：' + ownNames[n] } };
-      }
+    if (tpl.templateVersion !== RISK_TARGET_VERSION) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: 'templateVersion 不是当前支持的目标模板版本' } };
     }
-    for (var key in tpl.classes) {
-      if (!Object.prototype.hasOwnProperty.call(tpl.classes, key)) {
-        return { ok: false, error: { code: 'invalid_target_template', detail: '资产类别不得来自原型链：' + key } };
-      }
-    }
+    // 类别映射已在入口按冻结词表做精确自有数据键校验；这里只验证每一行的比例约束。
     var targetSum = 0, minSum = 0, maxSum = 0;
     for (var i = 0; i < RISK_CLASSES.length; i++) {
       var cls = RISK_CLASSES[i];
       var row = tpl.classes[cls];
-      if (!isRiskObject(row)) {
+      if (!hasExactRiskKeys(row, ['minBps', 'targetBps', 'maxBps'], ['minBps', 'targetBps', 'maxBps'])) {
         return { ok: false, error: { code: 'invalid_target_template', detail: '缺少资产类别：' + cls } };
       }
       var keys = ['minBps', 'targetBps', 'maxBps'];
@@ -2043,6 +2079,22 @@
     }
     if (minSum > BPS_TOTAL || maxSum < BPS_TOTAL) {
       return { ok: false, error: { code: 'invalid_proportion', detail: '必须满足 Σmin <= ' + BPS_TOTAL + ' <= Σmax' } };
+    }
+    // 当前 targetVersion 对每个风险等级只允许一份冻结模板。只验证“比例自洽”会让调用方
+    // 在 risk-targets-v1 下悄悄换一组同样合计 100% 的比例，破坏版本可复算性。
+    var registered = null;
+    for (var t = 0; t < TARGET_TEMPLATES.length; t++) {
+      if (TARGET_TEMPLATES[t].level === tpl.level) { registered = TARGET_TEMPLATES[t]; break; }
+    }
+    if (!registered) {
+      return { ok: false, error: { code: 'invalid_target_template', detail: '当前版本没有该风险等级的目标模板' } };
+    }
+    for (var c = 0; c < RISK_CLASSES.length; c++) {
+      var className = RISK_CLASSES[c];
+      var actual = tpl.classes[className], expected = registered.classes[className];
+      if (actual.minBps !== expected.minBps || actual.targetBps !== expected.targetBps || actual.maxBps !== expected.maxBps) {
+        return { ok: false, error: { code: 'invalid_target_template', detail: '模板内容与当前 targetVersion 的冻结定义不一致' } };
+      }
     }
     return { ok: true };
   }
@@ -2064,12 +2116,18 @@
   // 建议输入契约：只校验形状与引用完整性，不采信任何派生值（当前比例 / 分数 / 等级 / blocker 一律由服务端重算）。
   function validateRecommendationRequest(payload) {
     if (!isRiskObject(payload)) return { ok: false, error: { code: 'invalid_snapshot_ref', detail: '请求体必须是对象' } };
+    var requiredInputKeys = ['snapshotRef', 'assessmentRef', 'targetVersion', 'ruleVersion', 'newFundsMinor'];
+    if (!hasExactRiskKeys(payload, RECOMMENDATION_INPUT_KEYS, requiredInputKeys)) {
+      return { ok: false, error: { code: 'invalid_snapshot_ref', detail: '请求体键集合不符合建议输入契约' } };
+    }
     var snap = payload.snapshotRef;
-    if (!isRiskObject(snap) || !isRiskNonEmptyString(snap.closeId) || !isRiskNonEmptyString(snap.snapshotId) || !isRiskHex64(snap.payloadHash)) {
+    if (!hasExactRiskKeys(snap, ['closeId', 'snapshotId', 'payloadHash'], ['closeId', 'snapshotId', 'payloadHash'])
+      || !isRiskNonEmptyString(snap.closeId) || !isRiskNonEmptyString(snap.snapshotId) || !isRiskHex64(snap.payloadHash)) {
       return { ok: false, error: { code: 'invalid_snapshot_ref', detail: 'snapshotRef 必须带 closeId / snapshotId / 64 位十六进制 payloadHash' } };
     }
     var at = payload.assessmentRef;
-    if (!isRiskObject(at) || !isRiskNonEmptyString(at.id) || !isRiskNonEmptyString(at.ruleVersion)) {
+    if (!hasExactRiskKeys(at, ['id', 'ruleVersion'], ['id', 'ruleVersion'])
+      || !isRiskNonEmptyString(at.id) || !isRiskNonEmptyString(at.ruleVersion)) {
       return { ok: false, error: { code: 'invalid_assessment_ref', detail: 'assessmentRef 必须带 id 与 ruleVersion' } };
     }
     if (at.ruleVersion !== RISK_RULE_VERSION) {
@@ -2085,31 +2143,22 @@
       return { ok: false, error: { code: 'invalid_target_template', detail: 'targetVersion 不是当前可用的目标模板版本' } };
     }
     if (!isRiskNonNegInt(payload.newFundsMinor)) {
-      return { ok: false, error: { code: 'invalid_new_funds', detail: 'newFundsMinor 必须是非负整数（最小货币单位）' } };
+      return { ok: false, error: { code: 'invalid_new_funds', detail: 'newFundsMinor 必须是非负安全整数（最小货币单位）' } };
     }
     var map = payload.approvedInstruments;
     if (map == null) return { ok: true, approvedInstruments: {} };
-    if (!isRiskObject(map)) {
+    if (!hasExactRiskKeys(map, RISK_CLASSES, [])) {
       return { ok: false, error: { code: 'invalid_approved_instruments', detail: 'approvedInstruments 必须是「类别 → 标的 id 数组」对象' } };
     }
     var out = {};
     for (var i = 0; i < RISK_CLASSES.length; i++) {
       var cls = RISK_CLASSES[i];
-      if (map[cls] == null) continue;
-      if (!Array.isArray(map[cls])) {
-        return { ok: false, error: { code: 'invalid_approved_instruments', detail: '类别 ' + cls + ' 的映射必须是数组' } };
+      if (!Object.prototype.hasOwnProperty.call(map, cls)) continue;
+      var copied = copyRiskStringArray(map[cls]);
+      if (copied === null) {
+        return { ok: false, error: { code: 'invalid_approved_instruments', detail: '类别 ' + cls + ' 的映射必须是普通、稠密的标的 id 数组' } };
       }
-      for (var j = 0; j < map[cls].length; j++) {
-        if (!isRiskNonEmptyString(map[cls][j])) {
-          return { ok: false, error: { code: 'invalid_approved_instruments', detail: '类别 ' + cls + ' 第 ' + (j + 1) + ' 个标的不合法' } };
-        }
-      }
-      out[cls] = map[cls].slice();
-    }
-    for (var key in map) {
-      if (Object.prototype.hasOwnProperty.call(map, key) && RISK_CLASSES.indexOf(key) === -1) {
-        return { ok: false, error: { code: 'invalid_approved_instruments', detail: '出现未知资产类别：' + key } };
-      }
+      out[cls] = copied;
     }
     return { ok: true, approvedInstruments: out };
   }

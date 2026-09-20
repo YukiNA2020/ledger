@@ -662,3 +662,300 @@ test('5A-22 补口零回归：三条缺口的修复不得改变任何既有正�
   assert.strictEqual(Domain.RISK_QUESTIONS[0].options[0].score, FIXTURE.questions[0].options[0].score);
   assert.strictEqual(Domain.TARGET_TEMPLATES[2].classes.cash.targetBps, FIXTURE.targetTemplates[2].classes.cash.targetBps);
 });
+
+/* ------------------- 8. 第三轮复核补口反例（G5A-4 / G5A-5，2026-09-19） ------------------- */
+
+test('5A-23 G5A-4 反例：目标模板必须绑定合法 level 与当前 templateVersion', () => {
+  const base = () => JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  const badLevels = [undefined, null, '3', 0, 6, 999, 3.5, NaN];
+  badLevels.forEach((level) => {
+    const tpl = base();
+    if (level === undefined) delete tpl.level; else tpl.level = level;
+    const r = Domain.validateTargetTemplate(tpl);
+    assert.strictEqual(r.ok, false, '非法 level 必须拒绝：' + String(level));
+    assert.strictEqual(r.error.code, 'invalid_target_template');
+  });
+  const badVersions = [undefined, null, '', ' ', 'risk-targets-unknown', 'risk-targets-v1 ', 'Risk-Targets-V1', 1, {}];
+  badVersions.forEach((templateVersion) => {
+    const tpl = base();
+    if (templateVersion === undefined) delete tpl.templateVersion; else tpl.templateVersion = templateVersion;
+    const r = Domain.validateTargetTemplate(tpl);
+    assert.strictEqual(r.ok, false, '非法 templateVersion 必须拒绝：' + String(templateVersion));
+    assert.strictEqual(r.error.code, 'invalid_target_template');
+  });
+  Domain.TARGET_TEMPLATES.forEach((tpl) => assert.strictEqual(Domain.validateTargetTemplate(tpl).ok, true));
+  FIXTURE.targetTemplates.forEach((tpl) => assert.strictEqual(Domain.validateTargetTemplate(tpl).ok, true));
+});
+
+test('5A-24 G5A-5 反例：建议输入及两类引用对象执行精确键白名单', () => {
+  const badTopKeys = ['capacityScore', 'riskCeiling', 'currentAllocation', 'blockers'];
+  badTopKeys.forEach((key) => {
+    const req = sampleRequest(); req[key] = key === 'capacityScore' ? 999 : {};
+    assert.strictEqual(Domain.validateRecommendationRequest(req).ok, false, '顶层派生字段必须拒绝：' + key);
+  });
+  const hidden = sampleRequest();
+  Object.defineProperty(hidden, 'capacityScore', { value: 999, enumerable: false });
+  assert.strictEqual(Domain.validateRecommendationRequest(hidden).ok, false, '不可枚举顶层字段必须拒绝');
+  const symbolKey = sampleRequest(); symbolKey[Symbol('capacityScore')] = 999;
+  assert.strictEqual(Domain.validateRecommendationRequest(symbolKey).ok, false, 'Symbol 顶层字段必须拒绝');
+  const inherited = Object.assign(Object.create({ capacityScore: 999 }), sampleRequest());
+  assert.strictEqual(Domain.validateRecommendationRequest(inherited).ok, false, '原型链顶层字段必须拒绝');
+
+  const extraSnap = sampleRequest(); extraSnap.snapshotRef.capacityScore = 999;
+  assert.strictEqual(Domain.validateRecommendationRequest(extraSnap).error.code, 'invalid_snapshot_ref');
+  const hiddenSnap = sampleRequest();
+  Object.defineProperty(hiddenSnap.snapshotRef, 'payload', { value: {}, enumerable: false });
+  assert.strictEqual(Domain.validateRecommendationRequest(hiddenSnap).error.code, 'invalid_snapshot_ref');
+  const inheritedSnap = sampleRequest();
+  inheritedSnap.snapshotRef = Object.assign(Object.create({ currentAllocation: {} }), inheritedSnap.snapshotRef);
+  assert.strictEqual(Domain.validateRecommendationRequest(inheritedSnap).error.code, 'invalid_snapshot_ref');
+
+  const extraAssessment = sampleRequest(); extraAssessment.assessmentRef.riskCeiling = 5;
+  assert.strictEqual(Domain.validateRecommendationRequest(extraAssessment).error.code, 'invalid_assessment_ref');
+  const hiddenAssessment = sampleRequest();
+  Object.defineProperty(hiddenAssessment.assessmentRef, 'answers', { value: [], enumerable: false });
+  assert.strictEqual(Domain.validateRecommendationRequest(hiddenAssessment).error.code, 'invalid_assessment_ref');
+  const inheritedAssessment = sampleRequest();
+  inheritedAssessment.assessmentRef = Object.assign(Object.create({ blockers: [] }), inheritedAssessment.assessmentRef);
+  assert.strictEqual(Domain.validateRecommendationRequest(inheritedAssessment).error.code, 'invalid_assessment_ref');
+
+  const missing = sampleRequest(); delete missing.newFundsMinor;
+  assert.strictEqual(Domain.validateRecommendationRequest(missing).ok, false, '必填键缺失必须拒绝');
+  const optional = sampleRequest(); delete optional.approvedInstruments;
+  const result = Domain.validateRecommendationRequest(optional);
+  assert.strictEqual(result.ok, true, 'approvedInstruments 是唯一可省略顶层键');
+  assert.deepStrictEqual(result.approvedInstruments, {});
+});
+
+test('5A-25 G5A-4/5 补口零回归：冻结契约值与既有合法输入输出保持不变', () => {
+  assert.deepStrictEqual(Domain.RECOMMENDATION_INPUT_KEYS, FIXTURE.recommendationContract.inputKeys);
+  assert.deepStrictEqual(Domain.recommendationContract(), FIXTURE.recommendationContract);
+  assert.strictEqual(Domain.validateRecommendationRequest(sampleRequest()).ok, true);
+  Domain.TARGET_TEMPLATES.forEach((tpl) => assert.strictEqual(Domain.validateTargetTemplate(tpl).ok, true));
+  const scored = Domain.scoreRiskAnswers(FIXTURE.samples.S5_1.answers);
+  assert.strictEqual(scored.ok, true);
+  assert.strictEqual(scored.ceiling, FIXTURE.samples.S5_1.expect.ceiling);
+});
+
+test('5A-26 G5A-6 反例：认可标的只消费自有类别，任何自定义原型均 fail closed', () => {
+  const inheritedKnown = sampleRequest();
+  inheritedKnown.approvedInstruments = Object.create({ broad_equity: ['inst-not-approved'] });
+  let r = Domain.validateRecommendationRequest(inheritedKnown);
+  assert.strictEqual(r.ok, false, '继承的已知类别不得伪装成用户认可');
+  assert.strictEqual(r.error.code, 'invalid_approved_instruments');
+
+  const inheritedUnknown = sampleRequest();
+  inheritedUnknown.approvedInstruments = Object.create({ crypto: ['inst-crypto'] });
+  assert.strictEqual(Domain.validateRecommendationRequest(inheritedUnknown).error.code, 'invalid_approved_instruments');
+
+  const hiddenProto = {};
+  Object.defineProperty(hiddenProto, 'broad_equity', { value: ['inst-hidden'], enumerable: false });
+  const inheritedHidden = sampleRequest();
+  inheritedHidden.approvedInstruments = Object.create(hiddenProto);
+  assert.strictEqual(Domain.validateRecommendationRequest(inheritedHidden).error.code, 'invalid_approved_instruments');
+
+  const symbolProto = {};
+  symbolProto[Symbol('broad_equity')] = ['inst-symbol'];
+  const inheritedSymbol = sampleRequest();
+  inheritedSymbol.approvedInstruments = Object.create(symbolProto);
+  assert.strictEqual(Domain.validateRecommendationRequest(inheritedSymbol).error.code, 'invalid_approved_instruments');
+
+  const hiddenPayloadProto = {};
+  Object.defineProperty(hiddenPayloadProto, 'capacityScore', { value: 999, enumerable: false });
+  const inheritedPayload = Object.assign(Object.create(hiddenPayloadProto), sampleRequest());
+  assert.strictEqual(Domain.validateRecommendationRequest(inheritedPayload).ok, false, '白名单助手不得漏过不可枚举原型属性');
+
+  const own = sampleRequest();
+  own.approvedInstruments = { broad_equity: ['inst-approved'] };
+  r = Domain.validateRecommendationRequest(own);
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.approvedInstruments, { broad_equity: ['inst-approved'] });
+  const empty = sampleRequest(); empty.approvedInstruments = {};
+  assert.deepStrictEqual(Domain.validateRecommendationRequest(empty).approvedInstruments, {});
+  const nullProto = sampleRequest(); nullProto.approvedInstruments = Object.create(null);
+  assert.deepStrictEqual(Domain.validateRecommendationRequest(nullProto).approvedInstruments, {}, '无原型纯数据对象仍可表达空映射');
+});
+
+test('5A-27 G5A-7 反例：认可标的数组只接受普通稠密自有数据索引', () => {
+  const inheritedProto = Object.create(Array.prototype);
+  Object.defineProperty(inheritedProto, '0', { value: 'inst-inherited-array-slot', enumerable: false });
+  const inheritedIndex = [];
+  inheritedIndex.length = 1;
+  Object.setPrototypeOf(inheritedIndex, inheritedProto);
+  let req = sampleRequest(); req.approvedInstruments = { broad_equity: inheritedIndex };
+  let r = Domain.validateRecommendationRequest(req);
+  assert.strictEqual(r.ok, false, '继承数组索引不得变成用户认可标的');
+  assert.strictEqual(r.error.code, 'invalid_approved_instruments');
+
+  const noSlice = ['inst-own'];
+  Object.setPrototypeOf(noSlice, {});
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: noSlice };
+  assert.doesNotThrow(() => { r = Domain.validateRecommendationRequest(req); }, '非法数组原型必须返回错误而非抛 TypeError');
+  assert.strictEqual(r.error.code, 'invalid_approved_instruments');
+
+  const sparse = [];
+  sparse.length = 2;
+  sparse[1] = 'inst-own';
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: sparse };
+  assert.strictEqual(Domain.validateRecommendationRequest(req).error.code, 'invalid_approved_instruments');
+
+  const extra = ['inst-own']; extra.note = 'hidden-shape';
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: extra };
+  assert.strictEqual(Domain.validateRecommendationRequest(req).error.code, 'invalid_approved_instruments');
+  const hidden = ['inst-own']; Object.defineProperty(hidden, 'note', { value: 'hidden' });
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: hidden };
+  assert.strictEqual(Domain.validateRecommendationRequest(req).error.code, 'invalid_approved_instruments');
+  const symbol = ['inst-own']; symbol[Symbol('note')] = 'hidden';
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: symbol };
+  assert.strictEqual(Domain.validateRecommendationRequest(req).error.code, 'invalid_approved_instruments');
+
+  const getter = [];
+  Object.defineProperty(getter, '0', { get() { throw new Error('getter must not run'); }, enumerable: true });
+  getter.length = 1;
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: getter };
+  assert.doesNotThrow(() => { r = Domain.validateRecommendationRequest(req); }, '访问器不得执行或向外抛异常');
+  assert.strictEqual(r.error.code, 'invalid_approved_instruments');
+
+  req = sampleRequest(); req.approvedInstruments = { broad_equity: [], fixed_income: ['inst-a', 'inst-b'] };
+  r = Domain.validateRecommendationRequest(req);
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.approvedInstruments, { fixed_income: ['inst-a', 'inst-b'], broad_equity: [] });
+});
+
+test('5A-28 G5A-8 反例：答案行与目标模板比例行只接受精确自有数据字段', () => {
+  const normalAnswers = Domain.RISK_QUESTIONS.map((q) => ({ questionId: q.id, optionId: q.options[0].id }));
+  const customAnswerArray = normalAnswers.slice();
+  Object.setPrototypeOf(customAnswerArray, Object.create(Array.prototype));
+  let r;
+  assert.doesNotThrow(() => { r = Domain.validateRiskAnswers(customAnswerArray); });
+  assert.strictEqual(r.error.code, 'invalid_answers', '答案容器不得使用自定义数组原型');
+  const sparseAnswers = normalAnswers.slice(); delete sparseAnswers[0];
+  assert.strictEqual(Domain.validateRiskAnswers(sparseAnswers).error.code, 'invalid_answers', '答案容器不得有稀疏槽位');
+  const getterAnswers = normalAnswers.slice();
+  Object.defineProperty(getterAnswers, '0', { get() { throw new Error('array getter must not run'); }, enumerable: true });
+  assert.doesNotThrow(() => { r = Domain.validateRiskAnswers(getterAnswers); });
+  assert.strictEqual(r.error.code, 'invalid_answers', '答案容器不得执行索引访问器');
+
+  const inheritedAnswers = Domain.RISK_QUESTIONS.map((q) => Object.create({ questionId: q.id, optionId: q.options[0].id }));
+  r = Domain.validateRiskAnswers(inheritedAnswers);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.error.code, 'invalid_answers');
+
+  const extraAnswer = Domain.RISK_QUESTIONS.map((q) => ({ questionId: q.id, optionId: q.options[0].id }));
+  extraAnswer[0].score = 999;
+  assert.strictEqual(Domain.validateRiskAnswers(extraAnswer).error.code, 'invalid_answers');
+  const getterAnswer = Domain.RISK_QUESTIONS.map((q) => ({ questionId: q.id, optionId: q.options[0].id }));
+  Object.defineProperty(getterAnswer[0], 'questionId', { get() { throw new Error('getter must not run'); }, enumerable: true });
+  assert.doesNotThrow(() => { r = Domain.validateRiskAnswers(getterAnswer); });
+  assert.strictEqual(r.error.code, 'invalid_answers');
+
+  const baseTemplate = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  const inheritedTop = Object.assign(Object.create({ level: baseTemplate.level }), {
+    templateVersion: baseTemplate.templateVersion,
+    classes: baseTemplate.classes
+  });
+  assert.strictEqual(Domain.validateTargetTemplate(inheritedTop).error.code, 'invalid_target_template', '模板顶层字段不得继承');
+  const customClasses = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  Object.setPrototypeOf(customClasses.classes, { inheritedCategory: {} });
+  assert.strictEqual(Domain.validateTargetTemplate(customClasses).error.code, 'invalid_target_template', 'classes 不得使用自定义原型');
+  const getterTop = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  Object.defineProperty(getterTop, 'level', { get() { throw new Error('template getter must not run'); }, enumerable: true });
+  assert.doesNotThrow(() => { r = Domain.validateTargetTemplate(getterTop); });
+  assert.strictEqual(r.error.code, 'invalid_target_template', '模板顶层不得执行访问器');
+
+  const inheritedRow = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  inheritedRow.classes.cash = Object.create({ minBps: 1500, targetBps: 2000, maxBps: 3500 });
+  assert.strictEqual(Domain.validateTargetTemplate(inheritedRow).error.code, 'invalid_target_template');
+  const extraRow = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  extraRow.classes.cash.note = 'derived';
+  assert.strictEqual(Domain.validateTargetTemplate(extraRow).error.code, 'invalid_target_template');
+  const getterRow = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  Object.defineProperty(getterRow.classes.cash, 'minBps', { get() { throw new Error('getter must not run'); }, enumerable: true });
+  assert.doesNotThrow(() => { r = Domain.validateTargetTemplate(getterRow); });
+  assert.strictEqual(r.error.code, 'invalid_target_template');
+
+  const nullProtoTpl = Object.create(null);
+  nullProtoTpl.level = 3; nullProtoTpl.templateVersion = Domain.RISK_TARGET_VERSION;
+  nullProtoTpl.classes = Object.create(null);
+  Object.entries(Domain.TARGET_TEMPLATES[2].classes).forEach(([key, value]) => {
+    const row = Object.create(null);
+    row.minBps = value.minBps; row.targetBps = value.targetBps; row.maxBps = value.maxBps;
+    nullProtoTpl.classes[key] = row;
+  });
+  assert.strictEqual(Domain.validateTargetTemplate(nullProtoTpl).ok, true, '无原型纯数据对象仍是合法 JSON 等价形状');
+});
+
+test('5A-29 G5A-9 反例：答案排列顺序不改变完整评分结果且不修改调用方数组', () => {
+  const forward = Domain.RISK_QUESTIONS.map((q) => ({ questionId: q.id, optionId: q.options[0].id }));
+  const reverse = forward.slice().reverse().map((row) => ({ questionId: row.questionId, optionId: row.optionId }));
+  const reverseBefore = JSON.parse(JSON.stringify(reverse));
+  const a = Domain.scoreRiskAnswers(forward);
+  const b = Domain.scoreRiskAnswers(reverse);
+  assert.deepStrictEqual(b, a, '相同语义答案必须逐字段一致，包括 scored 顺序');
+  assert.deepStrictEqual(reverse, reverseBefore, '规范化不得修改调用方数组');
+  assert.deepStrictEqual(a.scored.map((row) => row.questionId), Domain.RISK_QUESTIONS.map((q) => q.id));
+});
+
+test('5A-30 规则图完整性：每题分值域固定为 0–3，等级边界与硬封顶引用均可解析', () => {
+  const questions = new Map(Domain.RISK_QUESTIONS.map((q) => [q.id, q]));
+  let capacityMax = 0;
+  let willingnessMax = 0;
+  for (const q of Domain.RISK_QUESTIONS) {
+    const scores = q.options.map((o) => o.score).slice().sort((a, b) => a - b);
+    assert.deepStrictEqual(scores, [0, 1, 2, 3], q.id + ' 必须恰有 0/1/2/3 四档且不得重复');
+    if (q.kind === 'capacity') capacityMax += 3;
+    else willingnessMax += 3;
+  }
+  assert.strictEqual(capacityMax, 15);
+  assert.strictEqual(willingnessMax, 12);
+  assert.ok(Domain.CAPACITY_LEVEL_BOUNDS.every((b) => b.minScore <= capacityMax));
+  assert.ok(Domain.WILLINGNESS_LEVEL_BOUNDS.every((b) => b.minScore <= willingnessMax));
+
+  const capCodes = new Set();
+  for (const cap of Domain.RISK_HARD_CAPS) {
+    assert.strictEqual(capCodes.has(cap.code), false, '硬封顶 code 不得重复：' + cap.code);
+    capCodes.add(cap.code);
+    const q = questions.get(cap.questionId);
+    assert.ok(q, '硬封顶必须引用存在的题目：' + cap.questionId);
+    assert.strictEqual(q.kind, 'capacity', '硬封顶只能引用承受能力题：' + cap.questionId);
+    assert.ok(q.options.some((o) => o.score === cap.maxOptionScore), '硬封顶阈值必须落在题目分值域');
+    assert.ok(Domain.RISK_LEVELS.includes(cap.maxLevel), '硬封顶等级必须属于 RISK_LEVELS');
+    assert.strictEqual(cap.explainKey, q.explainKey, '硬封顶解释卡必须与题目一致');
+  }
+});
+
+test('5A-31 G5A-10 反例：当前 targetVersion 只接受该等级唯一冻结模板', () => {
+  const changed = JSON.parse(JSON.stringify(Domain.TARGET_TEMPLATES[2]));
+  changed.classes.cash.targetBps -= 100;
+  changed.classes.fixed_income.targetBps += 100;
+  assert.strictEqual(changed.classes.cash.minBps <= changed.classes.cash.targetBps, true, '前置：修改后仍满足单类区间');
+  assert.strictEqual(changed.classes.fixed_income.targetBps <= changed.classes.fixed_income.maxBps, true, '前置：修改后仍满足单类区间');
+  assert.strictEqual(Object.values(changed.classes).reduce((sum, row) => sum + row.targetBps, 0), Domain.BPS_TOTAL, '前置：修改后仍合计 100%');
+  const r = Domain.validateTargetTemplate(changed);
+  assert.strictEqual(r.ok, false, '同版本不得接受另一套表面合法比例');
+  assert.strictEqual(r.error.code, 'invalid_target_template');
+
+  for (const template of Domain.TARGET_TEMPLATES) {
+    const clone = JSON.parse(JSON.stringify(template));
+    assert.strictEqual(Domain.validateTargetTemplate(clone).ok, true, '冻结模板的普通副本仍须通过：L' + template.level);
+  }
+});
+
+test('5A-32 G5A-11 反例：newFundsMinor 必须是非负安全整数', () => {
+  const max = sampleRequest(); max.newFundsMinor = Number.MAX_SAFE_INTEGER;
+  assert.strictEqual(Domain.validateRecommendationRequest(max).ok, true, '最大安全整数仍可精确表示');
+  [Number.MAX_SAFE_INTEGER + 1, 1e20].forEach((amount) => {
+    const req = sampleRequest(); req.newFundsMinor = amount;
+    const r = Domain.validateRecommendationRequest(req);
+    assert.strictEqual(r.ok, false, '超出安全整数范围必须拒绝：' + String(amount));
+    assert.strictEqual(r.error.code, 'invalid_new_funds');
+  });
+});
+
+test('5A-33 G5A-12 反例：未来评估日期不得被标记为有效', () => {
+  const future = Domain.assessmentValidity('2026-09-21', '2026-09-20');
+  assert.strictEqual(future.ok, false);
+  assert.strictEqual(future.error.code, 'invalid_assessment_date');
+  assert.strictEqual(Domain.assessmentValidity('2026-09-20', '2026-09-20').ok, true, '当天完成的评估合法');
+  assert.strictEqual(Domain.assessmentValidity('2024-02-29', '2024-02-28').error.code, 'invalid_assessment_date', '闰日的未来边界也必须拒绝');
+});
