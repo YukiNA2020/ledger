@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.4.23-ui-polish';
+  var APP_VERSION = '2.4.24-phase6b';
   // 追加式事实集合的键名只有一份定义（Store 导出），页面不另列一套（D-025）。
   var COMPANION_KEYS = Store.COMPANION_KEYS;
 

@@ -26,6 +26,11 @@
  *     原始答案与当时规则版本一起封存；历史行不被新规则重算改写，复评只追加不覆盖。
  *   - v9（Phase 5C）新增 allocation_targets（目标版本，追加式，D-048）与
  *     approved_instruments（资产类别 → 用户认可标的的白名单，仅用户判断可写）。
+ *   - v11（Phase 6B，D-057）新增决策状态机三表：decisions / decision_events / decision_links。
+ *     一行决策绑定一条建议（recommendation_id 唯一 + RESTRICT）；事件只追加（seq 每条决策内
+ *     从 1 连续递增），每次状态变化封存一份快照（canonicalJson + sha256）；关联行是软删除
+ *     （unlinked_on IS NULL 表示活动），部分唯一索引保证一条证券事件同时只属一条决策。
+ *     旧库前向迁移后三表为空 —— 不伪造任何历史决策。
  *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
 'use strict';
@@ -559,6 +564,87 @@ const MIGRATIONS = [
         );
         CREATE UNIQUE INDEX uq_recommendations_input ON recommendations(input_hash);
         CREATE INDEX idx_recommendations_created ON recommendations(created_at, id);
+      `);
+    }
+  },
+  {
+    version: 11,
+    name: 'phase6-decisions',
+    up(db) {
+      /* Phase 6B（D-057）：决策状态机、事件与交易关联（契约 §6.1）。
+       *
+       * decisions —— 一行 = 一条决策，绑定一条既有建议：
+       *   - recommendation_id 用 ON DELETE RESTRICT（与 recommendations.assessment_id 同口径）：
+       *     有决策引用时建议删不掉。这与 close_id 的「审计引用不设外键」不同 —— 建议与决策
+       *     总在同一个事务集合里被清空与重建，顺序可控；
+       *   - 唯一约束按名称显式建索引（不写内联 UNIQUE，与 v9 同纪律）：server/backup.js
+       *     才能按名校验「一条建议最多一条决策」这条幂等不变量（契约 §6.5）；
+       *   - 状态词表由 CHECK 兜底；last_seq 是每条决策内已追加的事件数（事件链的长度）。
+       *
+       * decision_events —— 一行 = 一次状态跳转，**只追加、永不 UPDATE**：
+       *   - seq 每条决策内从 1 连续递增（UNIQUE(decision_id, seq) 具名索引兜底）；
+       *   - occurred_at 是本地日历日（事件发生时的 ctx.today()），与 security_events.occurred_at
+       *     同形状，承载月度归属（§5）；recorded_at 是 ISO 时刻，用于展示与排序兜底；
+       *   - actor 恒为 'local-user'（服务端写入，客户端提交即 400）；
+       *   - snapshot_json 是该时点的一次性封存（canonicalJson 文本），snapshot_hash = sha256
+       *     原文，读取时按原文复算比对（§4.5）；payload_hash 覆盖事件行自身。
+       *
+       * decision_links —— 实际交易关联（6D 才有写入口，6B 只建表 + 全量写入校验）：
+       *   - 软删除：unlinked_on IS NULL 表示活动；解绑保留行（unlinked_on/unlink_note），
+       *     不删历史（"追加更正而非擦除"的落地形式）；
+       *   - 部分唯一索引 uq_decision_links_active：一条证券事件同时最多属于一条决策
+       *     （活动行唯一），数据库层兜底；
+       *   - security_event_id 为 ON DELETE RESTRICT：解绑不删除行，外键引用随之保留，
+       *     因此曾被关联（含已解绑）的证券事件一律不可物理删除（契约 §3.2 勘误口径）。
+       *
+       * 旧库前向迁移后三表为空：不伪造任何历史决策（与 v8/v10 同口径）。 */
+      db.exec(`
+        CREATE TABLE decisions (
+          id                TEXT PRIMARY KEY,
+          recommendation_id TEXT NOT NULL REFERENCES recommendations(id) ON DELETE RESTRICT,
+          state             TEXT NOT NULL CHECK (state IN
+                            ('proposed','accepted','deferred','dismissed','executed','reviewed','archived')),
+          last_seq          INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+          created_at        TEXT NOT NULL,
+          updated_at        TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_decisions_recommendation ON decisions(recommendation_id);
+        CREATE INDEX idx_decisions_state ON decisions(state, updated_at);
+        CREATE INDEX idx_decisions_updated ON decisions(updated_at, id);
+
+        CREATE TABLE decision_events (
+          id            TEXT PRIMARY KEY,
+          decision_id   TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+          seq           INTEGER NOT NULL CHECK (seq >= 1),
+          from_state    TEXT NOT NULL CHECK (from_state IN ('proposed','accepted','executed')),
+          to_state      TEXT NOT NULL CHECK (to_state IN
+                        ('accepted','deferred','dismissed','executed','reviewed','archived')),
+          reason_code   TEXT NOT NULL,
+          note          TEXT,
+          occurred_at   TEXT NOT NULL,
+          recorded_at   TEXT NOT NULL,
+          actor         TEXT NOT NULL CHECK (actor = 'local-user'),
+          snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json) AND json_type(snapshot_json)='object'),
+          snapshot_hash TEXT NOT NULL,
+          payload_hash  TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_decision_events_seq ON decision_events(decision_id, seq);
+        CREATE INDEX idx_decision_events_occurred ON decision_events(occurred_at, decision_id);
+
+        CREATE TABLE decision_links (
+          id                TEXT PRIMARY KEY,
+          decision_id       TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+          security_event_id TEXT NOT NULL REFERENCES security_events(id) ON DELETE RESTRICT,
+          linked_on         TEXT NOT NULL,
+          linked_at         TEXT NOT NULL,
+          note              TEXT,
+          unlinked_on       TEXT,
+          unlinked_at       TEXT,
+          unlink_note       TEXT
+        );
+        CREATE INDEX idx_decision_links_decision ON decision_links(decision_id);
+        CREATE UNIQUE INDEX uq_decision_links_active
+          ON decision_links(security_event_id) WHERE unlinked_on IS NULL;
       `);
     }
   }

@@ -1,9 +1,23 @@
 # 变更日志
 
+## 2.4.24-phase6b（2026-09-29）
+
+- **Phase 6B「状态机、事件、存储与 API」**：按 6A 冻结契约（D-057，含二次复测修正）落地决策状态机。迁移 **v11 `phase6-decisions`** 新增 `decisions` / `decision_events` / `decision_links` 三表（一条建议最多一条决策、事件只追加且 `seq` 连续、活动关联唯一由部分唯一索引承载）；旧库前向迁移后三表为空。
+- 新增 API：`POST /api/v1/decisions`（唯一对象是 formal 建议；intent 缺省为两步式 proposed；接受门禁在同事务内重核 `adviceStaleness` + 5D 门禁复放 + G5-R1 引用一致；同建议重复创建自然幂等 `created:false`）、`POST /api/v1/decisions/{id}/events`（501 占位改为真实行为；状态由服务端据当前状态推进，理由码按 §6.3 派生——归档理由按建议金额与关联历史唯一判定）、`GET /api/v1/decisions`（state/month/recommendationId/from/to 过滤 + `invalidCount` 留痕 + 排序与行序无关）、`GET /api/v1/decisions/{id}`（完整事件时间线、关联、决策/执行/复盘/归档快照与合并 timeline）。每次状态事件封存快照（`canonicalJson` + sha256），读取时哈希与 `seq` 链式一致性复核，失败 fail closed。缺交易日汇率时 CNY 汇总与剩余金额为 `null`（绝不部分小计或伪 0），`fxUnavailable` 按交易日与 id 升序。
+- 存储与备份：`CLEAR_ORDER` 头插三表；伴随集合 6 → 9（普通五键保存在同一事务保留决策历史，不恢复 GET→PUT 覆盖窗口；显式三集合空数组才是清空）；JSON 备份与恢复贯穿三集合（旧备份缺键恢复空历史）；SQLite 备份 `REQUIRED_*[11]` 登记并新增「部分唯一索引被换成普通索引」的对称拒止；曾被关联（含已解绑）的证券事件不可物理删除（409 `linked_event_missing`）。
+- 测试：新增 `tests/domain-phase6.test.js` 10 项与 `tests/server-phase6.test.js` 12 项——含 **49 个有序对数据驱动全遍历**（合法 6 恰好追加 1 条事件、非法 43 整体回滚）、F-A / F-B 两套闭环（F-B 含缺汇率与跨月事件月）、篡改检测（快照字节 / seq 断链 / 状态不一致 → `invalidCount` 留痕、详情 400）、迁移 v10→v11 空表与备份结构校验；既有守卫按契约 §11 逐条更新且只增不减（5A-18 → v11、server-api / server-phase3 的 501 断言改真实路由行为、server-phase5d 表结构、5D-24 边界下移 + 新增 Phase 6 段落守卫、store-headers 九伴随、server-migration v11 结构）。全量 `node --test` **671/671**。
+- `APP_VERSION` 与 SW 缓存键升至 `2.4.24-phase6b`；本轮不改任何页面行为，浏览器 wiring（34 项）留待 6C 页面交付时运行。
+
+## 2026-09-29 6A 契约二次复测修正（产品版本不变）
+
+- 修正 F-B 跨月用例：11 月仅关联买入时 `eventMonths` 不变，11 月确认执行后才新增月份；明确月度归属只取状态事件。
+- 缺交易日汇率时，关联本金、费用、剩余金额与内部偏差均为 `null`，保留实际关联数及缺汇率事件 id；归档理由改由建议金额和关联历史唯一判定，正金额未买即放弃为 `abandoned`。
+- 三时点表去掉非法的 `proposed → archived`，补归档事件独立快照；非法跳转正文计数同步为 43。补充反向验收例，更新 D-057、PRODUCT、ARCHITECTURE、ACCEPTANCE、ROADMAP、README、NEXT_AGENT 与拆解口径。全量 `node --test` **648/648**；零业务代码、零迁移、零页面，6A 修正后交 6B。
+
 ## 2026-09-29 6A 契约复核勘误（产品版本不变）
 
-- 独立复核发现并修正冻结契约的六处实现口径冲突（不改四条已确认产品口径；明细见 `PHASE6_CONTRACT.md` 头部与 DECISIONS D-057 勘误）：①状态矩阵计数为完整 7×7 = 49 个有序对（合法 6 / 非法 43，含自转移），原稿 44/38 有误；②`RESTRICT` 外键 + 软删除解绑下，曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 本金修正为 20 × 100.00 = 2,000.00；④归档理由 `no_trade` / `abandoned` 补按关联历史的可判定规则；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥快照 `reason` 公式补 `available` 判定。计数与语义同步 ACCEPTANCE / ROADMAP / README / NEXT_AGENT / ARCHITECTURE / PHASE6_BREAKDOWN / DECISIONS。
-- 零代码改动，全量 `node --test` **648/648**；6A 勘误后维持通过，交 6B。
+- 独立复核发现并修正冻结契约的六处实现口径冲突（不改四条已确认产品口径；明细见 `PHASE6_CONTRACT.md` 头部与 DECISIONS D-057 勘误）：①状态矩阵计数为完整 7×7 = 49 个有序对（合法 6 / 非法 43，含自转移），原稿 44/38 有误；②`RESTRICT` 外键 + 软删除解绑下，曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 本金修正为 20 × 100.00 = 2,000.00；④归档理由首次尝试按关联历史判定，后来被二次复测规则取代（见上节）；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥快照 `reason` 公式补 `available` 判定。计数与语义同步 ACCEPTANCE / ROADMAP / README / NEXT_AGENT / ARCHITECTURE / PHASE6_BREAKDOWN / DECISIONS。
+- 零代码改动，全量 `node --test` **648/648**；该次结论后来被二次复测推翻，剩余冲突见上方修正记录。
 
 ## 2026-09-28 Phase 6A 规则与契约冻结（产品版本不变）
 

@@ -230,8 +230,9 @@
    * 不能在客户端先 GET 再补回：两次请求之间若刚好追加评估/目标或修改映射，旧快照会
    * 把并发写入覆盖掉。调用方显式给出的集合仍按原样覆盖（空数组仍是清空指令）。 */
   /* 5D 的建议产物同样登记在这里：它是可供 Phase 6 接管的**不可变计算结果**，
-   * 页面上记一笔账绝不该把「当时给过什么建议」及其月结、快照引用一起抹掉。 */
-  var COMPANION_KEYS = ['riskAssessments', 'allocationTargets', 'approvedInstruments', 'recommendations', 'monthlyCloses', 'closeSnapshots'];
+   * 页面上记一笔账绝不该把「当时给过什么建议」及其月结、快照引用一起抹掉。
+   * 6B（D-057）起决策三集合（decisions / decisionEvents / decisionLinks）同处一份保留清单。 */
+  var COMPANION_KEYS = ['riskAssessments', 'allocationTargets', 'approvedInstruments', 'recommendations', 'decisions', 'decisionEvents', 'decisionLinks', 'monthlyCloses', 'closeSnapshots'];
 
   function hasMissingCompanionCollections(payload) {
     var next = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};

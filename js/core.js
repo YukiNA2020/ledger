@@ -1343,10 +1343,11 @@
     return a;
   }
 
-  /* 追加式事实集合（5B 风险评估 / 5C 目标版本与认可标的 / 5D 建议产物与月结快照历史）。
-   * JSON 备份必须带上它们，否则「导出备份」会丢掉规则版本、原始答案、评估、目标与认可映射；
-   * 旧备份缺这些键时恢复为**空集合**，不生成伪默认值（D-034 / PHASE5_BREAKDOWN §10.5）。 */
-  var COMPANION_STATE_KEYS = ['riskAssessments', 'allocationTargets', 'approvedInstruments', 'recommendations', 'monthlyCloses', 'closeSnapshots'];
+  /* 追加式事实集合（5B 风险评估 / 5C 目标版本与认可标的 / 5D 建议产物与月结快照历史 /
+   * 6B 决策状态机三集合）。
+   * JSON 备份必须带上它们，否则「导出备份」会丢掉规则版本、原始答案、评估、目标、认可映射
+   * 与决策历史；旧备份缺这些键时恢复为**空集合**，不生成伪默认值（D-034 / PHASE6_CONTRACT §6.4）。 */
+  var COMPANION_STATE_KEYS = ['riskAssessments', 'allocationTargets', 'approvedInstruments', 'recommendations', 'decisions', 'decisionEvents', 'decisionLinks', 'monthlyCloses', 'closeSnapshots'];
 
   function companionCollectionsOf(state) {
     var out = {};

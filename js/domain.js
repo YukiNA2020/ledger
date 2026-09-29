@@ -3852,6 +3852,426 @@
     return reasons;
   }
 
+  /* ------------------- 决策状态机与执行关联（Phase 6，D-057） -------------------
+   * 6B 按 6A 冻结契约（PHASE6_CONTRACT.md）实现的唯一状态机口径：
+   *   - 7 状态的完整矩阵是 7×7 = 49 个有序对：合法恰好 6 条，其余 43 条（含 7 条自转移）非法；
+   *   - 转移判定、请求 / 记录 / 事件 / 关联 / 快照的精确键白名单与事件链式一致性校验都是纯函数；
+   *   - 时间（occurredAt / recordedAt）、actor、id 与理由码由服务端生成（契约 §1.5 / §6.2 / §6.3），
+   *     本段不读时钟、不触网络与存储；快照 sha256 在服务端仓储层复算（浏览器侧没有 node:crypto）。
+   */
+
+  var DECISION_STATES = deepFreezeRisk(['proposed', 'accepted', 'deferred', 'dismissed', 'executed', 'reviewed', 'archived']);
+  // 权威转移表（契约 §1.2）：只列合法方向；自转移与表外方向一律非法。
+  var DECISION_LEGAL_TRANSITIONS = deepFreezeRisk({
+    proposed: ['accepted', 'deferred', 'dismissed'],
+    accepted: ['executed', 'archived'],
+    executed: ['reviewed']
+  });
+  var DECISION_INTENTS = deepFreezeRisk(['accepted', 'deferred', 'dismissed']);
+  var DECISION_EVENT_FROM_STATES = deepFreezeRisk(['proposed', 'accepted', 'executed']);
+  var DECISION_EVENT_TO_STATES = deepFreezeRisk(['accepted', 'deferred', 'dismissed', 'executed', 'reviewed', 'archived']);
+  var DECISION_REASON_CODES = deepFreezeRisk([
+    'agree', 'postpone', 'dismiss_not_actionable', 'executed_as_planned', 'executed_deviation',
+    'no_trade', 'abandoned', 'reviewed_with_drift', 'reviewed_no_drift'
+  ]);
+  var DECISION_ARCHIVE_REASON_CODES = deepFreezeRisk(['no_trade', 'abandoned']);
+  var DECISION_SNAPSHOT_REASON_CODES = deepFreezeRisk(['cash_not_reconciled', 'valuation_not_formal']);
+  var DECISION_ACTOR = 'local-user';
+  var DECISION_SNAPSHOT_SCHEMA_VERSION = 1;
+  var DECISION_NOTE_MAX_CHARS = 2000;
+
+  var DECISION_REQUEST_KEYS = deepFreezeRisk(['recommendationId', 'intent', 'note']);
+  var DECISION_EVENT_REQUEST_KEYS = deepFreezeRisk(['toState', 'note']);
+  // 契约 §6.2：服务端派生字段（camelCase 载荷名）。出现在任何决策载荷里即 400 invalid_decision_payload。
+  var DECISION_SERVER_GENERATED_KEYS = deepFreezeRisk([
+    'id', 'seq', 'state', 'reasonCode', 'occurredAt', 'recordedAt', 'actor',
+    'snapshot', 'snapshotHash', 'payloadHash', 'createdAt', 'updatedAt',
+    'linkedOn', 'linkedAt', 'unlinkedOn', 'unlinkedAt'
+  ]);
+
+  var DECISION_RECORD_KEYS = deepFreezeRisk(['id', 'recommendationId', 'state', 'lastSeq', 'createdAt', 'updatedAt']);
+  var DECISION_EVENT_RECORD_KEYS = deepFreezeRisk([
+    'id', 'decisionId', 'seq', 'fromState', 'toState', 'reasonCode', 'note',
+    'occurredAt', 'recordedAt', 'actor', 'snapshot', 'snapshotHash', 'payloadHash'
+  ]);
+  var DECISION_LINK_RECORD_KEYS = deepFreezeRisk([
+    'id', 'decisionId', 'securityEventId', 'linkedOn', 'linkedAt', 'note',
+    'unlinkedOn', 'unlinkedAt', 'unlinkNote'
+  ]);
+  var DECISION_SNAPSHOT_KEYS = deepFreezeRisk([
+    'schemaVersion', 'asOf', 'capturedAt', 'available', 'reason', 'blockers', 'cashReconciled',
+    'valuationStatus', 'netWorthMinor', 'investableTotalMinor', 'targetRef', 'recommendationRef',
+    'classes', 'execution'
+  ]);
+  var DECISION_SNAPSHOT_TARGETREF_KEYS = deepFreezeRisk(['targetId', 'templateVersion', 'ruleVersion', 'level']);
+  var DECISION_SNAPSHOT_RECREF_KEYS = deepFreezeRisk(['recommendationId', 'inputHash', 'asOf', 'status', 'allocatedTotalMinor']);
+  var DECISION_SNAPSHOT_CLASS_KEYS = deepFreezeRisk(['assetClass', 'valueMinor', 'pctBps', 'minBps', 'targetBps', 'maxBps', 'band', 'deviationBps']);
+  var DECISION_SNAPSHOT_BLOCKER_KEYS = deepFreezeRisk(['code', 'detail']);
+  var DECISION_EXECUTION_KEYS = deepFreezeRisk(['linkedCount', 'linkedPrincipalCnyMinor', 'linkedFeeCnyMinor', 'remainingMinor', 'fxUnavailable']);
+  var DECISION_SNAPSHOT_BANDS = deepFreezeRisk(['below_min', 'within', 'above_max']);
+  var DECISION_ID_RE = /^dec-[0-9a-f]{16}$/;
+  var DECISION_EVENT_ID_RE = /^dev-[0-9a-f]{16}$/;
+  var DECISION_LINK_ID_RE = /^lnk-[0-9a-f]{16}$/;
+  var DECISION_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+  var DECISION_HASH_RE = /^[0-9a-f]{64}$/;
+
+  function decisionFail(code, detail) {
+    return { ok: false, error: { code: code, detail: detail || code } };
+  }
+
+  function isDecisionIsoTimestamp(s) {
+    return typeof s === 'string' && DECISION_ISO_RE.test(s) && isCalendarDate(s.slice(0, 10));
+  }
+
+  // 契约 §1.2：两侧都必须在词表内、禁止自转移、方向必须在权威表里。
+  function isLegalDecisionTransition(fromState, toState) {
+    if (DECISION_STATES.indexOf(fromState) === -1 || DECISION_STATES.indexOf(toState) === -1) return false;
+    if (fromState === toState) return false;
+    var allowed = DECISION_LEGAL_TRANSITIONS[fromState];
+    return !!allowed && allowed.indexOf(toState) !== -1;
+  }
+
+  // 契约 §6.3（二次勘误后）：归档先要求活动关联为 0，再唯一判定 ——
+  // `no_trade` 当且仅当「建议金额为 0 且该决策从未存在任何 decision_links 行」；
+  // 其余（正金额未买即放弃、曾关联后全部解绑）均为 `abandoned`。
+  // 判定只读封存建议金额与关联历史，不从自由文本猜意图。
+  function deriveArchiveReason(allocatedTotalMinor, hasAnyLinkRow) {
+    return (allocatedTotalMinor === 0 && !hasAnyLinkRow) ? 'no_trade' : 'abandoned';
+  }
+
+  // 契约 §4.4：available = canAdvise && cashReconciled；可比时 reason 恒为 null，
+  // 不可比时按「现金未核对优先」取两个冻结值之一。
+  function decisionSnapshotGate(overview) {
+    var cashReconciled = !(overview && overview.freshness && overview.freshness.balanceStale === true);
+    var available = (overview && overview.canAdvise === true) && cashReconciled;
+    var reason = available ? null : (cashReconciled ? 'valuation_not_formal' : 'cash_not_reconciled');
+    return { cashReconciled: cashReconciled, available: available, reason: reason };
+  }
+
+  function normalizeDecisionNote(raw) {
+    if (raw == null) return { ok: true, note: null };
+    if (typeof raw !== 'string') return { ok: false };
+    var note = raw.trim();
+    if (note.length > DECISION_NOTE_MAX_CHARS) return { ok: false };
+    return { ok: true, note: note ? note : null };
+  }
+
+  // 契约 §8.1：创建请求键白名单 recommendationId（必填）/ intent（可选）/ note（条件必填）。
+  // intent 取 executed/reviewed/archived/proposed 是**状态问题**（proposed 出发的非法跳转）→
+  // illegal_transition（HTTP 409）；其余形状问题 → invalid_decision_payload（400）。
+  function validateDecisionRequest(payload) {
+    if (!hasExactRiskKeys(payload, DECISION_REQUEST_KEYS, ['recommendationId'])) {
+      return decisionFail('invalid_decision_payload', '决策请求键白名单：recommendationId（必填）、intent（可选）、note（条件必填）');
+    }
+    var recommendationId = typeof payload.recommendationId === 'string' ? payload.recommendationId.trim() : '';
+    if (!recommendationId || recommendationId.length > 64) {
+      return decisionFail('invalid_decision_payload', 'recommendationId 必须是非空字符串');
+    }
+    var note = normalizeDecisionNote(payload.note);
+    if (!note.ok) return decisionFail('invalid_decision_payload', 'note 必须是不超过 ' + DECISION_NOTE_MAX_CHARS + ' 字符的字符串');
+    var intent = null;
+    if (payload.intent != null) {
+      if (typeof payload.intent !== 'string') {
+        return decisionFail('invalid_decision_payload', 'intent 必须是字符串');
+      }
+      if (DECISION_INTENTS.indexOf(payload.intent) !== -1) {
+        intent = payload.intent;
+      } else if (DECISION_STATES.indexOf(payload.intent) !== -1) {
+        return decisionFail('illegal_transition', 'intent 只允许 accepted/deferred/dismissed；' + payload.intent + ' 等价于 proposed 出发的非法跳转');
+      } else {
+        return decisionFail('invalid_decision_payload', 'intent 取值不合法');
+      }
+    }
+    return { ok: true, value: { recommendationId: recommendationId, intent: intent, note: note.note } };
+  }
+
+  // 契约 §8.2：事件请求键白名单 toState（必填）/ note（条件必填）。toState 只做词表形状校验；
+  // 具体方向是否合法由当前状态决定（服务端据当前状态执行命令）。
+  function validateDecisionEventRequest(payload) {
+    if (!hasExactRiskKeys(payload, DECISION_EVENT_REQUEST_KEYS, ['toState'])) {
+      return decisionFail('invalid_decision_payload', '决策事件请求键白名单：toState（必填）、note（条件必填）');
+    }
+    if (typeof payload.toState !== 'string' || DECISION_STATES.indexOf(payload.toState) === -1) {
+      return decisionFail('invalid_decision_payload', 'toState 必须是状态词表内的字符串');
+    }
+    var note = normalizeDecisionNote(payload.note);
+    if (!note.ok) return decisionFail('invalid_decision_payload', 'note 必须是不超过 ' + DECISION_NOTE_MAX_CHARS + ' 字符的字符串');
+    return { ok: true, value: { toState: payload.toState, note: note.note } };
+  }
+
+  function validateDecisionRecord(decision) {
+    if (!hasExactRiskKeys(decision, DECISION_RECORD_KEYS, DECISION_RECORD_KEYS)) {
+      return decisionFail('invalid_decision_record', '决策记录键集必须恰好为 ' + DECISION_RECORD_KEYS.join('/'));
+    }
+    if (typeof decision.id !== 'string' || !DECISION_ID_RE.test(decision.id)) {
+      return decisionFail('invalid_decision_record', '决策 id 形状不合法');
+    }
+    if (typeof decision.recommendationId !== 'string' || !decision.recommendationId) {
+      return decisionFail('invalid_decision_record', '决策必须绑定一条建议');
+    }
+    if (DECISION_STATES.indexOf(decision.state) === -1) {
+      return decisionFail('invalid_decision_record', '决策状态不在词表内');
+    }
+    if (!Number.isSafeInteger(decision.lastSeq) || decision.lastSeq < 0) {
+      return decisionFail('invalid_decision_record', 'lastSeq 必须是非负安全整数');
+    }
+    if (!isDecisionIsoTimestamp(decision.createdAt) || !isDecisionIsoTimestamp(decision.updatedAt)) {
+      return decisionFail('invalid_decision_record', 'createdAt/updatedAt 必须是带时区的 ISO 时间戳');
+    }
+    return { ok: true, record: decision };
+  }
+
+  function validateDecisionSnapshotShape(snapshot) {
+    if (!hasExactRiskKeys(snapshot, DECISION_SNAPSHOT_KEYS, DECISION_SNAPSHOT_KEYS)) {
+      return decisionFail('invalid_decision_record', '快照键集必须恰好为 ' + DECISION_SNAPSHOT_KEYS.join('/'));
+    }
+    if (snapshot.schemaVersion !== DECISION_SNAPSHOT_SCHEMA_VERSION) {
+      return decisionFail('invalid_decision_record', '快照 schemaVersion 必须是 ' + DECISION_SNAPSHOT_SCHEMA_VERSION);
+    }
+    if (!isCalendarDate(snapshot.asOf) || !isDecisionIsoTimestamp(snapshot.capturedAt)) {
+      return decisionFail('invalid_decision_record', '快照 asOf/capturedAt 形状不合法');
+    }
+    if (typeof snapshot.available !== 'boolean' || typeof snapshot.cashReconciled !== 'boolean') {
+      return decisionFail('invalid_decision_record', '快照 available/cashReconciled 必须是布尔值');
+    }
+    if (snapshot.available) {
+      if (snapshot.reason !== null) return decisionFail('invalid_decision_record', '可比快照的 reason 必须为 null');
+    } else if (DECISION_SNAPSHOT_REASON_CODES.indexOf(snapshot.reason) === -1) {
+      return decisionFail('invalid_decision_record', '不可比快照的 reason 必须在冻结词表内');
+    }
+    if (!copyRiskDenseDataArray(snapshot.blockers)) {
+      return decisionFail('invalid_decision_record', '快照 blockers 必须是数组');
+    }
+    for (var bi = 0; bi < snapshot.blockers.length; bi++) {
+      var bRow = snapshot.blockers[bi];
+      if (!hasExactRiskKeys(bRow, DECISION_SNAPSHOT_BLOCKER_KEYS, DECISION_SNAPSHOT_BLOCKER_KEYS)) {
+        return decisionFail('invalid_decision_record', '快照 blocker 行键集必须为 code/detail');
+      }
+    }
+    if (snapshot.valuationStatus !== null && typeof snapshot.valuationStatus !== 'string') {
+      return decisionFail('invalid_decision_record', 'valuationStatus 必须是字符串或 null');
+    }
+    var numericOk = function (v) { return v === null || Number.isSafeInteger(v); };
+    if (!numericOk(snapshot.netWorthMinor) || !numericOk(snapshot.investableTotalMinor)) {
+      return decisionFail('invalid_decision_record', '快照金额字段必须是安全整数或 null');
+    }
+    if (!snapshot.available && (snapshot.netWorthMinor !== null || snapshot.investableTotalMinor !== null || snapshot.classes !== null)) {
+      return decisionFail('invalid_decision_record', '不可比快照不得携带任何数字（不出伪 0）');
+    }
+    if (!hasExactRiskKeys(snapshot.targetRef, DECISION_SNAPSHOT_TARGETREF_KEYS, DECISION_SNAPSHOT_TARGETREF_KEYS)) {
+      return decisionFail('invalid_decision_record', '快照 targetRef 键集不合法');
+    }
+    if (!Number.isSafeInteger(snapshot.targetRef.level) || snapshot.targetRef.level < 1 || snapshot.targetRef.level > 5) {
+      return decisionFail('invalid_decision_record', '快照 targetRef.level 必须是 1～5 的整数');
+    }
+    if (typeof snapshot.targetRef.targetId !== 'string' || !snapshot.targetRef.targetId ||
+        typeof snapshot.targetRef.templateVersion !== 'string' || !snapshot.targetRef.templateVersion ||
+        typeof snapshot.targetRef.ruleVersion !== 'string' || !snapshot.targetRef.ruleVersion) {
+      return decisionFail('invalid_decision_record', '快照 targetRef 引用字段不合法');
+    }
+    if (!hasExactRiskKeys(snapshot.recommendationRef, DECISION_SNAPSHOT_RECREF_KEYS, DECISION_SNAPSHOT_RECREF_KEYS)) {
+      return decisionFail('invalid_decision_record', '快照 recommendationRef 键集不合法');
+    }
+    if (typeof snapshot.recommendationRef.recommendationId !== 'string' || !snapshot.recommendationRef.recommendationId ||
+        typeof snapshot.recommendationRef.inputHash !== 'string' || !DECISION_HASH_RE.test(snapshot.recommendationRef.inputHash) ||
+        !isCalendarDate(snapshot.recommendationRef.asOf) ||
+        (snapshot.recommendationRef.status !== 'formal' && snapshot.recommendationRef.status !== 'estimate') ||
+        !Number.isSafeInteger(snapshot.recommendationRef.allocatedTotalMinor) || snapshot.recommendationRef.allocatedTotalMinor < 0) {
+      return decisionFail('invalid_decision_record', '快照 recommendationRef 字段不合法');
+    }
+    if (snapshot.classes !== null) {
+      var classRows = copyRiskDenseDataArray(snapshot.classes);
+      if (!classRows || classRows.length !== RISK_CLASSES.length) {
+        return decisionFail('invalid_decision_record', '可比快照的 classes 必须恰好覆盖六个资产类别');
+      }
+      for (var ci = 0; ci < classRows.length; ci++) {
+        var row = classRows[ci];
+        if (!hasExactRiskKeys(row, DECISION_SNAPSHOT_CLASS_KEYS, DECISION_SNAPSHOT_CLASS_KEYS) ||
+            row.assetClass !== RISK_CLASSES[ci]) {
+          return decisionFail('invalid_decision_record', '快照 classes 行键集或类别序不合法');
+        }
+        if (!Number.isSafeInteger(row.valueMinor) || row.valueMinor < 0) {
+          return decisionFail('invalid_decision_record', '快照 classes 行金额必须是非负安全整数');
+        }
+        var ratioOk = function (v) { return v === null || Number.isSafeInteger(v); };
+        if (!ratioOk(row.pctBps) || !ratioOk(row.minBps) || !ratioOk(row.targetBps) || !ratioOk(row.maxBps) || !ratioOk(row.deviationBps)) {
+          return decisionFail('invalid_decision_record', '快照 classes 行比例字段必须是安全整数或 null');
+        }
+        if (row.band !== null && DECISION_SNAPSHOT_BANDS.indexOf(row.band) === -1) {
+          return decisionFail('invalid_decision_record', '快照 classes 行 band 不在词表内');
+        }
+      }
+    }
+    if (!hasExactRiskKeys(snapshot.execution, DECISION_EXECUTION_KEYS, DECISION_EXECUTION_KEYS)) {
+      return decisionFail('invalid_decision_record', '快照 execution 键集不合法');
+    }
+    var ex = snapshot.execution;
+    if (!Number.isSafeInteger(ex.linkedCount) || ex.linkedCount < 0) {
+      return decisionFail('invalid_decision_record', '快照 execution 数字字段不合法');
+    }
+    // 缺汇率（fxUnavailable 非空）时三个 CNY 汇总必须全为 null（绝不部分小计或伪 0）；
+    // 无缺汇率时三个汇总必须是安全整数（无活动关联 → 0 / 0 / 建议金额）。
+    var moneyOk = function (v) { return v === null || Number.isSafeInteger(v); };
+    if (!moneyOk(ex.linkedPrincipalCnyMinor) || !moneyOk(ex.linkedFeeCnyMinor) || !moneyOk(ex.remainingMinor)) {
+      return decisionFail('invalid_decision_record', '快照 execution 汇总字段必须是安全整数或 null');
+    }
+    if (!copyRiskDenseDataArray(ex.fxUnavailable) || ex.fxUnavailable.some(function (id) { return typeof id !== 'string' || !id; })) {
+      return decisionFail('invalid_decision_record', '快照 execution.fxUnavailable 必须是事件 id 数组');
+    }
+    var missing = ex.fxUnavailable.length > 0;
+    if (missing !== (ex.linkedPrincipalCnyMinor === null || ex.linkedFeeCnyMinor === null || ex.remainingMinor === null)) {
+      return decisionFail('invalid_decision_record', 'execution 汇总为 null 必须且只能因缺汇率（fxUnavailable 非空）');
+    }
+    return { ok: true, record: snapshot };
+  }
+
+  function validateDecisionEventRecord(event) {
+    if (!hasExactRiskKeys(event, DECISION_EVENT_RECORD_KEYS, DECISION_EVENT_RECORD_KEYS)) {
+      return decisionFail('invalid_decision_record', '决策事件键集必须恰好为 ' + DECISION_EVENT_RECORD_KEYS.join('/'));
+    }
+    if (typeof event.id !== 'string' || !DECISION_EVENT_ID_RE.test(event.id)) {
+      return decisionFail('invalid_decision_record', '决策事件 id 形状不合法');
+    }
+    if (typeof event.decisionId !== 'string' || !DECISION_ID_RE.test(event.decisionId)) {
+      return decisionFail('invalid_decision_record', '决策事件 decisionId 形状不合法');
+    }
+    if (!Number.isSafeInteger(event.seq) || event.seq < 1) {
+      return decisionFail('invalid_decision_record', '决策事件 seq 必须是正整数');
+    }
+    if (DECISION_EVENT_FROM_STATES.indexOf(event.fromState) === -1 || DECISION_EVENT_TO_STATES.indexOf(event.toState) === -1) {
+      return decisionFail('invalid_decision_record', '决策事件 from/to 状态不在词表内');
+    }
+    if (DECISION_REASON_CODES.indexOf(event.reasonCode) === -1) {
+      return decisionFail('invalid_decision_record', '决策事件 reasonCode 不在冻结词表内');
+    }
+    if (event.note !== null && typeof event.note !== 'string') {
+      return decisionFail('invalid_decision_record', '决策事件 note 必须是字符串或 null');
+    }
+    if (!isCalendarDate(event.occurredAt) || !isDecisionIsoTimestamp(event.recordedAt)) {
+      return decisionFail('invalid_decision_record', '决策事件 occurredAt/recordedAt 形状不合法');
+    }
+    if (event.actor !== DECISION_ACTOR) {
+      return decisionFail('invalid_decision_record', '决策事件 actor 必须是 ' + DECISION_ACTOR);
+    }
+    if (!validateDecisionSnapshotShape(event.snapshot).ok) {
+      return decisionFail('invalid_decision_record', '决策事件必须携带一张形状合法的快照');
+    }
+    if (typeof event.snapshotHash !== 'string' || !DECISION_HASH_RE.test(event.snapshotHash) ||
+        typeof event.payloadHash !== 'string' || !DECISION_HASH_RE.test(event.payloadHash)) {
+      return decisionFail('invalid_decision_record', '决策事件哈希形状不合法');
+    }
+    return { ok: true, record: event };
+  }
+
+  function validateDecisionLinkRecord(link) {
+    if (!hasExactRiskKeys(link, DECISION_LINK_RECORD_KEYS, DECISION_LINK_RECORD_KEYS)) {
+      return decisionFail('invalid_decision_record', '关联行键集必须恰好为 ' + DECISION_LINK_RECORD_KEYS.join('/'));
+    }
+    if (typeof link.id !== 'string' || !DECISION_LINK_ID_RE.test(link.id) ||
+        typeof link.decisionId !== 'string' || !DECISION_ID_RE.test(link.decisionId) ||
+        typeof link.securityEventId !== 'string' || !link.securityEventId || link.securityEventId.length > 64) {
+      return decisionFail('invalid_decision_record', '关联行 id/引用字段不合法');
+    }
+    if (!isCalendarDate(link.linkedOn) || !isDecisionIsoTimestamp(link.linkedAt)) {
+      return decisionFail('invalid_decision_record', '关联行 linkedOn/linkedAt 形状不合法');
+    }
+    if (link.note !== null && typeof link.note !== 'string') {
+      return decisionFail('invalid_decision_record', '关联行 note 必须是字符串或 null');
+    }
+    // 软删除一致性：解绑必须同时带 unlinkedOn / unlinkedAt / unlinkNote（unlink_note 必填），
+    // 未解绑行三者必须全空。
+    if (link.unlinkedOn == null) {
+      if (link.unlinkedAt !== null || link.unlinkNote !== null) {
+        return decisionFail('invalid_decision_record', '活动关联不得携带解绑字段');
+      }
+    } else {
+      if (!isCalendarDate(link.unlinkedOn) || !isDecisionIsoTimestamp(link.unlinkedAt) ||
+          typeof link.unlinkNote !== 'string' || !link.unlinkNote.trim()) {
+        return decisionFail('invalid_decision_record', '解绑行必须带真实解绑日期与 unlinkNote');
+      }
+    }
+    return { ok: true, record: link };
+  }
+
+  // 契约 §4.5 第 2 条：事件序列完整性的唯一校验实现。零事件 proposed（lastSeq = 0，
+  // 两步式创建）是合法空序列；其余状态必须有事件且满足链式一致。
+  function validateDecisionEventChain(decision, events) {
+    var d = validateDecisionRecord(decision);
+    if (!d.ok) return d;
+    var list = copyRiskDenseDataArray(events);
+    if (!list) return decisionFail('invalid_decision_record', '决策事件集合必须是数组');
+    for (var i = 0; i < list.length; i++) {
+      var checked = validateDecisionEventRecord(list[i]);
+      if (!checked.ok) return checked;
+      if (list[i].decisionId !== decision.id) {
+        return decisionFail('invalid_decision_record', '事件属于另一条决策');
+      }
+    }
+    list.sort(function (a, b) { return a.seq - b.seq; });
+    if (decision.state === 'proposed' && decision.lastSeq === 0) {
+      if (list.length !== 0) {
+        return decisionFail('invalid_decision_record', '零事件 proposed 决策不得携带事件');
+      }
+      return { ok: true, events: list };
+    }
+    if (!list.length) {
+      return decisionFail('invalid_decision_record', '状态 ' + decision.state + ' 必须有事件序列');
+    }
+    for (var j = 0; j < list.length; j++) {
+      if (list[j].seq !== j + 1) {
+        return decisionFail('invalid_decision_record', '决策事件 seq 必须从 1 连续递增');
+      }
+      if (j === 0 && list[j].fromState !== 'proposed') {
+        return decisionFail('invalid_decision_record', '首条事件的 fromState 必须是 proposed');
+      }
+      if (j > 0 && list[j].fromState !== list[j - 1].toState) {
+        return decisionFail('invalid_decision_record', '事件链断裂：fromState 必须等于上一条 toState');
+      }
+      if (!isLegalDecisionTransition(list[j].fromState, list[j].toState)) {
+        return decisionFail('invalid_decision_record', '事件 ' + list[j].fromState + ' → ' + list[j].toState + ' 不在合法转移表内');
+      }
+    }
+    var last = list[list.length - 1];
+    if (last.toState !== decision.state || decision.lastSeq !== last.seq) {
+      return decisionFail('invalid_decision_record', '末条事件必须与决策当前状态和 lastSeq 一致');
+    }
+    return { ok: true, events: list };
+  }
+
+  // 契约 §4.3：复盘漂移 = 六类金额或比例与执行时点不同（只比 classes；目标参照固定为
+  // decision 引用的历史版本，同一决策内不变，band/deviation 由金额与比例派生）。
+  function decisionReviewDrift(executedSnapshot, reviewedSnapshot) {
+    var a = validateDecisionSnapshotShape(executedSnapshot);
+    var b = validateDecisionSnapshotShape(reviewedSnapshot);
+    if (!a.ok) return a;
+    if (!b.ok) return b;
+    return { ok: true, drift: canonicalJson(a.record.classes) !== canonicalJson(b.record.classes) };
+  }
+
+  // 只读契约快照：词表与白名单的可写深拷贝 + 有序对计数（7×7 = 49，合法 6 / 非法 43）。
+  function decisionPhase6Contract() {
+    return {
+      states: DECISION_STATES.slice(),
+      legalTransitions: JSON.parse(JSON.stringify(DECISION_LEGAL_TRANSITIONS)),
+      intents: DECISION_INTENTS.slice(),
+      reasonCodes: DECISION_REASON_CODES.slice(),
+      archiveReasonCodes: DECISION_ARCHIVE_REASON_CODES.slice(),
+      snapshotReasonCodes: DECISION_SNAPSHOT_REASON_CODES.slice(),
+      requestKeys: DECISION_REQUEST_KEYS.slice(),
+      eventRequestKeys: DECISION_EVENT_REQUEST_KEYS.slice(),
+      serverGeneratedKeys: DECISION_SERVER_GENERATED_KEYS.slice(),
+      recordKeys: DECISION_RECORD_KEYS.slice(),
+      eventRecordKeys: DECISION_EVENT_RECORD_KEYS.slice(),
+      linkRecordKeys: DECISION_LINK_RECORD_KEYS.slice(),
+      snapshotKeys: DECISION_SNAPSHOT_KEYS.slice(),
+      executionKeys: DECISION_EXECUTION_KEYS.slice(),
+      actor: DECISION_ACTOR,
+      snapshotSchemaVersion: DECISION_SNAPSHOT_SCHEMA_VERSION,
+      noteMaxChars: DECISION_NOTE_MAX_CHARS,
+      orderedPairs: { total: 49, legal: 6, illegal: 43, selfTransitions: 7 }
+    };
+  }
+
   return {
     CURRENCIES: CURRENCIES,
     POOLS: POOLS,
@@ -3996,6 +4416,38 @@
     mappingSignature: mappingSignature,
     ADVICE_STALE_REASON_CODES: ADVICE_STALE_REASON_CODES,
     adviceStaleness: adviceStaleness,
+    /* Phase 6（6B，D-057）：决策状态机与执行关联——纯函数；时间 / actor / 理由码由服务端生成 */
+    DECISION_STATES: DECISION_STATES,
+    DECISION_LEGAL_TRANSITIONS: DECISION_LEGAL_TRANSITIONS,
+    DECISION_INTENTS: DECISION_INTENTS,
+    DECISION_EVENT_FROM_STATES: DECISION_EVENT_FROM_STATES,
+    DECISION_EVENT_TO_STATES: DECISION_EVENT_TO_STATES,
+    DECISION_REASON_CODES: DECISION_REASON_CODES,
+    DECISION_ARCHIVE_REASON_CODES: DECISION_ARCHIVE_REASON_CODES,
+    DECISION_SNAPSHOT_REASON_CODES: DECISION_SNAPSHOT_REASON_CODES,
+    DECISION_ACTOR: DECISION_ACTOR,
+    DECISION_SNAPSHOT_SCHEMA_VERSION: DECISION_SNAPSHOT_SCHEMA_VERSION,
+    DECISION_HASH_RE: DECISION_HASH_RE,
+    DECISION_REQUEST_KEYS: DECISION_REQUEST_KEYS,
+    DECISION_EVENT_REQUEST_KEYS: DECISION_EVENT_REQUEST_KEYS,
+    DECISION_SERVER_GENERATED_KEYS: DECISION_SERVER_GENERATED_KEYS,
+    DECISION_RECORD_KEYS: DECISION_RECORD_KEYS,
+    DECISION_EVENT_RECORD_KEYS: DECISION_EVENT_RECORD_KEYS,
+    DECISION_LINK_RECORD_KEYS: DECISION_LINK_RECORD_KEYS,
+    DECISION_SNAPSHOT_KEYS: DECISION_SNAPSHOT_KEYS,
+    DECISION_EXECUTION_KEYS: DECISION_EXECUTION_KEYS,
+    isLegalDecisionTransition: isLegalDecisionTransition,
+    validateDecisionRequest: validateDecisionRequest,
+    validateDecisionEventRequest: validateDecisionEventRequest,
+    validateDecisionRecord: validateDecisionRecord,
+    validateDecisionEventRecord: validateDecisionEventRecord,
+    validateDecisionLinkRecord: validateDecisionLinkRecord,
+    validateDecisionEventChain: validateDecisionEventChain,
+    validateDecisionSnapshotShape: validateDecisionSnapshotShape,
+    deriveArchiveReason: deriveArchiveReason,
+    decisionSnapshotGate: decisionSnapshotGate,
+    decisionReviewDrift: decisionReviewDrift,
+    decisionPhase6Contract: decisionPhase6Contract,
     localTodayISO: localTodayISO
   };
 });

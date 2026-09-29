@@ -52,7 +52,8 @@ const REQUIRED_TABLES_BY_VERSION = {
   3: ['asset_transfers'],
   8: ['risk_assessments'],
   9: ['allocation_targets', 'approved_instruments'],
-  10: ['recommendations']
+  10: ['recommendations'],
+  11: ['decisions', 'decision_events', 'decision_links']
 };
 
 // 必需**索引**随 schema 版本增长：有些不变量由索引承载，光看表齐不齐看不出来。
@@ -93,6 +94,32 @@ const REQUIRED_INDEXES_BY_VERSION = {
   10: [
     { table: 'recommendations', name: 'uq_recommendations_input', unique: true, columns: ['input_hash'] },
     { table: 'recommendations', name: 'idx_recommendations_created', unique: false }
+  ],
+  // Phase 6B（D-057）：决策状态机三条不变量都由索引承载 —— 「一条建议最多一条决策」
+  // （uq_decisions_recommendation）、「事件 seq 每条决策内从 1 连续递增」（uq_decision_events_seq）、
+  // 「一条证券事件同时只属一条活动决策」（uq_decision_links_active，部分唯一索引）。
+  // 部分索引被手工换成普通索引会让活动关联唯一性静默失效，校验必须对称检查 partial 标记。
+  11: [
+    {
+      table: 'decisions',
+      name: 'uq_decisions_recommendation',
+      unique: true,
+      columns: ['recommendation_id']
+    },
+    {
+      table: 'decision_events',
+      name: 'uq_decision_events_seq',
+      unique: true,
+      columns: ['decision_id', 'seq']
+    },
+    {
+      table: 'decision_links',
+      name: 'uq_decision_links_active',
+      unique: true,
+      columns: ['security_event_id'],
+      partial: true
+    },
+    { table: 'decision_links', name: 'idx_decision_links_decision', unique: false }
   ]
 };
 
@@ -157,6 +184,29 @@ const REQUIRED_COLUMNS_BY_VERSION = {
     { table: 'recommendations', name: 'result_json' },
     { table: 'recommendations', name: 'payload_hash' },
     { table: 'recommendations', name: 'created_at' }
+  ],
+  // v11（Phase 6B）：决策状态机承载「绑定哪条建议、当前状态与事件链长度、封存快照与哈希、
+  // 软删除关联」。缺任何一列都无法证明决策历史可追溯、快照可复核。
+  11: [
+    { table: 'decisions', name: 'recommendation_id' },
+    { table: 'decisions', name: 'state' },
+    { table: 'decisions', name: 'last_seq' },
+    { table: 'decisions', name: 'created_at' },
+    { table: 'decisions', name: 'updated_at' },
+    { table: 'decision_events', name: 'decision_id' },
+    { table: 'decision_events', name: 'seq' },
+    { table: 'decision_events', name: 'from_state' },
+    { table: 'decision_events', name: 'to_state' },
+    { table: 'decision_events', name: 'reason_code' },
+    { table: 'decision_events', name: 'occurred_at' },
+    { table: 'decision_events', name: 'recorded_at' },
+    { table: 'decision_events', name: 'actor' },
+    { table: 'decision_events', name: 'snapshot_hash' },
+    { table: 'decision_events', name: 'payload_hash' },
+    { table: 'decision_links', name: 'decision_id' },
+    { table: 'decision_links', name: 'security_event_id' },
+    { table: 'decision_links', name: 'linked_on' },
+    { table: 'decision_links', name: 'unlinked_on' }
   ]
 };
 
@@ -309,6 +359,11 @@ function validateBackupFile(file) {
       }
       if (spec.partial === false && info.partial) {
         return { ok: false, reason: '必需索引不能是部分索引：' + spec.name };
+      }
+      // 对称校验（Phase 6B，契约 §6.5）：把部分唯一索引手工换成普通唯一索引后，表还在、
+      // 唯一性还在，但「活动关联唯一」的不变量已经静默失效 —— 只有 partial 标记能发现。
+      if (spec.partial === true && !info.partial) {
+        return { ok: false, reason: '必需索引必须是部分索引：' + spec.name };
       }
     }
     // 索引之外还有承载事实的必需列（复核 G4C-6）：缺列的库恢复后迁移器不会补列，

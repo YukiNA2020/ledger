@@ -11,13 +11,13 @@ const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1–v10：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1–v11：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 10);
+    assert.strictEqual(rows.length, 11);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
     assert.strictEqual(rows[1].version, 2);
@@ -38,6 +38,8 @@ test('迁移 v1–v10：schema_migrations 记录版本并建齐必需表', () =>
     assert.strictEqual(rows[8].name, 'phase5c-allocation-targets');
     assert.strictEqual(rows[9].version, 10);
     assert.strictEqual(rows[9].name, 'phase5d-recommendations');
+    assert.strictEqual(rows[10].version, 11);
+    assert.strictEqual(rows[10].name, 'phase6-decisions');
     assert.strictEqual(tableExists(ctx.db, 'asset_transfers'), true, 'v3 应建立换汇事实表');
     assert.ok(
       get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'uq_instruments_dedupe'"),
@@ -107,6 +109,35 @@ test('迁移 v1–v10：schema_migrations 记录版本并建齐必需表', () =>
     });
     assert.strictEqual(indexInfo(ctx.db, 'recommendations', 'uq_recommendations_input').unique, true,
       'input_hash 索引必须是唯一索引（D-040：不变量由索引承载）');
+    // v11（Phase 6B，D-057）：决策状态机三表 —— 承载「一条建议最多一条决策、事件 seq 连续递增、
+    // 活动关联唯一（部分唯一索引）」的不变量索引与冻结语义列齐备
+    assert.strictEqual(tableExists(ctx.db, 'decisions'), true, 'v11 应建立 decisions 表');
+    assert.strictEqual(tableExists(ctx.db, 'decision_events'), true, 'v11 应建立 decision_events 表');
+    assert.strictEqual(tableExists(ctx.db, 'decision_links'), true, 'v11 应建立 decision_links 表');
+    const decCols = all(ctx.db, 'PRAGMA table_info(decisions)').map((c) => c.name);
+    ['recommendation_id', 'state', 'last_seq', 'created_at', 'updated_at'].forEach((c) => {
+      assert.ok(decCols.includes(c), 'v11 decisions 应有列 ' + c);
+    });
+    const decEventCols = all(ctx.db, 'PRAGMA table_info(decision_events)').map((c) => c.name);
+    ['decision_id', 'seq', 'from_state', 'to_state', 'reason_code', 'occurred_at', 'recorded_at',
+      'actor', 'snapshot_json', 'snapshot_hash', 'payload_hash'].forEach((c) => {
+      assert.ok(decEventCols.includes(c), 'v11 decision_events 应有列 ' + c);
+    });
+    const decLinkCols = all(ctx.db, 'PRAGMA table_info(decision_links)').map((c) => c.name);
+    ['decision_id', 'security_event_id', 'linked_on', 'unlinked_on', 'unlink_note'].forEach((c) => {
+      assert.ok(decLinkCols.includes(c), 'v11 decision_links 应有列 ' + c);
+    });
+    ['uq_decisions_recommendation', 'idx_decisions_state', 'idx_decisions_updated',
+      'uq_decision_events_seq', 'idx_decision_events_occurred',
+      'idx_decision_links_decision'].forEach((n) => {
+      assert.ok(
+        get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", [n]),
+        'v11 应建立索引 ' + n
+      );
+    });
+    const activeLinkIndex = indexInfo(ctx.db, 'decision_links', 'uq_decision_links_active');
+    assert.strictEqual(activeLinkIndex.unique, true, '活动关联唯一性必须是唯一索引');
+    assert.strictEqual(activeLinkIndex.partial, true, '活动关联唯一性必须由部分唯一索引承载（WHERE unlinked_on IS NULL）');
     // CHECK 只挡结构：越界等级与非类别词表值在建表层就被挡下
     run(
       ctx.db,
@@ -207,14 +238,18 @@ test('已发布 v2 库前向迁移到最新版本：保留账户与余额并新�
     db.exec("INSERT INTO account_units (id,account_id,currency,balance_minor,as_of) VALUES ('u1','a1','HKD',123456,'2026-09-15')");
 
     const migrated = M.migrate(db);
-    assert.deepStrictEqual(migrated.applied, [3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.deepStrictEqual(migrated.applied, [3, 4, 5, 6, 7, 8, 9, 10, 11]);
     assert.strictEqual(tableExists(db, 'asset_transfers'), true);
     assert.strictEqual(get(db, 'SELECT balance_minor FROM account_units WHERE id = ?', ['u1']).balance_minor, 123456);
-    // D-047 §5.3 / D-048：旧库前向迁移后三张表必须为空 —— 不伪造默认评估、目标或认可标的
+    // D-047 §5.3 / D-048 / D-057：旧库前向迁移后各追加式表必须为空 ——
+    // 不伪造默认评估、目标、认可标的、历史建议或历史决策
     assert.strictEqual(all(db, 'SELECT id FROM risk_assessments').length, 0, '前向迁移不得生成默认评估');
     assert.strictEqual(all(db, 'SELECT id FROM allocation_targets').length, 0, '前向迁移不得生成默认目标版本');
     assert.strictEqual(all(db, 'SELECT id FROM approved_instruments').length, 0, '前向迁移不得替用户认可任何标的');
     assert.strictEqual(all(db, 'SELECT id FROM recommendations').length, 0, '前向迁移不得伪造任何一条历史建议');
+    assert.strictEqual(all(db, 'SELECT id FROM decisions').length, 0, '前向迁移不得伪造任何历史决策');
+    assert.strictEqual(all(db, 'SELECT id FROM decision_events').length, 0, '前向迁移不得伪造任何决策事件');
+    assert.strictEqual(all(db, 'SELECT id FROM decision_links').length, 0, '前向迁移不得伪造任何决策关联');
   } finally {
     db.close();
   }

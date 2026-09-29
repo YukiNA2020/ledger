@@ -646,7 +646,10 @@ test('5D-23 相同事实重复计算逐字段一致，且不依赖对象键序 /
 test('5D-24 5D 段落范围守卫：零时钟 / 零网络 / 零存储，且不含 Phase 6 决策语义', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'js', 'domain.js'), 'utf8');
   const start = src.indexOf('新增资金优先再平衡与正式建议（Phase 5D');
-  const end = src.indexOf('return {\n    CURRENCIES: CURRENCIES,');
+  // 6B（D-057，契约 §11）：Phase 6 的领域段落追加在 5D 段落之后，本守卫的 end 标记
+  // 相应下移到 Phase 6 段落开头 —— 只移动边界标记，断言逐条保留；Phase 6 段落自己
+  // 有同形状的新守卫（见下一条），守卫数量只增不减。
+  const end = src.indexOf('决策状态机与执行关联（Phase 6');
   assert.ok(start > 0 && end > start, '找不到 Phase 5D 段落边界');
   const seg = src.slice(start, end);
   ['Date.now', 'new Date(', 'fetch(', 'require(', 'XMLHttpRequest', 'Math.random', 'process.env',
@@ -661,6 +664,23 @@ test('5D-24 5D 段落范围守卫：零时钟 / 零网络 / 零存储，且不�
   // 不新增数据源、不开启自动行情
   ['Frankfurter', 'Provider', 'provider('].forEach((frag) => {
     assert.strictEqual(seg.indexOf(frag), -1, 'Phase 5D 不得接入外部数据源：' + frag);
+  });
+});
+
+test('Phase 6 段落范围守卫：决策状态机零时钟 / 零网络 / 零存储，不接券商（6B，D-057）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'js', 'domain.js'), 'utf8');
+  const start = src.indexOf('决策状态机与执行关联（Phase 6');
+  const end = src.indexOf('return {\n    CURRENCIES: CURRENCIES,');
+  assert.ok(start > 0 && end > start, '找不到 Phase 6 段落边界');
+  const seg = src.slice(start, end);
+  // 与 5D-24 同形状：零时钟、零网络、零存储、零随机、零 DOM。
+  ['Date.now', 'new Date(', 'fetch(', 'require(', 'XMLHttpRequest', 'Math.random', 'process.env',
+    'localStorage', 'document.', 'window.'].forEach((frag) => {
+    assert.strictEqual(seg.indexOf(frag), -1, 'Phase 6 段落不得出现 ' + frag);
+  });
+  // 不做券商接入、不自动下单、不接外部数据源。
+  ['placeOrder', 'trade(', 'Frankfurter', 'Provider', 'provider('].forEach((frag) => {
+    assert.strictEqual(seg.indexOf(frag), -1, 'Phase 6 段落不得接入券商或外部数据源：' + frag);
   });
 });
 

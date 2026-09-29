@@ -415,10 +415,15 @@ test('5A-17 容忍带端点含入区间，边界归属唯一', () => {
 test('5A-18 范围守卫：5A 段落纯函数零时钟 / 零网络，5B/5C 边界只放开冻结交付物', () => {
   const M = require('../server/migrations.js');
   // 5A 自身零迁移；5B 交付 v8（risk_assessments）、5C 交付 v9（目标版本与认可标的）、
-  // 5D 交付 v10（recommendations 建议产物）。除此之外不得预建后续阶段的表（Phase 6 的决策状态机）。
-  assert.strictEqual(M.LATEST_VERSION, 10, '迁移只允许推进到 5D 的 v10');
-  assert.strictEqual(M.MIGRATIONS[M.MIGRATIONS.length - 1].name, 'phase5d-recommendations');
-  assert.ok(!M.MIGRATIONS.some((m) => /decisions|decision_events/.test(m.name)), 'Phase 6 的表不得预建');
+  // 5D 交付 v10（recommendations 建议产物）。6B 按 6A 冻结契约（D-057）交付 v11
+  // （decisions / decision_events / decision_links 三表，迁移名 phase6-decisions）——
+  // 更新说明：原断言「Phase 6 的表不得预建」随 6B 实施显式推进，改为断言 v11 恰为该三表迁移；
+  // 除 phase6-decisions 外仍不得出现其他决策表迁移（契约 §11：只移动边界，不删断言）。
+  assert.strictEqual(M.LATEST_VERSION, 11, '迁移推进到 6B 的 v11');
+  assert.strictEqual(M.MIGRATIONS[M.MIGRATIONS.length - 1].name, 'phase6-decisions');
+  const decisionMigrations = M.MIGRATIONS.filter((m) => /decisions|decision_events|decision_links/.test(m.name));
+  assert.strictEqual(decisionMigrations.length, 1, '决策表只允许由 v11 一并交付');
+  assert.strictEqual(decisionMigrations[0].version, 11);
 
   const apiSrc = fs.readFileSync(path.join(ROOT, 'server/api.js'), 'utf8');
   // 5A 期间这里是 DEFERRED_WRITES 延后登记；5B 已实现为真实路由（测试见 tests/server-phase5b.test.js）

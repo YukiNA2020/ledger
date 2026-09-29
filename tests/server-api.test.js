@@ -437,12 +437,30 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
     assert.strictEqual(quoteScope.status, 'skipped');
     assert.strictEqual(quoteScope.reason, 'auto_fetch_disabled');
 
-    const decisionEvent = await request(srv.port, 'POST', '/api/v1/decisions/d-1/events', {
+    // Phase 6B（D-057）：决策事件路由已从 501 占位变为真实实现。载荷形状合法但决策不存在时，
+    // 真实行为是 404 unknown_decision（不再是 not_implemented）；空载荷则先按 400
+    // invalid_decision_payload 拒绝。完整的状态机行为（49 个有序对全遍历等）由
+    // tests/server-phase6.test.js 在隔离数据库上覆盖。
+    const decisionEventEmpty = await request(srv.port, 'POST', '/api/v1/decisions/d-1/events', {
       headers: writeHeaders(ctx),
       body: '{}'
     });
-    assert.strictEqual(decisionEvent.status, 501);
-    assert.match(decisionEvent.json.error.message, /Phase 6/);
+    assert.strictEqual(decisionEventEmpty.status, 400);
+    assert.strictEqual(decisionEventEmpty.json.error.code, 'invalid_decision_payload');
+    const decisionEvent = await request(srv.port, 'POST', '/api/v1/decisions/d-1/events', {
+      headers: writeHeaders(ctx),
+      body: '{"toState":"accepted"}'
+    });
+    assert.strictEqual(decisionEvent.status, 404);
+    assert.strictEqual(decisionEvent.json.error.code, 'unknown_decision');
+
+    // 决策列表与详情也是 6B 的真实路由：空库返回空列表，详情 404。
+    const decisionList = await request(srv.port, 'GET', '/api/v1/decisions');
+    assert.strictEqual(decisionList.status, 200);
+    assert.strictEqual(decisionList.json.total, 0);
+    const decisionDetail = await request(srv.port, 'GET', '/api/v1/decisions/d-1');
+    assert.strictEqual(decisionDetail.status, 404);
+    assert.strictEqual(decisionDetail.json.error.code, 'unknown_decision');
 
     const unknown = await request(srv.port, 'GET', '/api/v1/nope');
     assert.strictEqual(unknown.status, 404);

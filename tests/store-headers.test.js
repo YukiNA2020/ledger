@@ -221,7 +221,11 @@ test('saveAll 用单次 PUT 请求服务端原子保留未显式集合，显式�
     calls.length = 0;
     await Store.saveAll({
       accounts: [], categories: [], txns: [], settings: {}, assets: {},
-      riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: [], monthlyCloses: [], closeSnapshots: []
+      // 6B（D-057）：决策三集合（decisions / decisionEvents / decisionLinks）加入伴随清单后，
+      // 「全部显式给出 = 完整覆盖」的语义必须覆盖九份集合 —— 少任何一份都仍要请求保留。
+      riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: [],
+      decisions: [], decisionEvents: [], decisionLinks: [],
+      monthlyCloses: [], closeSnapshots: []
     });
     const wrapped3 = JSON.parse(lastCall().init.body);
     assert.strictEqual(wrapped3.preserveCompanionCollections, false,

@@ -320,7 +320,7 @@ test('S3.3 应急金覆盖月数由服务端按必要支出重算', async () => 
   }
 });
 
-test('Phase 5 建议写入口已实现并进入真实校验；Phase 6 决策事件仍是 501', async () => {
+test('Phase 5 建议写入口已实现并进入真实校验；Phase 6B 决策路由也是真实行为（D-057）', async () => {
   const ctx = setup('ledger-p3-');
   const srv = await startServer(ctx);
   try {
@@ -330,9 +330,11 @@ test('Phase 5 建议写入口已实现并进入真实校验；Phase 6 决策事�
     const rec = await post(srv.port, '/api/v1/recommendations', {});
     assert.strictEqual(rec.status, 400);
     assert.strictEqual(rec.json.error.code, 'invalid_snapshot_ref', '缺引用绑定按 5A 冻结的引用错误码拒绝');
+    // 6B（D-057）：决策事件路由已实现。对不存在的决策 id，真实行为是 404 unknown_decision，
+    // 不再是 501 not_implemented；完整状态机行为由 tests/server-phase6.test.js 覆盖。
     const events = await post(srv.port, '/api/v1/decisions/dc-1/events', { toState: 'accepted' });
-    assert.strictEqual(events.status, 501, '决策事件仍属 Phase 6');
-    assert.ok(String(events.json.error.message).indexOf('Phase 6') >= 0);
+    assert.strictEqual(events.status, 404, '决策事件已是真实路由：未知决策 404');
+    assert.strictEqual(events.json.error.code, 'unknown_decision');
   } finally {
     srv.close();
     ctx.close();

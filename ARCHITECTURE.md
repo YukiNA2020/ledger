@@ -233,7 +233,7 @@ POST   /api/v1/decisions/{id}/links
 POST   /api/v1/decisions/{id}/links/unlink
   # 6D：软删除留痕，note 必填；409 link_not_active
 GET    /api/v1/decisions?state=&month=&recommendationId=&from=&to=
-  # 月度按 decision_events.occurred_at 本地事件月；复核失败行不返回，计入 invalidCount
+  # 月度按 decision_events.occurred_at 本地状态事件月；仅关联/解绑不新增月份；复核失败行不返回，计入 invalidCount
 GET    /api/v1/decisions/{id}
   # 返回 decision + 完整 events 时间线 + links + 快照 + execution；复核失败 → 400 invalid_decision_record
 POST   /api/v1/backups

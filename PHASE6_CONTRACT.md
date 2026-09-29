@@ -1,7 +1,8 @@
 # Phase 6 契约（6A 冻结稿）
 
 > 2026-09-28；执行子阶段：**6A 规则与契约**。基线代码 `2.4.23-ui-polish` / SQLite **v10**。
-> **2026-09-29 复核勘误**（不改四条已确认产品口径，只修实现口径）：①有序对计数为完整矩阵 **7×7 = 49**（合法 6 / 非法 43，含自转移）；②`RESTRICT` + 软删除 ⇒ 曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 修正为 20 × 100.00 = 2,000.00 本金；④归档理由 `no_trade` / `abandoned` 补按关联历史的可判定规则；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥§4.4 `reason` 公式补 `available` 判定。明细见 DECISIONS D-057 勘误。
+> **2026-09-29 复核勘误**（不改四条已确认产品口径，只修实现口径）：①有序对计数为完整矩阵 **7×7 = 49**（合法 6 / 非法 43，含自转移）；②`RESTRICT` + 软删除 ⇒ 曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 修正为 20 × 100.00 = 2,000.00 本金；④归档理由首次尝试按关联历史判定（**已被下条二次复测规则取代**）；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥§4.4 `reason` 公式补 `available` 判定。明细见 DECISIONS D-057 勘误。
+> **2026-09-29 二次复测修正**：跨月关联不新增 `eventMonths`；缺汇率时 CNY 汇总与剩余金额返回 `null`；归档理由按建议金额与关联历史唯一判定；三时点表与非法计数对齐矩阵。对应反例见 §10.2，详见 D-057 二次勘误。
 > 顺序入口：[ROADMAP.md](./ROADMAP.md)；任务来源：[PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) §3；执行入口：[NEXT_AGENT.md](./NEXT_AGENT.md)。
 > **本文件是 6A～6F 的唯一规则来源。** 与本文件冲突的旧文档、旧测试注释或代码注释，一律以本文件为准，并按 §11 更新；发现本文件未覆盖的分歧，先在本文件补一条规则再实现，不得在代码里就地裁定。
 
@@ -84,7 +85,7 @@ archived   已归档放弃（终态，6A 新增）
 
 ### 1.4 非法跳转例子（按类别）
 
-全部 38 条同码 `illegal_transition` → **HTTP 409**，且**事务整体回滚**（状态、事件、关联、快照都不写入）。代表例子：
+全部 43 条同码 `illegal_transition` → **HTTP 409**，且**事务整体回滚**（状态、事件、关联、快照都不写入）。代表例子：
 
 | 类别 | 例子（from → to） | 期望 |
 |---|---|---|
@@ -188,12 +189,18 @@ archived   已归档放弃（终态，6A 新增）
 |---|---|
 | 建议金额 | `rec.allocatedTotalMinor`（只读，永不改写） |
 | 单笔本金 | `Domain.mulMinor(quantity, price_minor)`，币种 = 标的 `currency`（D-042 ⑤） |
-| 关联本金 | Σ 活动关联 buy 的本金，按各自 `occurred_at` 用 `Domain.findFxRateAsOf`（只认当天及之前）折算 CNY 后求和 |
-| 关联费用 | Σ 活动关联 buy 的 `fee_minor` 同法折算，**单列展示** |
-| 进度 / 剩余 | `remainingMinor = rec.allocatedTotalMinor − 关联本金`，可为负（超买），**进度只反映事实，不改状态** |
-| 偏差 `diff` | `关联本金 − rec.allocatedTotalMinor` |
+| 关联本金 | Σ 活动关联 buy 的本金，按各自 `occurred_at` 用 `Domain.findFxRateAsOf`（只认当天及之前）折算 CNY 后求和；任一活动事件缺折算汇率时为 `null` |
+| 关联费用 | Σ 活动关联 buy 的 `fee_minor` 同法折算，**单列展示**；任一活动事件缺折算汇率时为 `null` |
+| 进度 / 剩余 | `remainingMinor = rec.allocatedTotalMinor − 关联本金`，可为负（超买）；关联本金为 `null` 时也为 `null`，**进度只反映事实，不改状态** |
+| 偏差 `diff` | `关联本金 − rec.allocatedTotalMinor`；关联本金为 `null` 时也为 `null`（不可判定） |
 
-- **缺汇率**：任一活动关联事件折算所需汇率不存在 → 偏差**不可判定**，按「有偏差」处理（`reason = executed_deviation`，`note` 必填），快照的 `execution.fxUnavailable` 列出事件 id；**绝不按 1:1、期末汇率或伪 0 兜底**。
+- **缺汇率**：任一活动关联事件折算所需汇率不存在 → `linkedPrincipalCnyMinor`、`linkedFeeCnyMinor`、`remainingMinor` 与内部 `diff` **全部为 `null`**，`linkedCount` 仍是实际活动关联条数；`fxUnavailable` 按事件 `occurred_at`、`id` 升序列出缺汇率的事件 id。偏差**不可判定**，确认执行时按「有偏差」处理（`reason_code = executed_deviation`，`note` 必填）。列表、详情、关联响应和每份快照的 `execution` 使用同一形状；**绝不按 1:1、期末汇率、已能折算的部分小计或伪 0 兜底**。无活动关联时汇总本金与费用均为 0、剩余为建议金额、`fxUnavailable=[]`。
+
+  例如建议 2,000.00 CNY，已关联一笔 CNY buy 与一笔缺交易日 HKD→CNY 汇率的 HKD buy，响应固定为：
+
+  ```json
+  {"linkedCount":2,"linkedPrincipalCnyMinor":null,"linkedFeeCnyMinor":null,"remainingMinor":null,"fxUnavailable":["sev-hkd"]}
+  ```
 - **状态永远由显式命令推进**：`accepted → executed` 必须是 `POST .../events`，**不按「金额相等」自动判 executed**。
 - `accepted → executed` 要求活动关联 **≥ 1**，否则 **409 `no_linked_events`**。
 - 偏差存在（`diff ≠ 0` 或不可判定）时，`note` 必填，否则 **400 `deviation_note_required`**；`diff === 0` 时 `note` 可空，服务端理由码取 `executed_as_planned`，否则 `executed_deviation`。
@@ -210,7 +217,7 @@ archived   已归档放弃（终态，6A 新增）
 ### 3.5 0 元、全部保留现金与无交易（用户已确认）
 
 - **不得伪造任何 0 元证券交易、不得用零关联的 `executed` 满足状态**。
-- 无交易的关闭路径唯一：**`accepted → archived`**，`note` 必填，服务端理由码 `no_trade`（0 元 / 全部保留现金 / 始终没买）或 `abandoned`（接受后放弃）。
+- 无交易的关闭路径唯一：**`accepted → archived`**，`note` 必填。活动关联为 0 且建议金额为 0、从未关联过买入时，服务端理由码为 `no_trade`；其余归档（包括有正金额但接受后始终没买，以及曾关联后全部解绑）为 `abandoned`。判定规则见 §6.3。
 - 归档要求活动关联 = 0，否则 **409 `has_linked_events`**（先解绑再归档）。
 - `archived` 是终态：不可再接受、执行或复盘；在历史中可按状态筛选。
 - 0 元 formal 建议（5E-6 已证明会生成）的完整路径：`accepted`（note 必填）→ `archived`（note 必填，`no_trade`）。它**不会**出现在复盘历史里，这是预期行为而不是缺口。
@@ -229,9 +236,11 @@ archived   已归档放弃（终态，6A 新增）
 
 | 时点 | 触发事件 | `asOf` |
 |---|---|---|
-| 决策时点 | `proposed → accepted/deferred/dismissed/archived` | 事件 `occurred_at`（= 当日 `ctx.today()`） |
+| 决策时点 | `proposed → accepted/deferred/dismissed` | 事件 `occurred_at`（= 当日 `ctx.today()`） |
 | 执行时点 | `accepted → executed` | 同上 |
 | 复盘时点 | `executed → reviewed` | 同上 |
+
+`accepted → archived` 也是合法状态事件，必须按「每次状态事件」规则另封存**归档快照**；它不属于执行或复盘时点，也不进入三时点配置对照。详情的 `snapshots.archived` 返回该快照，未归档时为 `null`。
 
 **每一次状态事件都封存一份完整快照**（`decision_events.snapshot_json` + `snapshot_hash`）。快照是当时事实的一次性封存，此后改行情、改目标、改资产都**不能**改变已封存的快照；历史追溯用当时的规则版本（`targetRef.ruleVersion` / `templateVersion`），当前值若在页面展示必须**分开标注**，不得与历史值混排。
 
@@ -267,12 +276,12 @@ archived   已归档放弃（终态，6A 新增）
       "minBps": 1000, "targetBps": 2000, "maxBps": 3000,
       "band": "above_max", "deviationBps": 3154 }
   ],
-  "execution": {                      // 每份快照都有；关联为空时全 0 / 空数组
+  "execution": {                      // 每份快照都有；无关联时本金/费用为 0、剩余为建议金额
     "linkedCount": 2,
-    "linkedPrincipalCnyMinor": 199900,
-    "linkedFeeCnyMinor": 500,
-    "remainingMinor": 100,
-    "fxUnavailable": []               // 折算缺汇率的事件 id
+    "linkedPrincipalCnyMinor": 199900, // 缺任一活动买入的折算汇率 → null
+    "linkedFeeCnyMinor": 500,          // 同上 → null
+    "remainingMinor": 100,             // 同上 → null
+    "fxUnavailable": []                // 缺汇率事件 id，按交易日、id 升序
   }
 }
 ```
@@ -312,6 +321,7 @@ reason          = available ? null
 - `available === true` 时 `reason` 恒为 `null`（§4.2 示例即此情形）。2026-09-29 勘误：原公式缺 `available` 判定，会把可比快照也写成 `valuation_not_formal`。
 
 - `available === false` → `netWorthMinor` / `investableTotalMinor` / `classes` **全部为 `null`**，`reason` 与 `blockers` 解释原因；**任何情况下都不输出伪 0、伪收益**。
+- `available` 只说明该时点配置估值能否比较；历史买入缺折算汇率时，`execution` 的 CNY 汇总按 §3.3 为 `null`，即使 `available === true` 也不伪造执行金额。两种可用性不能互相代替。
 - `reason` 词表冻结为两个值：`cash_not_reconciled`、`valuation_not_formal`；`blockers` 沿用 `computeOverview` 的既有码（`quote_missing` / `quote_stale` / `fx_stale` / `fx_missing` / `classification_unconfirmed` / `balance_stale` / `close_incomplete` …），**不另造第二套 blocker 码**。
 - `available === true` 且投资池为 0：`investableTotalMinor = 0`、`classes[].pctBps/band/deviationBps = null`、`valueMinor = 0`，`valuationStatus` 照实填写。这是**合法的可比状态**（0 元案例），不是缺数据。
 - 复盘（`executed → reviewed`）**本身不因缺数据而被拒绝**：缺数据时照样封存，但快照为 `available:false`，页面必须显著标注「不可比」。用户想得到可比复盘，应先补行情 / 汇率 / 现金核对再复盘——因为 `reviewed` 是终态，封存后不可改。
@@ -333,7 +343,7 @@ reason          = available ? null
 ## 5. 月度历史归属
 
 - **筛选月 = `substr(decision_events.occurred_at, 1, 7)`**，即**本地事件发生月**；月底边界 = 本地日历月末（不按 30 天、不按 UTC）。
-- 一条决策可以在多个月出现（事件跨月），列表项返回 `eventMonths: ["2026-10","2026-11"]`；详情永远是**完整时间线**，不按月截断。
+- 一条决策可以在多个月出现（**状态事件**跨月），列表项返回 `eventMonths: ["2026-10","2026-11"]`；详情永远是**完整时间线**，不按月截断。`eventMonths` 是状态事件月份去重升序集合，关联 / 解绑当天不会新增月份。
 - **回填交易日 ≠ 事件记录时间**：`security_events.occurred_at`（交易日，可早于操作时间、可回填）只用于交易明细展示与本金折算；月度筛选只认 `decision_events.occurred_at`。两者在页面上必须分别标注为「交易日」与「操作时间」。
 - 关联 / 解绑不产生状态事件，因此**不单独影响月度归属**；它们通过所属决策的事件被包含进该月。
 - 空月份不生成条目；筛选结果为空时显示空态，不报错。
@@ -414,13 +424,13 @@ postpone                  proposed → deferred
 dismiss_not_actionable    proposed → dismissed
 executed_as_planned       accepted → executed 且 diff === 0
 executed_deviation        accepted → executed 且 diff ≠ 0 或不可判定
-no_trade                  accepted → archived（没有发生交易）
-abandoned                 accepted → archived（接受后放弃）
+no_trade                  accepted → archived（建议金额为 0，且从未关联过买入）
+abandoned                 accepted → archived（其他活动关联为 0 的放弃情形）
 reviewed_with_drift       executed → reviewed 且六类金额或比例与执行时点不同
 reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 ```
 
-`reason_code` 由**服务端**根据动作与计算结果得出，客户端不可指定；用户的自由文本理由走 `note`。两个归档理由的**可判定规则**（2026-09-29 补充，原稿未给出）：`no_trade` = 该决策自创建以来从未存在过任何 `decision_links` 行（活动与已解绑均为 0，即从未关联过买入）；`abandoned` = 曾有过关联行、后全部解绑再归档。判定只读关联历史，不由客户端提交；两种情形都要求活动关联 = 0（§3.5）。
+`reason_code` 由**服务端**根据动作与计算结果得出，客户端不可指定；用户的自由文本理由走 `note`。归档先要求活动关联为 0（§3.5），再唯一判定：`no_trade` 当且仅当 `rec.allocatedTotalMinor === 0` **且**该决策从未存在任何 `decision_links` 行；其余均为 `abandoned`。因此正金额建议接受后尚未关联就放弃，明确是 `abandoned`；零金额建议曾关联后全部解绑，也为 `abandoned`。判定只读封存建议金额与关联历史，不从自由文本猜意图。
 
 ### 6.4 写入顺序与全量写入
 
@@ -598,7 +608,8 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
   "recommendation": { "id": "rec-…", "status": "formal", "asOf": "2026-10-01",
                       "allocatedTotalMinor": 200000, "inputHash": "…",
                       "explanationVersion": "1", "adviceStaleReasons": [] },
-  "snapshots": { "decision": { "…": "§4.2" }, "executed": null, "reviewed": null },
+  "snapshots": { "decision": { "…": "§4.2" }, "executed": null, "reviewed": null,
+                 "archived": null },
   "execution": { "…": "§8.3" },
   "timeline": [ { "at": "2026-10-15", "kind": "state", "…": "…" },
                 { "at": "2026-10-21", "kind": "link", "…": "…" } ]
@@ -668,9 +679,9 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 | 步骤 | 输入 | 期望 |
 |---|---|---|
 | 1 | 另一个月的正式建议 `rec-B`（5,000.00 CNY） | 与 F-A 无共用事件 |
-| 2 | accept → 第 1 笔 buy（10 月）→ link | 进度部分 |
-| 3 | 第 2 笔 buy（11 月，HKD 币种，金额偏低）→ link | `eventMonths = ["2026-10","2026-11"]` |
-| 4 | 核对现金 → executed（`diff≠0`，note 必填） | `reason=executed_deviation`，`remainingMinor` 记录未完成部分 |
+| 2 | 10 月 accept → 第 1 笔 CNY buy（20 × 100.00 = 2,000.00）→ link | 进度部分；`eventMonths = ["2026-10"]` |
+| 3 | 11 月第 2 笔 HKD buy（30 × 100.00 = 3,000.00 HKD），交易日 as-of HKD→CNY 汇率 0.9（2,700.00 CNY）→ link | 仅关联，不产生状态事件；此刻 `eventMonths = ["2026-10"]`，时间线另列 11 月关联操作；本金合计 4,700.00 CNY |
+| 4 | 11 月核对现金 → executed（`diff = -300.00`，note 必填） | 追加 11 月状态事件后 `eventMonths = ["2026-10","2026-11"]`；`reason=executed_deviation`，`remainingMinor = 300.00 CNY` |
 | 5 | reviewed + note | 三时点六类对照逐 basis point 可复算 |
 | 6 | 生成 SQLite 备份 → 清空到空库 → 恢复 | 状态、事件顺序、关联、快照、引用与建议**逐字段一致**，`invalidCount=0` |
 
@@ -695,12 +706,12 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 17. 恢复**缺三键的旧 JSON 备份** → 决策为空历史，不从活库保留、不伪造；
 18. **普通五键保存** → 三集合保留（G5C-1 同类回归）；显式 `decisions: []` → 清空；非数组 → 400；
 19. 全量写入删除**曾被任何关联行（活动或已解绑）引用**的 `security_event` → `linked_event_missing` 整体回滚；软解绑后再删同样拒绝；
-20. 缺汇率的关联 → executed 走 `executed_deviation` + `fxUnavailable` 非空，**不按 1:1 兜底**；
-21. 现金未核对 → 复盘快照 `available:false` + `reason=cash_not_reconciled`，数字字段全 `null`；
+20. 缺汇率的关联 → 列表、详情、关联响应、快照的三个 CNY 汇总字段均为 `null`，`linkedCount` 保持实际条数，`fxUnavailable` 顺序稳定；executed 走 `executed_deviation` 且 note 必填，**不按 1:1 或部分小计兜底**；无活动关联时汇总为 0、剩余为建议金额；
+21. 现金未核对 → 复盘快照 `available:false` + `reason=cash_not_reconciled`，`netWorthMinor` / `investableTotalMinor` / `classes` 为 `null`，`execution` 仍按 §3.3 保留关联事实；
 22. 缺报价 / 过期价格 / 分类未确认 → `available:false` + `valuation_not_formal` + 既有 blockers；
 23. 0 投资池 → `available:true`、`pctBps/band/deviationBps = null`、金额为 0，**不算不可比**；
-24. 0 元建议 → `accepted` → `archived`（从未关联过事件 → `no_trade`），**不存在任何证券交易**，不进复盘历史；曾有关联、全部解绑后归档 → `abandoned`（§6.3 判定规则）；
-25. 月度归属：月底边界（本地 10-31 vs UTC 11-01）、回填交易日早于操作时间、跨月事件、空月份；
+24. 0 元建议 → `accepted` → `archived`（从未关联过事件 → `no_trade`），**不存在任何证券交易**，不进复盘历史；正金额建议从未关联就归档、或任意金额建议曾关联后全部解绑再归档 → `abandoned`（§6.3 判定规则）；
+25. 月度归属：月底边界（本地 10-31 vs UTC 11-01）、回填交易日早于操作时间、10 月接受后 11 月仅关联仍只属 10 月、11 月执行后才同时属两月、空月份；
 26. 迁移：v10 → v11 空表；v11 库二次迁移幂等；迁移中途失败整体回滚；
 27. 备份结构：缺表 / 缺必需索引 / 缺必需列 / **部分唯一索引被换成普通索引** → 拒绝恢复且活库不变；
 28. 原功能回归：记账、账单导入、去重、月结、建议生成、G5-R1～R3 反例全部保持通过。

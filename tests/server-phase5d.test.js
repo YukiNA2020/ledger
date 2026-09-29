@@ -702,15 +702,19 @@ test('范围边界：provider 刷新不生成也不改写建议；建议表没�
     });
     assert.strictEqual(JSON.stringify((await get(srv.port, '/api/v1/recommendations')).json), before);
 
-    // 建议表结构里没有任何决策状态列（Phase 6 的 decisions / decision_events 也不得存在）
+    // 建议表结构里没有任何决策状态列（5D 段落原意保留：决策状态只存在于 6B 的 decisions 表）
     const cols = require('../server/db').all(ctx.db, 'PRAGMA table_info(recommendations)').map((c) => c.name);
     ['state', 'decision_state', 'accepted_at', 'deferred', 'executed', 'reviewed', 'dismissed'].forEach((c) => {
       assert.ok(!cols.includes(c), '建议表不得预建决策状态列 ' + c);
     });
+    // 6B（D-057，契约 §11 更新）：决策三表已按 v11 交付 —— 原断言「Phase 6 表不得提前建」
+    // 随 6B 实施显式推进；建议表无状态列的原意保持不变。
     const tables = require('../server/db').all(ctx.db, "SELECT name FROM sqlite_master WHERE type='table'").map((t) => t.name);
-    assert.ok(!tables.includes('decisions') && !tables.includes('decision_events'), 'Phase 6 表不得提前建');
+    assert.ok(tables.includes('decisions') && tables.includes('decision_events') && tables.includes('decision_links'),
+      'v11 应已建立决策三表');
     const events = await post(srv.port, '/api/v1/decisions/dc-1/events', { toState: 'accepted' });
-    assert.strictEqual(events.status, 501, '决策事件仍属 Phase 6');
+    assert.strictEqual(events.status, 404, '决策事件已是真实路由：未知决策 404');
+    assert.strictEqual(events.json.error.code, 'unknown_decision');
 
     // 建议响应里不回显任何 provider / 网络痕迹，且引用快照哈希可追溯到封存行
     const json = created.json.recommendation;

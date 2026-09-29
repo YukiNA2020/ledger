@@ -2,9 +2,22 @@
 
 > 文档用途：记录可复现的测试证据、覆盖范围、缺陷和发布判断。
 > 创建时间：2026-08-16
-> 最近更新：2026-09-28
+> 最近更新：2026-09-29
 
 ## 当前结论
+
+2026-09-29 Phase 6B `2.4.24-phase6b`：决策状态机、事件与存储（D-057 契约落地）。全量 `node --test` **671/671**（648 基线 + 新增 `tests/domain-phase6.test.js` 10 项 + `tests/server-phase6.test.js` 12 项 + 新增 Phase 6 段落范围守卫 1 项）。要点：
+
+- **49 个有序对数据驱动全遍历**（契约 §1.2）：合法 6 恰好追加 1 条事件；非法 43 全部 409 `illegal_transition` 且状态、事件数、关联数逐项不变（事务整体回滚）。
+- 创建门禁实测：estimate → `recommendation_not_formal`、未知建议 → 422 `unknown_recommendation`、intent 白名单（executed/reviewed/archived/proposed → 409 且零落库）、派生键载荷 400、note 必填、同建议重复创建 `created:false`。
+- 接受门禁（§2.2）：撤销认可映射后接受 → 409 `recommendation_stale`；同条失效建议 `deferred` 照常创建（不重核）。
+- 幂等（§8.6）：同 key 同载荷回放（`X-Ledger-Idempotent: replay`）、同 key 异载荷 409 `idempotency_conflict`；事件端点无自然幂等（自转移 409）。
+- F-A / F-B 闭环：三时点快照齐全、`executed_as_planned` / `executed_deviation` / `reviewed_no_drift` 理由码、`deviation_note_required`、跨月 eventMonths（回填交易日与操作时间分列）、SQLite 备份 → 恢复 → 详情逐字段一致、`invalidCount=0`。
+- 全量写入（§6.4）：五键保存（preserve）保留三集合、缺键清空、显式三集合空数组清空、孤儿事件 400 `invalid_decision_record`、非数组 400 `invalid_asset_collection`、删除被关联引用的事件 409 `linked_event_missing`、双活动关联 409 `event_already_linked`。
+- 读取复核（§4.5）：篡改快照一个字节 / seq 断链 / 状态与事件链不一致 → 列表 `invalidCount` 留痕、详情 400 `invalid_decision_record`，复原后恢复可用；actor 篡改被 DB CHECK 直接挡下。
+- 迁移与备份：v10→v11 三表为空、二次迁移幂等；`REQUIRED_*[11]` 校验通过；**部分唯一索引换成普通唯一索引被对称拒止**（点名 `uq_decision_links_active`）。
+- 守卫测试按契约 §11 逐条更新（5A-18 → v11、server-api / server-phase3 的 501 → 真实路由行为、server-phase5d 表结构断言、5D-24 边界下移 + 新增 Phase 6 段落守卫、store-headers 九伴随、server-migration v11 结构与空表）。
+- 本轮未改任何页面行为（`js/app.js` 仅版本号），浏览器 wiring（34 项）留待 6C 页面交付时一并运行；`node --check` 与 `git diff --check` 通过。
 
 2026-09-28 UI 细节修复 `2.4.23-ui-polish`：全量 **648/648**，浏览器 **34/34**；1440/1100/390px 的 17 个页面无装饰表情、无横向溢出，月份标题无裁切且前后切换正常；分类/账户/筛选弹层通过，分类编辑保存保留原有图标字段。证据与可复跑脚本见 `docs/evidence/ui-polish-20260928/`。
 

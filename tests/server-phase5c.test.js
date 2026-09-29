@@ -766,7 +766,7 @@ test('范围边界：5C 的接口自身不分配金额、写请求仍需令牌�
       M.migrate(v8, { list: M.MIGRATIONS.filter((m) => m.version <= 8) });
       assert.strictEqual(M.currentVersion(v8), 8);
       const migrated = M.migrate(v8);
-      assert.deepStrictEqual(migrated.applied, [9, 10]);
+      assert.deepStrictEqual(migrated.applied, [9, 10, 11]);
       assert.strictEqual(dbm.all(v8, 'SELECT id FROM allocation_targets').length, 0);
       assert.strictEqual(dbm.all(v8, 'SELECT id FROM approved_instruments').length, 0);
       assert.ok(rec && rec.id);

@@ -19,6 +19,7 @@ const crypto = require('node:crypto');
 const dbm = require('./db');
 const R = require('./repository');
 const Recommendations = require('./recommendations');
+const Decisions = require('./decisions');
 const backupLib = require('./backup');
 const keychain = require('./keychain');
 const migrations = require('./migrations');
@@ -346,7 +347,26 @@ const DOMAIN_ERROR_STATUS = {
   target_assessment_mismatch: 409,
   invalid_recommendation_record: 400,
   invalid_recommendation_output: 500,
-  duplicate_recommendation: 409
+  duplicate_recommendation: 409,
+  // Phase 6B（D-057）：决策状态机写路径。载荷形状 / note 缺失 400、未知引用按
+  // 「路径资源 404、载荷引用 422」分口径、状态与冲突 409 —— 全部是客户端可修正的 4xx；
+  // 服务端算不出的仍是 5xx（沿用 invalid_valuation_input）。
+  invalid_decision_payload: 400,
+  deviation_note_required: 400,
+  invalid_decision_record: 400,
+  unknown_decision: 404,
+  illegal_transition: 409,
+  recommendation_not_formal: 409,
+  recommendation_stale: 409,
+  no_linked_events: 409,
+  has_linked_events: 409,
+  event_already_linked: 409,
+  link_not_active: 409,
+  illegal_state_for_link: 409,
+  invalid_link_target: 409,
+  linked_event_missing: 409,
+  unknown_recommendation: 422,
+  unknown_security_event: 422
 };
 
 // 幂等键必须绑定“同一路径的同一份请求语义”，不能让同一个 key 悄悄吞掉另一笔事件。
@@ -1440,6 +1460,40 @@ function createHandler(ctx) {
     };
   }
 
+  // Phase 6B：创建 / 事件响应的统一装配。created:false 时回放既有决策的完整详情
+  //（不套用本次 intent / note）；eventMonths 由事件发生月派生（契约 §5）。
+  function decisionMutationResponse(db, result, ctx) {
+    if (!result.created) {
+      const detail = Decisions.decisionDetailResponse(db, result.decisionId, ctx);
+      return {
+        ok: true,
+        created: false,
+        decision: detail.decision,
+        events: detail.events,
+        links: detail.links,
+        execution: detail.execution,
+        recommendation: detail.recommendation,
+        snapshots: detail.snapshots,
+        timeline: detail.timeline
+      };
+    }
+    const eventMonths = Array.from(new Set(result.events.map((e) => String(e.occurredAt).slice(0, 7)))).sort();
+    return {
+      ok: true,
+      created: true,
+      decision: Object.assign({}, result.decision, { eventMonths: eventMonths }),
+      events: result.events,
+      links: result.links.map((l) => ({
+        id: l.id,
+        securityEventId: l.securityEventId,
+        linkedOn: l.linkedOn,
+        unlinkedOn: l.unlinkedOn,
+        note: l.note
+      })),
+      execution: result.execution
+    };
+  }
+
   api['GET /api/v1/recommendations'] = (req, res) => {
     const view = R.readRecommendationView(ctx.db);
     // 与 5B / 5C 的列表同一纪律：复核不过或封存哈希被改动的行不冒充可用建议，但显式留痕
@@ -1449,6 +1503,59 @@ function createHandler(ctx) {
       total: view.total,
       versions: { ruleVersion: Domain.RISK_RULE_VERSION, targetVersion: Domain.RISK_TARGET_VERSION }
     });
+  };
+
+  /* ------------------------- Phase 6B：决策状态机、事件与只读视图（D-057） -------------------------
+   * 创建：唯一对象是一条 formal 建议；一条建议最多一条决策（自然幂等 created:false）。
+   * intent 缺省 → 两步式 proposed（零事件、无快照）；accepted/deferred/dismissed → 一步创建
+   * 并追加首条事件。接受门禁（adviceStaleness + 5D 门禁复放 + G5-R1 引用一致）与事件、
+   * 快照、幂等记录在同一事务提交；失败整体回滚（契约 §2.2 / §6.4 / §8.6）。
+   */
+  api['POST /api/v1/decisions'] = async (req, res) => {
+    const body = await readBody(req);
+    const idemKey = req.headers['idempotency-key'];
+    const fingerprint = requestFingerprint(body);
+    if (idemKey) {
+      const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/decisions');
+      if (cached) {
+        if (cached.__requestFingerprint) {
+          if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+            return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于另一次决策请求', false);
+          }
+          return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+        }
+        return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      }
+    }
+    const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    const nowIso = typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString();
+    try {
+      const payload = dbm.transaction(ctx.db, () => {
+        const result = Decisions.createDecision(ctx.db, body, { today: today, nowIso: nowIso });
+        const out = decisionMutationResponse(ctx.db, result, { today: today });
+        if (idemKey) {
+          R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/decisions', {
+            __requestFingerprint: fingerprint,
+            response: out
+          });
+        }
+        return out;
+      });
+      return sendJson(res, payload.created ? 201 : 200, payload);
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  // 列表：有效决策 + 过滤（state / month / recommendationId / from / to）+ invalidCount 留痕。
+  // 过滤参数不合法会以领域错误码抛出：同步 handler 也必须走集中错误映射，不能炸掉进程。
+  api['GET /api/v1/decisions'] = (req, res) => {
+    const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    try {
+      sendJson(res, 200, Decisions.decisionListResponse(ctx.db, req.query || {}, { today: today }));
+    } catch (err) {
+      return upsertFail(res, err);
+    }
   };
 
   api['GET /api/v1/quotes'] = (req, res) => {
@@ -1719,6 +1826,96 @@ function readCloseSnapshotHandler(ctx, rawId, res) {
   });
 }
 
+// Phase 6B：决策事件（POST，路径参数）。写接口走同一道 token / Origin / Content-Type 门禁；
+// 幂等键绑定「同一路径的同一份请求语义」，事件端点没有自然幂等，页面必须带 Idempotency-Key。
+async function handleDecisionEvent(ctx, rawId, req, res) {
+  let decisionId = '';
+  try {
+    decisionId = decodeURIComponent(String(rawId));
+  } catch (_) {
+    return fail(res, 400, 'invalid_id', '决策 id 不合法', false);
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(decisionId)) {
+    return fail(res, 400, 'invalid_id', '决策 id 不合法', false);
+  }
+  const body = await readBody(req);
+  const idemKey = req.headers['idempotency-key'];
+  const eventPath = '/api/v1/decisions/' + decisionId + '/events';
+  const fingerprint = requestFingerprint(body);
+  if (idemKey) {
+    const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', eventPath);
+    if (cached) {
+      if (cached.__requestFingerprint) {
+        if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+          return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于另一次决策事件', false);
+        }
+        return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+      }
+      return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+    }
+  }
+  const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+  const nowIso = typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString();
+  try {
+    const payload = dbm.transaction(ctx.db, () => {
+      const result = Decisions.appendDecisionEvent(ctx.db, decisionId, body, { today: today, nowIso: nowIso });
+      const eventMonths = Array.from(new Set(result.events.map((e) => String(e.occurredAt).slice(0, 7)))).sort();
+      const out = {
+        ok: true,
+        decision: Object.assign({}, result.decision, { eventMonths: eventMonths }),
+        events: result.events,
+        links: result.links.map((l) => ({
+          id: l.id,
+          securityEventId: l.securityEventId,
+          linkedOn: l.linkedOn,
+          unlinkedOn: l.unlinkedOn,
+          note: l.note
+        })),
+        execution: result.execution
+      };
+      if (idemKey) {
+        R.rememberIdempotent(ctx.db, String(idemKey), 'POST', eventPath, {
+          __requestFingerprint: fingerprint,
+          response: out
+        });
+      }
+      return out;
+    });
+    return sendJson(res, 200, payload);
+  } catch (err) {
+    return upsertFailDispatcher(err, res);
+  }
+}
+
+// Phase 6B：决策详情（GET，路径参数）。任一复核失败 → 400 invalid_decision_record（fail closed）。
+function handleDecisionDetail(ctx, rawId, res) {
+  let decisionId = '';
+  try {
+    decisionId = decodeURIComponent(String(rawId));
+  } catch (_) {
+    return fail(res, 400, 'invalid_id', '决策 id 不合法', false);
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(decisionId)) {
+    return fail(res, 400, 'invalid_id', '决策 id 不合法', false);
+  }
+  const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+  try {
+    return sendJson(res, 200, Decisions.decisionDetailResponse(ctx.db, decisionId, { today: today }));
+  } catch (err) {
+    return upsertFailDispatcher(err, res);
+  }
+}
+
+// 路径参数路由没有 api 表内的 upsertFail 闭包：集中同一套错误码 → HTTP 状态映射。
+function upsertFailDispatcher(err, res) {
+  const code = (err && err.code) || 'internal_error';
+  if (code === 'internal_error' || /^(?:ERR_)?SQLITE_/.test(code)) {
+    return fail(res, 500, 'internal_error', '写入失败', false);
+  }
+  const status = DOMAIN_ERROR_STATUS[code] || 400;
+  return fail(res, status, code, err && err.message ? err.message : '写入失败', false);
+}
+
 function isAllowedOrigin(origin, port) {
   if (!origin) return true; // 非浏览器客户端（如 curl）不带 Origin，由 token 把关
   const allowed = ['http://127.0.0.1:' + port, 'http://localhost:' + port, 'http://[::1]:' + port];
@@ -1807,6 +2004,18 @@ function createHandlerEntry(ctx) {
       return readCloseSnapshotHandler(ctx, snapshotMatch[1], res);
     }
 
+    // Phase 6B：决策事件（POST 写接口，先过写门禁）与决策详情（GET 只读）
+    const decisionEventMatch = /^POST \/api\/v1\/decisions\/([^/]+)\/events$/.exec(key);
+    if (decisionEventMatch) {
+      const denied = checkWrite(req, ctx);
+      if (denied) return fail(res, denied.status, denied.code, denied.message, denied.retryable);
+      return handleDecisionEvent(ctx, decisionEventMatch[1], req, res);
+    }
+    const decisionDetailMatch = /^GET \/api\/v1\/decisions\/([^/]+)$/.exec(key);
+    if (decisionDetailMatch) {
+      return handleDecisionDetail(ctx, decisionDetailMatch[1], res);
+    }
+
     // 后端冻结但尚未实现的写接口：保持资源边界可见，明确告知所属阶段
     if (DEFERRED_WRITES[key]) {
       return fail(
@@ -1816,9 +2025,6 @@ function createHandlerEntry(ctx) {
         key + ' 属于 ' + DEFERRED_WRITES[key] + ' 的交付范围，本阶段只提供读取',
         false
       );
-    }
-    if (/^POST \/api\/v1\/decisions\/[^/]+\/events$/.test(key)) {
-      return fail(res, 501, 'not_implemented', '决策事件属于 Phase 6 的交付范围', false);
     }
 
     if (pathname.indexOf(API_PREFIX) === 0) {

@@ -5,7 +5,7 @@
 
 ## 唯一当前阶段
 
-2026-09-28 最新安排：**6A「规则与契约」已完成**——权威文本 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)，决策 D-057，零业务代码、零迁移、零页面，基线仍 `2.4.23-ui-polish` / schema **v10**。**当前为 Phase 6 6B「状态机、事件、存储与 API」，下一位 agent 领取 6B，不得直接实施整个 Phase 6。** 详见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) 和 [NEXT_AGENT.md](./NEXT_AGENT.md)。
+2026-09-29 最新安排：**6B「状态机、事件、存储与 API」已完成**——版本 `2.4.24-phase6b` / schema **v11**（`phase6-decisions` 三表）。决策状态机、事件与只读视图按 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（含二次复测修正）落地：49 个有序对数据驱动全遍历、接受门禁、幂等、伴随集合 6→9、备份 `REQUIRED_*[11]` 与部分唯一索引对称拒止、缺汇率汇总为 null、归档理由按建议金额与关联历史判定，全部实测通过，全量 `node --test` **671/671**。**当前为 Phase 6 6C「接受、暂缓、忽略与待执行页面」，下一位 agent 领取 6C，不得直接实施整个 Phase 6。** 详见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) 和 [NEXT_AGENT.md](./NEXT_AGENT.md)。
 
 G5-R4（用户称 05-R4）安排到 **6E-3** 真人计时，作为 **6F 最终验收硬门禁**；不阻塞前半程开发。Phase 5 维持「排除 R4 的限定范围通过，原完整验收待计时」，不是免除验收。Phase 7 两个月验证仍单独执行。
 
@@ -400,13 +400,13 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 目标：完成个人决策闭环。
 
-状态：**6A 已完成（2026-09-28 冻结，2026-09-29 复核勘误后通过；零代码，交付 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)）；6B～6F 未实施**。详细任务、验收、交接指令见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md)。
+状态：**6A 已完成（2026-09-28 冻结，2026-09-29 二次复测修正四组冲突后通过；零代码，交付 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)）；6B～6F 未实施**。详细任务、验收、交接指令见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md)。
 
 | 顺序 | 子阶段 | 退出条件 | 状态 |
 |---|---|---|---|
-| 6A | 规则与契约 | 状态、关联、复盘口径及迁移方案明确，无规则歧义 | ✅ **2026-09-28**（09-29 复核勘误后通过）：`PHASE6_CONTRACT.md` 冻结 49 有序对状态机（含新终态 `archived`，合法 6 / 非法 43）、buy-only 关联、三时点快照、v11/备份/回滚、F-A/F-B 正向与 28 条反向清单、§11 守卫测试清单；PRODUCT / DECISIONS(D-057) / ARCHITECTURE / ACCEPTANCE / ROADMAP / README / NEXT_AGENT / AGENTS / CHANGELOG / 本表同步；**零业务代码、零迁移、零页面**，基线仍 `2.4.23-ui-polish` / v10 |
-| 6B | 状态机、事件、存储与 API | 合法/非法跳转、事务、幂等、迁移和恢复通过 | 未开始（**下一入口**） |
-| 6C | 接受、暂缓、忽略与待执行页面 | 三类决定真实可用，刷新一致，失败不假成功 | 未开始 |
+| 6A | 规则与契约 | 状态、关联、复盘口径及迁移方案明确，无规则歧义 | ✅ **2026-09-29 二次复测修正后通过**：`PHASE6_CONTRACT.md` 冻结 49 有序对状态机（含新终态 `archived`，合法 6 / 非法 43）、buy-only 关联、三时点快照、v11/备份/回滚、F-A/F-B 正向与 28 条反向清单、§11 守卫测试清单；补齐仅状态事件决定月份、缺汇率金额为 `null`、归档理由唯一判定及归档快照；PRODUCT / DECISIONS(D-057) / ARCHITECTURE / ACCEPTANCE / ROADMAP / README / NEXT_AGENT / AGENTS / CHANGELOG / 本表同步；**零业务代码、零迁移、零页面**，基线仍 `2.4.23-ui-polish` / v10，回归 648/648 |
+| 6B | 状态机、事件、存储与 API | 合法/非法跳转、事务、幂等、迁移和恢复通过 | ✅ **2026-09-29**（`2.4.24-phase6b` / v11）：迁移 `phase6-decisions` 三表；POST /decisions（一条建议一条决策、自然幂等 + Idempotency-Key + 接受门禁）、POST /decisions/{id}/events（501 占位改真实路由、理由码服务端派生）、GET /decisions[/id]（过滤/排序/invalidCount/三时点与归档快照/时间线）；CLEAR_ORDER 头插三表、伴随集合 6→9、JSON/SQLite 备份贯穿、REQUIRED_*[11] + 部分索引对称拒止；缺汇率汇总为 null、归档理由按建议金额与关联历史判定；49 有序对数据驱动全遍历 + F-A/F-B + 反向清单实测；全量 **671/671** |
+| 6C | 接受、暂缓、忽略与待执行页面 | 三类决定真实可用，刷新一致，失败不假成功 | 未开始（**下一入口**） |
 | 6D | 实际交易关联与执行 | 复用证券事件，无重复入账，分批与偏差可追溯 | 未开始 |
 | 6E-1 | 复盘计算与封存 | 配置变化可复核，历史不随当前数据漂移 | 未开始 |
 | 6E-2 | 复盘页面与月度历史 | 完整时间线、跨月筛选及三档宽度验证通过 | 未开始 |

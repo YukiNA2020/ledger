@@ -2111,9 +2111,311 @@ function writeTxnsBlob(db, blob) {
   );
 }
 
+/* ------------------------ Phase 6B：决策状态机、事件与关联（D-057） ------------------------
+ *
+ * 一行决策绑定一条建议（uq_decisions_recommendation 兜底）；事件只追加（UNIQUE(decision_id, seq)），
+ * 每次状态变化封存一份快照。快照 / 事件行的完整性口径（契约 §4.5）：
+ *   - snapshot_hash = sha256(snapshot_json 原文)；snapshot_json 必须是 canonicalJson 文本；
+ *   - payload_hash = sha256(canonicalJson(事件行去掉 payload_hash 自身))；
+ * 读取（列表 / 详情 / /state / 备份恢复）时逐条复算，任一条不过即 invalid_decision_record。
+ */
+
+function hydrateDecisionRow(row) {
+  return {
+    id: row.id,
+    recommendationId: row.recommendation_id,
+    state: row.state,
+    lastSeq: row.last_seq,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function hydrateDecisionEventRow(row) {
+  return {
+    id: row.id,
+    decisionId: row.decision_id,
+    seq: row.seq,
+    fromState: row.from_state,
+    toState: row.to_state,
+    reasonCode: row.reason_code,
+    note: row.note,
+    occurredAt: row.occurred_at,
+    recordedAt: row.recorded_at,
+    actor: row.actor,
+    snapshot: JSON.parse(row.snapshot_json),
+    snapshotHash: row.snapshot_hash,
+    payloadHash: row.payload_hash
+  };
+}
+
+function hydrateDecisionLinkRow(row) {
+  return {
+    id: row.id,
+    decisionId: row.decision_id,
+    securityEventId: row.security_event_id,
+    linkedOn: row.linked_on,
+    linkedAt: row.linked_at,
+    note: row.note,
+    unlinkedOn: row.unlinked_on,
+    unlinkedAt: row.unlinked_at,
+    unlinkNote: row.unlink_note
+  };
+}
+
+// 契约 §4.2：snapshot_hash = SHA-256(snapshot_json 的 UTF-8 字节)，snapshot_json 必须 canonical。
+function decisionSnapshotHash(snapshot) {
+  return sha256Hex(canonicalJson(snapshot));
+}
+
+// 事件行自身的防篡改哈希：覆盖除 payload_hash 外的全部字段（含快照引用与哈希）。
+function decisionEventPayloadHash(event) {
+  const copy = Object.assign({}, event);
+  delete copy.payloadHash;
+  return sha256Hex(canonicalJson(copy));
+}
+
+function readDecisionRows(db) {
+  return all(db, 'SELECT * FROM decisions ORDER BY created_at ASC, id ASC').map((row) => {
+    try {
+      return hydrateDecisionRow(row);
+    } catch (_) {
+      return null;
+    }
+  });
+}
+
+function readDecisionEvents(db) {
+  return all(db, 'SELECT * FROM decision_events ORDER BY decision_id ASC, seq ASC').map((row) => {
+    try {
+      return hydrateDecisionEventRow(row);
+    } catch (_) {
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+function readDecisionLinks(db) {
+  return all(db, 'SELECT * FROM decision_links ORDER BY decision_id ASC, linked_on ASC, id ASC').map((row) => {
+    try {
+      return hydrateDecisionLinkRow(row);
+    } catch (_) {
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+function getDecisionRow(db, id) {
+  const row = get(db, 'SELECT * FROM decisions WHERE id = ?', [String(id)]);
+  return row ? hydrateDecisionRow(row) : null;
+}
+
+function getDecisionEvents(db, decisionId) {
+  return all(db, 'SELECT * FROM decision_events WHERE decision_id = ? ORDER BY seq ASC', [String(decisionId)])
+    .map((row) => hydrateDecisionEventRow(row));
+}
+
+function insertDecisionRow(db, decision) {
+  run(
+    db,
+    `INSERT INTO decisions (id, recommendation_id, state, last_seq, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [decision.id, decision.recommendationId, decision.state, decision.lastSeq, decision.createdAt, decision.updatedAt]
+  );
+}
+
+function insertDecisionEventRow(db, event) {
+  run(
+    db,
+    `INSERT INTO decision_events
+       (id, decision_id, seq, from_state, to_state, reason_code, note, occurred_at, recorded_at, actor, snapshot_json, snapshot_hash, payload_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      event.id,
+      event.decisionId,
+      event.seq,
+      event.fromState,
+      event.toState,
+      event.reasonCode,
+      event.note,
+      event.occurredAt,
+      event.recordedAt,
+      event.actor,
+      canonicalJson(event.snapshot),
+      event.snapshotHash,
+      event.payloadHash
+    ]
+  );
+}
+
+function updateDecisionForRow(db, decision) {
+  run(
+    db,
+    'UPDATE decisions SET state = ?, last_seq = ?, updated_at = ? WHERE id = ?',
+    [decision.state, decision.lastSeq, decision.updatedAt, decision.id]
+  );
+}
+
+// 决策读取复核（契约 §4.5）：链式一致 + 快照原文哈希 + 事件防篡改哈希 + 建议引用复核。
+// 任何一条不过 → invalid_decision_record；列表把失败行计入 invalidCount，详情接口直接 400。
+function validateDecisionWithIntegrity(db, decision, events, links, validRecommendationIds) {
+  const chain = Domain.validateDecisionEventChain(decision, events);
+  if (!chain.ok) return chain;
+  for (const event of chain.events) {
+    if (Domain.DECISION_HASH_RE.test(event.snapshotHash) !== true ||
+        decisionSnapshotHash(event.snapshot) !== event.snapshotHash) {
+      return { ok: false, error: { code: 'invalid_decision_record', detail: '快照原文与封存哈希不一致：' + event.id } };
+    }
+    if (decisionEventPayloadHash(event) !== event.payloadHash) {
+      return { ok: false, error: { code: 'invalid_decision_record', detail: '事件行内容与封存哈希不一致：' + event.id } };
+    }
+  }
+  if (!validRecommendationIds.has(decision.recommendationId)) {
+    return { ok: false, error: { code: 'invalid_decision_record', detail: '决策引用的建议不存在或复核失败：' + decision.recommendationId } };
+  }
+  for (const link of links) {
+    const checked = Domain.validateDecisionLinkRecord(link);
+    if (!checked.ok) return checked;
+  }
+  return { ok: true, decision: decision, events: chain.events, links: links };
+}
+
+// 全库决策的有效读取视图：{ decision, events, links } 逐条复核，失败行显式留痕。
+function readValidatedDecisions(db) {
+  const decisions = readDecisionRows(db).filter(Boolean);
+  const events = readDecisionEvents(db);
+  const links = readDecisionLinks(db);
+  const validRecommendationIds = new Set(readRecommendationView(db).items.map((r) => r.id));
+  const out = [];
+  let invalidCount = 0;
+  decisions.forEach((decision) => {
+    const dEvents = events.filter((e) => e.decisionId === decision.id);
+    const dLinks = links.filter((l) => l.decisionId === decision.id);
+    const checked = validateDecisionWithIntegrity(db, decision, dEvents, dLinks, validRecommendationIds);
+    if (!checked.ok) {
+      invalidCount += 1;
+      return;
+    }
+    out.push(checked);
+  });
+  return { items: out, invalidCount: invalidCount, total: decisions.length };
+}
+
+// 全量写入（PUT /state / JSON 恢复）：三集合逐条复核，任一条非法整体回滚，绝不静默丢行。
+// 引用规则（契约 §6.4）：decision.recommendationId 必须存在于本次写入的建议集合（建议先写入）；
+// 关联行指向的证券事件必须存在且为 buy（security_events 先写入）；删除仍被关联行引用的
+// 事件（含已解绑行）→ linked_event_missing 整体拒绝。
+function writeDecisions(db, collections) {
+  const decisions = collections.decisions || [];
+  const decisionEvents = collections.decisionEvents || [];
+  const decisionLinks = collections.decisionLinks || [];
+  if (!decisions.length && !decisionEvents.length && !decisionLinks.length) return;
+
+  const decisionIds = new Set();
+  const recommendationIds = new Set();
+  decisions.forEach((d) => {
+    const checked = Domain.validateDecisionRecord(d);
+    if (!checked.ok) {
+      throw Object.assign(new Error('决策记录不合法：' + checked.error.detail), { code: checked.error.code });
+    }
+    if (decisionIds.has(d.id)) {
+      throw Object.assign(new Error('同一决策 id 在写入集合中出现两次：' + d.id), { code: 'invalid_decision_record' });
+    }
+    if (recommendationIds.has(d.recommendationId)) {
+      throw Object.assign(new Error('同一条建议被两条决策绑定：' + d.recommendationId), { code: 'invalid_decision_record' });
+    }
+    decisionIds.add(d.id);
+    recommendationIds.add(d.recommendationId);
+  });
+  recommendationIds.forEach((recId) => {
+    if (!get(db, 'SELECT id FROM recommendations WHERE id = ?', [recId])) {
+      throw Object.assign(new Error('决策引用的建议不存在：' + recId), { code: 'unknown_recommendation' });
+    }
+  });
+
+  const eventIds = new Set();
+  const eventsByDecision = new Map();
+  decisionEvents.forEach((e) => {
+    const checked = Domain.validateDecisionEventRecord(e);
+    if (!checked.ok) {
+      throw Object.assign(new Error('决策事件不合法：' + checked.error.detail), { code: checked.error.code });
+    }
+    if (!decisionIds.has(e.decisionId)) {
+      throw Object.assign(new Error('事件指向的决策不在写入集合中：' + e.decisionId), { code: 'invalid_decision_record' });
+    }
+    const eventKey = e.decisionId + ':' + e.seq;
+    if (eventIds.has(e.id) || eventIds.has('seq:' + eventKey)) {
+      throw Object.assign(new Error('决策事件 id 或 seq 重复：' + e.id), { code: 'invalid_decision_record' });
+    }
+    eventIds.add(e.id);
+    eventIds.add('seq:' + eventKey);
+    if (!eventsByDecision.has(e.decisionId)) eventsByDecision.set(e.decisionId, []);
+    eventsByDecision.get(e.decisionId).push(e);
+  });
+  decisions.forEach((d) => {
+    const chain = Domain.validateDecisionEventChain(d, eventsByDecision.get(d.id) || []);
+    if (!chain.ok) {
+      throw Object.assign(new Error('决策事件链不完整：' + chain.error.detail), { code: chain.error.code });
+    }
+    chain.events.forEach((e) => {
+      if (decisionSnapshotHash(e.snapshot) !== e.snapshotHash || decisionEventPayloadHash(e) !== e.payloadHash) {
+        throw Object.assign(new Error('决策事件封存哈希与内容不一致：' + e.id), { code: 'invalid_decision_record' });
+      }
+    });
+  });
+
+  const linkIds = new Set();
+  const activeEventLinks = new Set();
+  const linkEventIds = new Set();
+  decisionLinks.forEach((l) => {
+    const checked = Domain.validateDecisionLinkRecord(l);
+    if (!checked.ok) {
+      throw Object.assign(new Error('关联行不合法：' + checked.error.detail), { code: checked.error.code });
+    }
+    if (!decisionIds.has(l.decisionId)) {
+      throw Object.assign(new Error('关联行指向的决策不在写入集合中：' + l.decisionId), { code: 'invalid_decision_record' });
+    }
+    if (linkIds.has(l.id)) {
+      throw Object.assign(new Error('关联行 id 重复：' + l.id), { code: 'invalid_decision_record' });
+    }
+    linkIds.add(l.id);
+    linkEventIds.add(l.securityEventId);
+    if (l.unlinkedOn == null) {
+      if (activeEventLinks.has(l.securityEventId)) {
+        throw Object.assign(new Error('同一证券事件被两条活动关联占用：' + l.securityEventId), { code: 'event_already_linked' });
+      }
+      activeEventLinks.add(l.securityEventId);
+    }
+  });
+  linkEventIds.forEach((eventId) => {
+    const ev = get(db, 'SELECT id, event_type FROM security_events WHERE id = ?', [eventId]);
+    if (!ev || ev.event_type !== 'buy') {
+      throw Object.assign(new Error('关联行引用的证券事件不存在或不是 buy：' + eventId), { code: 'linked_event_missing' });
+    }
+  });
+
+  decisions.forEach((d) => insertDecisionRow(db, d));
+  decisionEvents.forEach((e) => insertDecisionEventRow(db, e));
+  decisionLinks.forEach((l) => {
+    run(
+      db,
+      `INSERT INTO decision_links
+         (id, decision_id, security_event_id, linked_on, linked_at, note, unlinked_on, unlinked_at, unlink_note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [l.id, l.decisionId, l.securityEventId, l.linkedOn, l.linkedAt, l.note, l.unlinkedOn, l.unlinkedAt, l.unlinkNote]
+    );
+  });
+}
+
 /* ------------------------------ 全量读写 ------------------------------ */
 
 const CLEAR_ORDER = [
+  // Phase 6 的三张决策表在头部清空：decision_links 引用 security_events（RESTRICT）、
+  // decision_events / decisions 引用 recommendations（CASCADE / RESTRICT），
+  // 必须先于 recommendations 与 security_events 清空，否则 RESTRICT 会让整表重置失败。
+  'decision_links',
+  'decision_events',
+  'decisions',
   // Phase 5D 的建议产物引用 risk_assessments / allocation_targets（ON DELETE RESTRICT），
   // 必须最先清空；它引用的快照与月结在本表**没有**外键（封存审计引用），顺序上前置也无副作用。
   'recommendations',
@@ -2205,6 +2507,10 @@ function readState(db) {
     approvedInstruments: readApprovedInstruments(db),
     // Phase 5D：建议产物是服务端算出的不可变计算结果，同样独立成集合（不参与 assets.schemaVersion）
     recommendations: readRecommendations(db),
+    // Phase 6B：决策状态机三集合（决策 / 事件 / 关联行）—— /state 与备份的无损往返集合。
+    decisions: readDecisionRows(db).filter(Boolean),
+    decisionEvents: readDecisionEvents(db),
+    decisionLinks: readDecisionLinks(db),
     monthlyCloses: listMonthlyCloses(db),
     closeSnapshots: readCloseSnapshots(db)
   };
@@ -2238,6 +2544,15 @@ function writeState(db, state, options) {
       if (!Object.prototype.hasOwnProperty.call(src, 'recommendations')) {
         preservedCompanions.recommendations = readRecommendations(db);
       }
+      // Phase 6B（6B，D-057）：决策三集合与建议同处一份事务保留清单 —— 记账的普通保存
+      // 绝不表达「删掉用户的决策历史」。
+      ['decisions', 'decisionEvents', 'decisionLinks'].forEach((key) => {
+        if (!Object.prototype.hasOwnProperty.call(src, key)) {
+          preservedCompanions[key] = key === 'decisions'
+            ? readDecisionRows(db).filter(Boolean)
+            : key === 'decisionEvents' ? readDecisionEvents(db) : readDecisionLinks(db);
+        }
+      });
     }
     for (const key of ['monthlyCloses', 'closeSnapshots']) {
       if (opts.preserveMissingCompanionCollections === true && !Object.prototype.hasOwnProperty.call(src, key)) {
@@ -2306,6 +2621,19 @@ function writeState(db, state, options) {
       }
       writeRecommendations(db, recommendations);
     }
+    // Phase 6B：决策三集合最后写入 —— decisions 按 RESTRICT 引用建议、decision_links 按
+    // RESTRICT 引用证券事件，两者必须已在同一事务内可见（契约 §6.4 写入顺序）。
+    // 显式存在才逐条校验写入；缺省 = 清空（与评估 / 目标 / 建议同一兼容语义）；非数组 = 显式拒绝。
+    const decisionCollections = {};
+    ['decisions', 'decisionEvents', 'decisionLinks'].forEach((key) => {
+      const value = Object.prototype.hasOwnProperty.call(src, key)
+        ? src[key] : preservedCompanions[key];
+      if (value !== undefined && !Array.isArray(value)) {
+        throw Object.assign(new Error(key + ' 必须是数组'), { code: 'invalid_asset_collection' });
+      }
+      decisionCollections[key] = value === undefined ? [] : value;
+    });
+    writeDecisions(db, decisionCollections);
     return { ok: true };
   });
 }
@@ -2952,5 +3280,19 @@ module.exports = {
   canonicalJson,
   sha256Hex,
   validateApprovedInstrumentRow,
-  approvedInstrumentId
+  approvedInstrumentId,
+  /* Phase 6B：决策状态机、事件与关联（D-057） */
+  readDecisionRows,
+  readDecisionEvents,
+  readDecisionLinks,
+  getDecisionRow,
+  getDecisionEvents,
+  insertDecisionRow,
+  insertDecisionEventRow,
+  updateDecisionForRow,
+  writeDecisions,
+  readValidatedDecisions,
+  validateDecisionWithIntegrity,
+  decisionSnapshotHash,
+  decisionEventPayloadHash
 };
