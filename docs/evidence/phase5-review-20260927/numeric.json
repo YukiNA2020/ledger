@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "scoresChecked": 13312,
+  "portfoliosChecked": 5000,
+  "manual": [
+    {
+      "case": "S5.2 other categories within bands",
+      "requestedMinor": 200000,
+      "allocatedMinor": [
+        0,
+        0,
+        200000,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "requestedMinor": 1,
+      "allocatedMinor": [
+        0,
+        0,
+        1,
+        0,
+        0,
+        0
+      ],
+      "unallocatedMinor": 0
+    },
+    {
+      "requestedMinor": 200000,
+      "allocatedMinor": [
+        0,
+        57142,
+        142858,
+        0,
+        0,
+        0
+      ],
+      "unallocatedMinor": 0
+    },
+    {
+      "requestedMinor": 800000,
+      "allocatedMinor": [
+        0,
+        200000,
+        350000,
+        50000,
+        0,
+        0
+      ],
+      "unallocatedMinor": 200000
+    }
+  ]
+}

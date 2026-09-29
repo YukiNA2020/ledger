@@ -1343,11 +1343,25 @@
     return a;
   }
 
+  /* 追加式事实集合（5B 风险评估 / 5C 目标版本与认可标的 / 5D 建议产物与月结快照历史）。
+   * JSON 备份必须带上它们，否则「导出备份」会丢掉规则版本、原始答案、评估、目标与认可映射；
+   * 旧备份缺这些键时恢复为**空集合**，不生成伪默认值（D-034 / PHASE5_BREAKDOWN §10.5）。 */
+  var COMPANION_STATE_KEYS = ['riskAssessments', 'allocationTargets', 'approvedInstruments', 'recommendations', 'monthlyCloses', 'closeSnapshots'];
+
+  function companionCollectionsOf(state) {
+    var out = {};
+    state = state || {};
+    COMPANION_STATE_KEYS.forEach(function (k) {
+      out[k] = Array.isArray(state[k]) ? state[k] : [];
+    });
+    return out;
+  }
+
   function createBackup(state, appVersion, exportedAt) {
     state = state || {};
     var assets = state.assets && typeof state.assets === 'object' && !Array.isArray(state.assets)
       ? state.assets : emptyV3Assets();
-    return {
+    return Object.assign({
       app: 'ledger',
       appVersion: appVersion || '',
       schemaVersion: 2,
@@ -1358,7 +1372,7 @@
       assets: assets,
       // 备份为可迁移明文；恢复后默认关闭应用锁，避免携带无法使用的内存密钥状态。
       settings: Object.assign({}, state.settings || {}, { lock: { enabled: false } })
-    };
+    }, companionCollectionsOf(state));
   }
 
   function restoreStateFromBackup(data) {
@@ -1385,13 +1399,19 @@
         });
       }
     }
-    return {
+    // 追加式事实集合：显式存在就必须是数组（不静默丢行），缺省则为空集合（旧备份不伪造默认值）。
+    var companion = {};
+    COMPANION_STATE_KEYS.forEach(function (k) {
+      if (data[k] != null && !Array.isArray(data[k])) throw new Error('备份 ' + k + ' 数据格式错误');
+      companion[k] = Array.isArray(data[k]) ? data[k] : [];
+    });
+    return Object.assign({
       accounts: data.accounts || defaultAccounts(),
       categories: data.categories || defaultCategories(),
       txns: data.txns,
       assets: assets,
       settings: Object.assign(defaultSettings(), data.settings || {}, { lock: { enabled: false } })
-    };
+    }, companion);
   }
 
   function transactionsToCSV(txns, accounts, categories) {

@@ -137,3 +137,44 @@ test('备份往返去除 exportedAt 后按 id 深比较一致（P3.1 闭环）',
   assert.strictEqual(byId['rt-4'].recurringKey, 'rc-1@2026-08-04');
   assert.strictEqual(byId['rt-2'].accountTo, 'acc-bank');
 });
+
+/* ---------------- Phase 5C（D-048）/ PHASE5_BREAKDOWN §10.5：追加式事实集合进 JSON 备份 ---------------- */
+
+test('5C JSON 备份保留评估、目标版本与认可标的映射，并可往返', () => {
+  const state = {
+    accounts: [], categories: [], txns: [], settings: Core.defaultSettings(),
+    riskAssessments: [{ id: 'ra-1', ruleVersion: 'risk-rules-v1', ceiling: 5, assessedAt: '2026-09-20' }],
+    allocationTargets: [{
+      id: 'at-1', templateVersion: 'risk-targets-v1', ruleVersion: 'risk-rules-v1', level: 5,
+      classes: { cash: { minBps: 500, targetBps: 1000, maxBps: 2000 } },
+      assessmentId: 'ra-1', effectiveFrom: '2026-09-21'
+    }],
+    approvedInstruments: [{ id: 'aim-1', assetClass: 'broad_equity', instrumentId: 'ins-voo', position: 0 }]
+  };
+  const backup = Core.createBackup(state, '2.4.8-phase5c', '2026-09-21T08:00:00.000Z');
+  assert.deepStrictEqual(backup.riskAssessments, state.riskAssessments, '原始答案与评估必须随备份导出');
+  assert.deepStrictEqual(backup.allocationTargets, state.allocationTargets, '目标版本与所引用评估必须随备份导出');
+  assert.deepStrictEqual(backup.approvedInstruments, state.approvedInstruments, '用户认可映射必须随备份导出');
+  const restored = Core.restoreStateFromBackup(JSON.parse(JSON.stringify(backup)));
+  assert.deepStrictEqual(restored.allocationTargets, state.allocationTargets);
+  assert.deepStrictEqual(restored.approvedInstruments, state.approvedInstruments);
+  assert.deepStrictEqual(restored.riskAssessments, state.riskAssessments);
+  // 再次导出仍一致（往返无损）
+  assert.deepStrictEqual(Core.createBackup(restored, 'x', '2026-09-21T09:00:00.000Z').allocationTargets,
+    state.allocationTargets);
+});
+
+test('5C 旧备份缺集合键时恢复为空集合，绝不伪造默认评估、目标或映射', () => {
+  const legacy = {
+    app: 'ledger', appVersion: '2.4.7-phase5b', schemaVersion: 2,
+    exportedAt: '2026-09-20T08:00:00.000Z',
+    accounts: [], categories: [], txns: [], assets: null, settings: {}
+  };
+  const restored = Core.restoreStateFromBackup(legacy);
+  assert.deepStrictEqual(restored.riskAssessments, []);
+  assert.deepStrictEqual(restored.allocationTargets, []);
+  assert.deepStrictEqual(restored.approvedInstruments, []);
+  // 结构损坏（集合不是数组）显式拒绝，不静默当成空
+  assert.throws(() => Core.restoreStateFromBackup(Object.assign({}, legacy, { allocationTargets: {} })), /allocationTargets/);
+  assert.throws(() => Core.restoreStateFromBackup(Object.assign({}, legacy, { approvedInstruments: 'x' })), /approvedInstruments/);
+});

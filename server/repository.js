@@ -17,6 +17,7 @@
 const crypto = require('node:crypto');
 const { transaction, all, get, run, tableExists } = require('./db');
 const Domain = require('../js/domain.js');
+const Recommendations = require('./recommendations');
 
 // 资产集合的形状以前端 js/domain.js 为唯一来源（DECISIONS T-001：服务与浏览器共用同一份领域代码）。
 // 这里不复制键名与版本号：一旦前端调整集合结构，服务端读回形状自动跟随，不会静默分叉。
@@ -130,6 +131,20 @@ const KNOWN = {
   ],
   quotes: ['instrumentId', 'priceMinor', 'currency', 'priceDate', 'fetchedAt', 'provider', 'status', 'sourceSymbol'],
   fxRates: ['base', 'quote', 'rateDecimal', 'rateDate', 'fetchedAt', 'provider', 'status'],
+  // Phase 5B：/state 顶层独立集合（不并入 assets）；行字段白名单由领域层
+  // validateRiskAssessmentRecord 精确自有键校验，这里只登记形状。
+  riskAssessments: [
+    'id', 'ruleVersion', 'answers', 'capacityScore', 'willingnessScore',
+    'capacityLevel', 'willingnessLevel', 'ceiling', 'ceilingSource', 'hardCaps',
+    'explainCodes', 'assessedAt', 'expiry', 'reason', 'createdAt'
+  ],
+  // Phase 5C：/state 顶层独立集合。目标版本承载派生值与所引用评估，
+  // 认可标的承载用户判断；两者的字段白名单由领域层精确自有键校验，这里只登记形状。
+  allocationTargets: [
+    'id', 'templateVersion', 'ruleVersion', 'level', 'classes',
+    'assessmentId', 'assessedAt', 'assessmentExpiry', 'effectiveFrom', 'createdAt'
+  ],
+  approvedInstruments: ['id', 'assetClass', 'instrumentId', 'position', 'createdAt', 'updatedAt'],
   accounts: ['id', 'name', 'type', 'color', 'initialBalance', 'order', 'aliases', 'deleted'],
   categories: ['id', 'type', 'name', 'icon', 'parent', 'keywords'],
   txns: [
@@ -1008,6 +1023,680 @@ function writeSecurityEvents(db, list) {
   }
 }
 
+/* ------------------------------ 风险评估（Phase 5B，D-047） ------------------------------ */
+
+// 评估行 = 一次评估的封存事实：id 永久唯一，历史行绝不 UPDATE（复评即追加新行）。
+// 形状与派生值一致性共用领域层 validateRiskAssessmentRecord（唯一实现，D-025）：
+// 单条 API 写入、全量 PUT /state、备份恢复三条路径走同一道闸，不合格整体回滚。
+// 服务端只消费白名单字段，载荷上的 extra/未知键在领域入口已被拒绝。
+
+const RISK_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function validateRiskAssessmentRow(rec, atLabel) {
+  const label = atLabel ? atLabel + ' ' : '';
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+    throw Object.assign(new Error(label + '评估记录必须是对象'), { code: 'invalid_answers' });
+  }
+  if (typeof rec.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(rec.id)) {
+    throw Object.assign(new Error(label + '评估 id 不合法'), { code: 'invalid_id' });
+  }
+  if (typeof rec.createdAt !== 'string' || !RISK_ISO_RE.test(rec.createdAt)) {
+    throw Object.assign(new Error(label + 'createdAt 必须是带时区的 ISO 时间戳'), { code: 'invalid_answers' });
+  }
+  const v = Domain.validateRiskAssessmentRecord(rec);
+  if (!v.ok) {
+    throw Object.assign(
+      new Error(label + '评估记录未通过领域校验：' + (v.error && v.error.detail ? v.error.detail : v.error && v.error.code)),
+      { code: (v.error && v.error.code) || 'invalid_answers' }
+    );
+  }
+  return v.record;
+}
+
+function hydrateRiskAssessment(row) {
+  return {
+    id: row.id,
+    ruleVersion: row.rule_version,
+    answers: JSON.parse(row.answers_json),
+    capacityScore: row.capacity_score,
+    willingnessScore: row.willingness_score,
+    capacityLevel: row.capacity_level,
+    willingnessLevel: row.willingness_level,
+    ceiling: row.risk_ceiling,
+    ceilingSource: row.ceiling_source,
+    hardCaps: JSON.parse(row.hard_caps_json),
+    explainCodes: JSON.parse(row.explain_codes_json),
+    assessedAt: row.assessed_at,
+    expiry: row.expiry,
+    reason: row.reason,
+    createdAt: row.created_at
+  };
+}
+
+// 读取全部评估：确定性排序（assessedAt 降序 → createdAt 降序 → id 升序），与行序无关。
+function readRiskAssessments(db) {
+  const rows = all(db, 'SELECT * FROM risk_assessments').map(hydrateRiskAssessment);
+  return Domain.sortRiskAssessments(rows);
+}
+
+function getRiskAssessment(db, id) {
+  const row = get(db, 'SELECT * FROM risk_assessments WHERE id = ?', [id]);
+  return row ? hydrateRiskAssessment(row) : null;
+}
+
+// 追加一条评估：同 id 重放 → duplicate_assessment（409，API 层翻译），绝不覆盖历史。
+function insertRiskAssessment(db, rec) {
+  const row = validateRiskAssessmentRow(rec);
+  if (get(db, 'SELECT id FROM risk_assessments WHERE id = ?', [row.id])) {
+    throw Object.assign(new Error('同 id 的风险评估已存在（历史评估不可覆盖）：' + row.id), { code: 'duplicate_assessment' });
+  }
+  run(
+    db,
+    `INSERT INTO risk_assessments (id, rule_version, answers_json, capacity_score, willingness_score,
+       capacity_level, willingness_level, risk_ceiling, ceiling_source, hard_caps_json,
+       explain_codes_json, assessed_at, expiry, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      row.id,
+      row.ruleVersion,
+      JSON.stringify(row.answers),
+      row.capacityScore,
+      row.willingnessScore,
+      row.capacityLevel,
+      row.willingnessLevel,
+      row.ceiling,
+      row.ceilingSource,
+      JSON.stringify(row.hardCaps),
+      JSON.stringify(row.explainCodes),
+      row.assessedAt,
+      row.expiry,
+      row.reason,
+      row.createdAt
+    ]
+  );
+  return getRiskAssessment(db, row.id);
+}
+
+// 全量写入路径：逐条校验（任一条非法整体回滚，绝不静默丢行），id 重复 → duplicate_assessment。
+function writeRiskAssessments(db, list) {
+  const rows = Array.isArray(list) ? list : [];
+  const seen = {};
+  const normalized = rows.map((r, idx) => {
+    const rec = validateRiskAssessmentRow(r, '第 ' + (idx + 1) + ' 条');
+    if (seen[rec.id]) {
+      throw Object.assign(new Error('风险评估 id 重复写入：' + rec.id), { code: 'duplicate_assessment' });
+    }
+    seen[rec.id] = true;
+    return rec;
+  });
+  normalized.forEach((rec) => {
+    run(
+      db,
+      `INSERT INTO risk_assessments (id, rule_version, answers_json, capacity_score, willingness_score,
+         capacity_level, willingness_level, risk_ceiling, ceiling_source, hard_caps_json,
+         explain_codes_json, assessed_at, expiry, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        rec.id, rec.ruleVersion, JSON.stringify(rec.answers), rec.capacityScore, rec.willingnessScore,
+        rec.capacityLevel, rec.willingnessLevel, rec.ceiling, rec.ceilingSource, JSON.stringify(rec.hardCaps),
+        JSON.stringify(rec.explainCodes), rec.assessedAt, rec.expiry, rec.reason, rec.createdAt
+      ]
+    );
+  });
+}
+
+/* ------------------------------ 目标配置与认可标的（Phase 5C，D-048） ------------------------------ */
+
+// 目标版本 = 「哪一份评估 + 哪个模板/规则版本 + 何时生效」的封存事实（追加式，历史行永不 UPDATE）。
+// 派生值（level / classes）全部来自服务端按 5A 冻结模板的映射，客户端提交的任何派生值都不被采信；
+// 单条 API 写入、全量 PUT /state、备份恢复三条路径共用 Domain.validateAllocationTargetRecord。
+
+const TARGET_ISO_RE = RISK_ISO_RE;
+
+function validateAllocationTargetRow(rec, assessment, atLabel) {
+  const label = atLabel ? atLabel + ' ' : '';
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+    throw Object.assign(new Error(label + '目标记录必须是对象'), { code: 'invalid_target_record' });
+  }
+  if (typeof rec.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(rec.id)) {
+    throw Object.assign(new Error(label + '目标 id 不合法'), { code: 'invalid_id' });
+  }
+  if (typeof rec.createdAt !== 'string' || !TARGET_ISO_RE.test(rec.createdAt)) {
+    throw Object.assign(new Error(label + 'createdAt 必须是带时区的 ISO 时间戳'), { code: 'invalid_target_record' });
+  }
+  // 目标必须能在事实源里找到它引用的那一份评估（第 1 个参数为 undefined 时是纯形状复核）。
+  // 缺引用要在领域闸之前显式拒绝：SQL 的 RESTRICT 只能给出「外键失败」这种无法解释的信息。
+  if (assessment === null) {
+    throw Object.assign(new Error(label + '目标引用的风险评估不存在'), { code: 'invalid_assessment_ref' });
+  }
+  const v = Domain.validateAllocationTargetRecord(rec, assessment);
+  if (!v.ok) {
+    throw Object.assign(
+      new Error(label + '目标记录未通过领域校验：' + (v.error && v.error.detail ? v.error.detail : v.error && v.error.code)),
+      { code: (v.error && v.error.code) || 'invalid_target_record' }
+    );
+  }
+  return v.record;
+}
+
+function hydrateAllocationTarget(row) {
+  return {
+    id: row.id,
+    templateVersion: row.template_version,
+    ruleVersion: row.rule_version,
+    level: row.level,
+    classes: JSON.parse(row.classes_json),
+    assessmentId: row.assessment_id,
+    assessedAt: row.assessed_at,
+    assessmentExpiry: row.assessment_expiry,
+    effectiveFrom: row.effective_from,
+    createdAt: row.created_at
+  };
+}
+
+// 读取全部目标版本：确定性排序（effectiveFrom 降序 → createdAt 降序 → id 升序），与行序无关。
+function readAllocationTargets(db) {
+  const rows = all(db, 'SELECT * FROM allocation_targets').map(hydrateAllocationTarget);
+  return Domain.sortAllocationTargets(rows) || [];
+}
+
+function getAllocationTarget(db, id) {
+  const row = get(db, 'SELECT * FROM allocation_targets WHERE id = ?', [id]);
+  return row ? hydrateAllocationTarget(row) : null;
+}
+
+// 追加一个目标版本：同自然键重放 → duplicate_target（API 翻译成 200 created:false），
+// 绝不覆盖历史目标；所引用的评估必须真实存在（RESTRICT 之外先给领域层一次显式判定）。
+function insertAllocationTarget(db, rec, options) {
+  const assessment = options && options.assessment !== undefined
+    ? options.assessment
+    : getRiskAssessment(db, rec && rec.assessmentId);
+  const row = validateAllocationTargetRow(rec, assessment);
+  const dup = get(
+    db,
+    'SELECT id, classes_json FROM allocation_targets WHERE assessment_id = ? AND template_version = ? AND effective_from = ?',
+    [row.assessmentId, row.templateVersion, row.effectiveFrom]
+  );
+  if (dup) {
+    if (JSON.stringify(JSON.parse(dup.classes_json)) === JSON.stringify(row.classes) && dup.id === row.id) {
+      return getAllocationTarget(db, row.id); // 同一内容同 id 重放（幂等恢复路径）
+    }
+    throw Object.assign(new Error('该评估在此生效日已有目标版本（历史目标不可覆盖）'), { code: 'duplicate_target' });
+  }
+  run(
+    db,
+    `INSERT INTO allocation_targets (id, template_version, rule_version, level, classes_json,
+       assessment_id, assessed_at, assessment_expiry, effective_from, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      row.id, row.templateVersion, row.ruleVersion, row.level, JSON.stringify(row.classes),
+      row.assessmentId, row.assessedAt, row.assessmentExpiry, row.effectiveFrom, row.createdAt
+    ]
+  );
+  return getAllocationTarget(db, row.id);
+}
+
+// 全量写入路径：逐条按「记录 + 所引用评估」复核（任一条非法整体回滚，绝不静默丢行）。
+function writeAllocationTargets(db, list) {
+  const rows = Array.isArray(list) ? list : [];
+  const seen = {};
+  const normalized = rows.map((r, idx) => {
+    const rec = validateAllocationTargetRow(r, getRiskAssessment(db, r && r.assessmentId), '第 ' + (idx + 1) + ' 条');
+    if (seen[rec.id]) {
+      throw Object.assign(new Error('目标版本 id 重复写入：' + rec.id), { code: 'duplicate_target' });
+    }
+    seen[rec.id] = true;
+    const natural = Domain.allocationTargetNaturalKey(rec);
+    if (seen['nk:' + natural]) {
+      throw Object.assign(new Error('同一评估 + 模板版本 + 生效日存在两个目标版本'), { code: 'duplicate_target' });
+    }
+    seen['nk:' + natural] = true;
+    return rec;
+  });
+  normalized.forEach((rec) => {
+    run(
+      db,
+      `INSERT INTO allocation_targets (id, template_version, rule_version, level, classes_json,
+         assessment_id, assessed_at, assessment_expiry, effective_from, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        rec.id, rec.templateVersion, rec.ruleVersion, rec.level, JSON.stringify(rec.classes),
+        rec.assessmentId, rec.assessedAt, rec.assessmentExpiry, rec.effectiveFrom, rec.createdAt
+      ]
+    );
+  });
+}
+
+/* 认可标的映射：只有用户判断写入本表，provider 刷新路径不涉及这里任何一列（§6.2 工作项 7）。
+ * id 由「类别 + 标的」确定性导出：同一份清单重复写入得到同一批行与同一批 id（幂等），
+ * 而不是每次点击都换一套主键。 */
+
+function approvedInstrumentId(assetClass, instrumentId) {
+  return 'aim-' + crypto.createHash('sha256').update(String(assetClass) + '|' + String(instrumentId)).digest('hex').slice(0, 16);
+}
+
+function validateApprovedInstrumentRow(rec, atLabel) {
+  const label = atLabel ? atLabel + ' ' : '';
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+    throw Object.assign(new Error(label + '认可标的记录必须是对象'), { code: 'invalid_mapping_payload' });
+  }
+  if (typeof rec.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(rec.id)) {
+    throw Object.assign(new Error(label + '认可标的 id 不合法'), { code: 'invalid_id' });
+  }
+  ['createdAt', 'updatedAt'].forEach((k) => {
+    if (typeof rec[k] !== 'string' || !TARGET_ISO_RE.test(rec[k])) {
+      throw Object.assign(new Error(label + k + ' 必须是带时区的 ISO 时间戳'), { code: 'invalid_mapping_payload' });
+    }
+  });
+  const v = Domain.validateApprovedInstrumentRecord(rec);
+  if (!v.ok) {
+    throw Object.assign(
+      new Error(label + '认可标的未通过领域校验：' + (v.error && v.error.detail ? v.error.detail : v.error && v.error.code)),
+      { code: (v.error && v.error.code) || 'invalid_mapping_payload' }
+    );
+  }
+  return v.record;
+}
+
+function hydrateApprovedInstrument(row) {
+  return {
+    id: row.id,
+    assetClass: row.asset_class,
+    instrumentId: row.instrument_id,
+    position: row.position,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+// 只读用户判断本身（不 join 标的）：/state、备份与恢复走这一份，保证往返无损。
+function readApprovedInstruments(db) {
+  const rows = all(db, 'SELECT * FROM approved_instruments').map(hydrateApprovedInstrument);
+  return Domain.sortApprovedInstruments(rows) || [];
+}
+
+// 引用完整性在**读取时**判定（不写回）：标的被删 / 分类回到 suggested / 类别被改，
+// 映射行保持原样并显式给出失效原因，绝不静默丢行或自动改写用户判断。
+function readApprovedMappingView(db) {
+  return Domain.checkApprovedMapping(readApprovedInstruments(db), readInstruments(db));
+}
+
+function writeApprovedInstruments(db, list) {
+  const rows = Array.isArray(list) ? list : [];
+  const seen = {};
+  const slots = {};
+  const normalized = rows.map((r, idx) => {
+    const rec = validateApprovedInstrumentRow(r, '第 ' + (idx + 1) + ' 条');
+    if (seen[rec.id]) {
+      throw Object.assign(new Error('认可标的 id 重复写入：' + rec.id), { code: 'invalid_mapping_payload' });
+    }
+    seen[rec.id] = true;
+    if (seen['i:' + rec.instrumentId]) {
+      throw Object.assign(new Error('同一标的被映射了多次：' + rec.instrumentId), { code: 'instrument_already_mapped' });
+    }
+    seen['i:' + rec.instrumentId] = true;
+    const slot = rec.assetClass + '|' + rec.position;
+    if (slots[slot]) {
+      throw Object.assign(new Error('类别 ' + rec.assetClass + ' 的排序位置 ' + rec.position + ' 重复'), {
+        code: 'invalid_mapping_payload'
+      });
+    }
+    slots[slot] = true;
+    return rec;
+  });
+  // 引用校验按整表一次做（全量写入的 instruments 已先落库）：失效引用在恢复路径同样要挡下。
+  const view = Domain.checkApprovedMapping(normalized, readInstruments(db));
+  if (view.ok !== true) {
+    throw Object.assign(new Error('认可标的不符合冻结契约'), { code: 'invalid_mapping_payload' });
+  }
+  if (view.invalidCount) {
+    throw Object.assign(new Error('认可标的记录字段不符合冻结契约'), { code: 'invalid_mapping_payload' });
+  }
+  const broken = view.rows.filter((r) => r.status !== 'ok');
+  if (broken.length) {
+    const first = broken[0];
+    throw Object.assign(
+      new Error('认可标的引用不成立（' + first.issues.join('/') + '）：类别 ' + first.assetClass),
+      { code: first.issues[0] === 'instrument_missing' ? 'unknown_instrument' : first.issues[0] }
+    );
+  }
+  normalized.forEach((rec) => {
+    run(
+      db,
+      `INSERT INTO approved_instruments (id, asset_class, instrument_id, position, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [rec.id, rec.assetClass, rec.instrumentId, rec.position, rec.createdAt, rec.updatedAt]
+    );
+  });
+}
+
+// 整类替换（用户判断的最小维护语义）：只动这一类，其它类别不受影响；
+// 未变化的行保留 created_at，位置变化才写 updated_at —— 重复提交同一份清单不产生任何漂移。
+function replaceApprovedInstrumentClass(db, assetClass, instrumentIds, options) {
+  const opts = options || {};
+  const now = opts.now || new Date().toISOString();
+  const req = Domain.validateApprovedMappingRequest({ assetClass: assetClass, instrumentIds: instrumentIds });
+  if (!req.ok) {
+    throw Object.assign(new Error('认可标的载荷不合法：' + req.error.detail), { code: req.error.code });
+  }
+  const instruments = readInstruments(db);
+  const byId = {};
+  instruments.forEach((i) => { if (i && i.id && !byId[i.id]) byId[i.id] = i; });
+  const existing = readApprovedInstruments(db).filter((r) => r.assetClass === req.assetClass);
+  const existingById = {};
+  existing.forEach((r) => { existingById[r.id] = r; });
+  // 与全量写入同一道领域闸（D-025）：先构造候选行，再让领域层判定引用是否成立。
+  // 未变化的行必须保留 updated_at；否则同一清单重复提交会制造虚假的用户修改时间。
+  const candidates = req.instrumentIds.map((id, idx) => {
+    const rowId = approvedInstrumentId(req.assetClass, id);
+    const previous = existingById[rowId];
+    return {
+      id: rowId,
+      assetClass: req.assetClass,
+      instrumentId: id,
+      position: idx,
+      createdAt: previous ? previous.createdAt : now,
+      updatedAt: previous && previous.position === idx ? previous.updatedAt : now
+    };
+  });
+  const view = Domain.checkApprovedMapping(candidates, instruments);
+  if (!view.ok) {
+    throw Object.assign(new Error('认可标的载荷不合法'), { code: 'invalid_mapping_payload' });
+  }
+  const broken = view.rows.filter((r) => r.status !== 'ok')[0];
+  if (broken) {
+    const code = broken.issues[0] === 'instrument_missing' ? 'unknown_instrument' : broken.issues[0];
+    throw Object.assign(new Error('认可标的引用不成立：' + broken.issues.join('/')), { code: code });
+  }
+  const conflicting = req.instrumentIds.filter((id) => {
+    const row = get(db, 'SELECT asset_class FROM approved_instruments WHERE instrument_id = ?', [id]);
+    return !!row && row.asset_class !== req.assetClass;
+  });
+  if (conflicting.length) {
+    throw Object.assign(new Error('该标的已映射在其他资产类别下，不能同时属于两个类别'), {
+      code: 'instrument_already_mapped'
+    });
+  }
+  // 先整类删除再按新顺序插入：类别内 position 唯一（uq_approved_instruments_slot），
+  // 逐行 UPDATE 交换顺序会在语句之间瞬时撞到这个唯一约束。
+  // created_at 从旧行带过来，所以「重复提交同一份清单」既不换 id 也不换创建时间（幂等）。
+  run(db, 'DELETE FROM approved_instruments WHERE asset_class = ?', [req.assetClass]);
+  candidates.forEach((c) => {
+    run(
+      db,
+      `INSERT INTO approved_instruments (id, asset_class, instrument_id, position, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [c.id, c.assetClass, c.instrumentId, c.position, c.createdAt, c.updatedAt]
+    );
+  });
+  return readApprovedInstruments(db).filter((r) => r.assetClass === req.assetClass);
+}
+
+/* ------------------------------ Phase 5D：建议产物（不可变计算结果） ------------------------------
+
+ * 一行 = 一次建议。id 由 input_hash 确定性导出，因此「同一份输入重复请求」回到同一行；
+ * 事实变了才产生新的一行。历史行永不 UPDATE（Phase 6 接管的是这份封存草案本身）。
+ *
+ * payload_hash 的口径：sha256(canonicalJson(record))。canonicalJson 也在本文件导出，
+ * server/api.js 复用同一份实现（D-025：哈希口径不得各写一遍）。
+ */
+
+const canonicalJson = Recommendations.canonicalJson;
+
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+function recommendationInputHash(record) {
+  if (record.gate && record.gate.capture) return Recommendations.hash(Recommendations.normalizeInput(record.gate.capture));
+  // 旧 2.4.10 产物仅用于无损保存，读取视图会标记为未验证，不能冒充可重放建议。
+  // 以下仅保留旧记录的哈希口径；它没有覆盖全部事实，不能用于新建议。
+  return sha256Hex(canonicalJson({
+    ruleVersion: record.ruleVersion,
+    targetVersion: record.targetVersion,
+    assessmentId: record.assessmentId,
+    targetId: record.targetId,
+    closeId: record.closeId,
+    snapshotId: record.snapshotId,
+    snapshotPayloadHash: record.snapshotPayloadHash,
+    dataCutoff: record.dataCutoff,
+    asOf: record.asOf,
+    requestedNewFundsMinor: record.requestedNewFundsMinor,
+    newFundsAvailableMinor: record.newFundsAvailableMinor,
+    allocatableNewFundsMinor: record.allocatableNewFundsMinor,
+    allocatedTotalMinor: record.allocatedTotalMinor,
+    status: record.status
+  }));
+}
+
+function recommendationRecordId(inputHash) {
+  return 'rec-' + String(inputHash).slice(0, 16);
+}
+
+// D-052：同一份输入（inputHash 不含解释版本）回到同一行。比较幂等相等时把 gate 区的
+// explanationVersion 剥掉：升级后重复请求不得因「新记录多一个封存键」误报 duplicate，
+// 也绝不因此回填 / 覆盖旧记录 —— 返回的永远是库里原来那条（未封存的照旧未封存）。
+function withoutExplanationVersion(rec) {
+  if (!rec || !rec.gate || !Object.prototype.hasOwnProperty.call(rec.gate, 'explanationVersion')) return rec;
+  const gate = Object.assign({}, rec.gate);
+  delete gate.explanationVersion;
+  return Object.assign({}, rec, { gate });
+}
+
+function validateRecommendationRow(rec, atLabel) {
+  const label = atLabel ? atLabel + ' ' : '';
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
+    throw Object.assign(new Error(label + '建议记录必须是对象'), { code: 'invalid_recommendation_record' });
+  }
+  const v = Domain.validateRecommendationRecord(rec);
+  if (!v.ok) {
+    throw Object.assign(
+      new Error(label + '建议记录未通过领域复核：' + (v.error && v.error.detail ? v.error.detail : v.error && v.error.code)),
+      { code: (v.error && v.error.code) || 'invalid_recommendation_record' }
+    );
+  }
+  if (typeof rec.id !== 'string' || !INSTRUMENT_ID_RE.test(rec.id)) {
+    throw Object.assign(new Error(label + '建议 id 不合法'), { code: 'invalid_id' });
+  }
+  if (!TARGET_ISO_RE.test(rec.createdAt)) {
+    throw Object.assign(new Error(label + 'createdAt 必须是带时区的 ISO 时间戳'), { code: 'invalid_recommendation_record' });
+  }
+  if (!isDateStr(rec.dataCutoff) || !isDateStr(rec.asOf)) {
+    throw Object.assign(new Error(label + '数据截止日与判定日必须是真实日历日'), { code: 'invalid_recommendation_record' });
+  }
+  if (rec.gate.capture) validateCapturedRecommendation(rec);
+  return v.record;
+}
+
+function validateCapturedRecommendation(rec) {
+  const out = Recommendations.calculate(rec.gate.capture);
+  if (rec.inputHash !== recommendationInputHash(rec) || rec.id !== recommendationRecordId(rec.inputHash) ||
+      canonicalJson(out.result) !== canonicalJson(rec.result) || canonicalJson(out.checks) !== canonicalJson(rec.gate.checks) ||
+      canonicalJson(out.todos) !== canonicalJson(rec.todos) || out.status !== rec.status ||
+      ['requestedNewFundsMinor','newFundsAvailableMinor','allocatableNewFundsMinor','allocatedTotalMinor'].some(k => out.allocation[k] !== rec[k])) {
+    throw Object.assign(new Error('建议与封存输入重放结果不一致'), { code: 'invalid_recommendation_record' });
+  }
+}
+
+function validateRecommendationReferences(db, rec) {
+  if (!rec.gate.capture) return;
+  const snap = getCloseSnapshot(db, rec.snapshotId);
+  const close = get(db, 'SELECT id FROM monthly_closes WHERE id = ?', [rec.closeId]);
+  if (!close || !snap || snap.closeId !== rec.closeId || snap.payloadHash !== rec.snapshotPayloadHash ||
+      snap.payloadJson !== rec.gate.capture.snapshot.payloadJson) {
+    throw Object.assign(new Error('建议引用的月结快照缺失或已改变'), { code: 'invalid_recommendation_record' });
+  }
+  // G5-R1：引用链必须与封存输入交叉一致。单条记录合法 + SQL 外键「存在」并不保证审计链
+  // 自洽：恢复可以保留 id、只换内容，于是「按评估 / 目标 id 下钻」得到的事实与建议
+  // gate.capture 里同一 id 的不可变版本互相矛盾，读取视图却仍显示 formal / invalidCount=0。
+  // 只核对本条建议**引用**的那两份不可变记录；资产与认可映射是可变事实，按 capture
+  // 保留历史，绝不在此要求它们等于当前状态（否则历史建议永远无法保留）。
+  const sealedAssessment = Array.isArray(rec.gate.capture.riskAssessments)
+    ? rec.gate.capture.riskAssessments.filter((a) => a && a.id === rec.assessmentId)[0]
+    : undefined;
+  const liveAssessment = getRiskAssessment(db, rec.assessmentId);
+  if (!liveAssessment || !sealedAssessment ||
+      canonicalJson(liveAssessment) !== canonicalJson(sealedAssessment)) {
+    throw Object.assign(
+      new Error('建议引用的风险评估与封存记录不是同一份不可变事实'),
+      { code: 'invalid_recommendation_record' }
+    );
+  }
+  const sealedTarget = Array.isArray(rec.gate.capture.allocationTargets)
+    ? rec.gate.capture.allocationTargets.filter((t) => t && t.id === rec.targetId)[0]
+    : undefined;
+  const liveTarget = getAllocationTarget(db, rec.targetId);
+  if (!liveTarget || !sealedTarget || canonicalJson(liveTarget) !== canonicalJson(sealedTarget)) {
+    throw Object.assign(
+      new Error('建议引用的目标配置与封存记录不是同一份不可变事实'),
+      { code: 'invalid_recommendation_record' }
+    );
+  }
+}
+
+function hydrateRecommendation(row) {
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    status: row.status,
+    ruleVersion: row.rule_version,
+    targetVersion: row.target_version,
+    assessmentId: row.assessment_id,
+    targetId: row.target_id,
+    closeId: row.close_id,
+    snapshotId: row.snapshot_id,
+    snapshotPayloadHash: row.snapshot_hash,
+    dataCutoff: row.data_cutoff,
+    asOf: row.as_of,
+    requestedNewFundsMinor: row.requested_new_funds_minor,
+    newFundsAvailableMinor: row.available_new_funds_minor,
+    allocatableNewFundsMinor: row.allocatable_new_funds_minor,
+    allocatedTotalMinor: row.allocated_total_minor,
+    inputHash: row.input_hash,
+    gate: JSON.parse(row.gate_json),
+    todos: JSON.parse(row.todos_json),
+    result: JSON.parse(row.result_json)
+  };
+}
+
+// 原始行（不复核、不算哈希）：/state 与备份要做到无损往返，语义复核在读取视图与写入闸各做一次。
+function readRecommendationRows(db) {
+  const rows = all(db, 'SELECT * FROM recommendations').map((row) => {
+    let rec = null;
+    try {
+      rec = hydrateRecommendation(row);
+    } catch (_) {
+      // 结构损坏（JSON 列不合法）也必须可见：返回 null 让上层计入 invalidCount，绝不静默丢行
+      rec = null;
+    }
+    return { record: rec, payloadHash: row.payload_hash };
+  });
+  return rows;
+}
+
+// /state 与备份用的集合：可解析的记录按冻结顺序给出（无法解析的行由读取视图计入 invalidCount 显式报告）
+function readRecommendations(db) {
+  return readRecommendationRows(db)
+    .filter((row) => !!row.record)
+    .map((row) => row.record)
+    .sort(Domain.compareRecommendations);
+}
+
+// 建议列表的读取视图：逐条按冻结契约复核 + 按 payload_hash 判封存原文是否被动过。
+// 与 GET /close-snapshots/:id 同一纪律（G4E-1）：哈希不符的行不得冒充可用建议，但显式留痕。
+function readRecommendationView(db) {
+  const rows = readRecommendationRows(db);
+  const items = [];
+  let invalidCount = 0;
+  rows.forEach((row) => {
+    if (!row.record) { invalidCount += 1; return; }
+    const checked = Domain.validateRecommendationRecord(row.record);
+    const sealed = checked.ok && sha256Hex(canonicalJson(checked.record)) === row.payloadHash;
+    if (!sealed) { invalidCount += 1; return; }
+    try {
+      if (!checked.record.gate.capture) throw new Error('legacy_unverified');
+      validateCapturedRecommendation(checked.record);
+      validateRecommendationReferences(db, checked.record);
+    } catch (_) { invalidCount += 1; return; }
+    items.push(Object.assign(checked.record, { payloadHash: row.payloadHash }));
+  });
+  items.sort(Domain.compareRecommendations);
+  return { items: items, invalidCount: invalidCount, total: rows.length };
+}
+
+function getRecommendation(db, id) {
+  const row = get(db, 'SELECT * FROM recommendations WHERE id = ?', [String(id)]);
+  if (!row) return null;
+  let rec = null;
+  try {
+    rec = hydrateRecommendation(row);
+  } catch (_) {
+    rec = null;
+  }
+  return rec ? { record: rec, payloadHash: row.payload_hash } : null;
+}
+
+function insertRecommendation(db, rec) {
+  const row = validateRecommendationRow(rec);
+  validateRecommendationReferences(db, row);
+  if (row.inputHash !== recommendationInputHash(row) || row.id !== recommendationRecordId(row.inputHash)) {
+    throw Object.assign(new Error('建议记录的 id / inputHash 与所绑定输入不一致'), { code: 'invalid_recommendation_record' });
+  }
+  const payloadHash = sha256Hex(canonicalJson(row));
+  const dup = get(db, 'SELECT id, payload_hash FROM recommendations WHERE input_hash = ?', [row.inputHash]);
+  if (dup) {
+    const stored = getRecommendation(db, dup.id);
+    if (stored && dup.id === row.id && sha256Hex(canonicalJson(stored.record)) === stored.payloadHash) {
+      const existing = validateRecommendationRow(stored.record);
+      const incoming = Object.assign({}, row, { createdAt: existing.createdAt });
+      if (canonicalJson(withoutExplanationVersion(existing)) === canonicalJson(withoutExplanationVersion(incoming))) {
+        return Object.assign(existing, { payloadHash: stored.payloadHash });
+      }
+    }
+    throw Object.assign(new Error('同一份输入已有另一条建议产物（历史建议不可覆盖）'), { code: 'duplicate_recommendation' });
+  }
+  run(
+    db,
+    `INSERT INTO recommendations (id, status, rule_version, target_version, assessment_id, target_id,
+       close_id, snapshot_id, snapshot_hash, data_cutoff, as_of,
+       requested_new_funds_minor, available_new_funds_minor, allocatable_new_funds_minor, allocated_total_minor,
+       input_hash, gate_json, todos_json, result_json, payload_hash, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      row.id, row.status, row.ruleVersion, row.targetVersion, row.assessmentId, row.targetId,
+      row.closeId, row.snapshotId, row.snapshotPayloadHash, row.dataCutoff, row.asOf,
+      row.requestedNewFundsMinor, row.newFundsAvailableMinor, row.allocatableNewFundsMinor, row.allocatedTotalMinor,
+      row.inputHash, JSON.stringify(row.gate), JSON.stringify(row.todos), JSON.stringify(row.result),
+      payloadHash, row.createdAt
+    ]
+  );
+  const stored = getRecommendation(db, row.id);
+  if (!stored) throw Object.assign(new Error('建议写入后读不回来'), { code: 'internal_error' });
+  return Object.assign(stored.record, { payloadHash: stored.payloadHash });
+}
+
+// 全量写入路径（PUT /state / 恢复）：逐条领域复核 + 引用必须在本事务此刻可见，
+// 任一条非法整体回滚，绝不静默丢行（与 5B / 5C 同一纪律）。
+function writeRecommendations(db, list) {
+  const rows = Array.isArray(list) ? list : [];
+  const seen = {};
+  const normalized = rows.map((r, idx) => {
+    const rec = validateRecommendationRow(r, '第 ' + (idx + 1) + ' 条');
+    if (seen[rec.id]) {
+      throw Object.assign(new Error('建议 id 重复写入：' + rec.id), { code: 'duplicate_recommendation' });
+    }
+    seen[rec.id] = true;
+    if (seen['h:' + rec.inputHash]) {
+      throw Object.assign(new Error('同一份输入存在两条建议产物'), { code: 'duplicate_recommendation' });
+    }
+    seen['h:' + rec.inputHash] = true;
+    return rec;
+  });
+  normalized.forEach((rec) => {
+    insertRecommendation(db, rec);
+  });
+}
+
 /* ------------------------------ 写入/读取：报价（Phase 4D） ------------------------------ */
 
 // 报价行的形状与引用校验，两条写入路径（单条 / 全量 / 自动更新）共用同一套口径
@@ -1425,9 +2114,17 @@ function writeTxnsBlob(db, blob) {
 /* ------------------------------ 全量读写 ------------------------------ */
 
 const CLEAR_ORDER = [
+  // Phase 5D 的建议产物引用 risk_assessments / allocation_targets（ON DELETE RESTRICT），
+  // 必须最先清空；它引用的快照与月结在本表**没有**外键（封存审计引用），顺序上前置也无副作用。
+  'recommendations',
+  // Phase 5C 的两张表引用 risk_assessments / instruments（ON DELETE RESTRICT），
+  // 必须最先清空，否则 RESTRICT 会让整表重置失败（外键在语句级即时检查）。
+  'allocation_targets',
+  'approved_instruments',
   'close_snapshots',
   'monthly_closes',
   'asset_transfers',
+  'risk_assessments',
   'dedup_candidates',
   'dedup_fingerprints',
   'security_events',
@@ -1498,7 +2195,18 @@ function readState(db) {
       quotes: readQuotes(db),
       fxRates: readFxRates(db),
       securityEvents: readSecurityEvents(db)
-    }
+    },
+    // Phase 5B：风险评估是账务事实之外的独立集合，不并入 assets（ASSET_KEYS 与
+    // assets.schemaVersion=1 是已冻结契约）。旧调用方缺省该键 → 全量写入后为空，
+    // 与「旧库迁移后评估为空、不伪造默认评估」同一口径。
+    riskAssessments: readRiskAssessments(db),
+    // Phase 5C：目标版本与用户认可标的同样是 /state 顶层独立集合（同一口径）。
+    allocationTargets: readAllocationTargets(db),
+    approvedInstruments: readApprovedInstruments(db),
+    // Phase 5D：建议产物是服务端算出的不可变计算结果，同样独立成集合（不参与 assets.schemaVersion）
+    recommendations: readRecommendations(db),
+    monthlyCloses: listMonthlyCloses(db),
+    closeSnapshots: readCloseSnapshots(db)
   };
 }
 
@@ -1513,7 +2221,33 @@ function writeState(db, state, options) {
   const assets = normalizeAssets(src.assets, hasAssets);
   const now = opts.now || new Date().toISOString();
   return transaction(db, () => {
+    // UI 的旧五键全量保存不表达删除 5B/5C 追加式事实。缺失集合必须在本事务内
+    // 先读后写，不能由客户端 GET 后带回，否则两次 HTTP 请求之间的并发写入会丢失。
+    // 默认仍是「缺键即清空」；只有 API 明确传入该选项时才保留。
+    const preservedCompanions = {};
+    if (opts.preserveMissingCompanionCollections === true) {
+      if (!Object.prototype.hasOwnProperty.call(src, 'riskAssessments')) {
+        preservedCompanions.riskAssessments = readRiskAssessments(db);
+      }
+      if (!Object.prototype.hasOwnProperty.call(src, 'allocationTargets')) {
+        preservedCompanions.allocationTargets = readAllocationTargets(db);
+      }
+      if (!Object.prototype.hasOwnProperty.call(src, 'approvedInstruments')) {
+        preservedCompanions.approvedInstruments = readApprovedInstruments(db);
+      }
+      if (!Object.prototype.hasOwnProperty.call(src, 'recommendations')) {
+        preservedCompanions.recommendations = readRecommendations(db);
+      }
+    }
+    for (const key of ['monthlyCloses', 'closeSnapshots']) {
+      if (opts.preserveMissingCompanionCollections === true && !Object.prototype.hasOwnProperty.call(src, key)) {
+        preservedCompanions[key] = key === 'monthlyCloses' ? listMonthlyCloses(db) : readCloseSnapshots(db);
+      }
+    }
     clearState(db);
+    writeCloseHistory(db,
+      Object.prototype.hasOwnProperty.call(src, 'monthlyCloses') ? src.monthlyCloses : preservedCompanions.monthlyCloses,
+      Object.prototype.hasOwnProperty.call(src, 'closeSnapshots') ? src.closeSnapshots : preservedCompanions.closeSnapshots);
     writeSettings(db, src.settings);
     writeAccounts(db, Array.isArray(src.accounts) ? src.accounts : []);
     writeCategories(db, Array.isArray(src.categories) ? src.categories : []);
@@ -1535,6 +2269,43 @@ function writeState(db, state, options) {
     writeSecurityEvents(db, assets.securityEvents);
     writeQuotes(db, assets.quotes);
     writeFxRates(db, assets.fxRates);
+    // 风险评估显式存在时逐条校验写入（缺省 = 清空，与 assets 各集合的兼容语义一致）；
+    // 存在但不是数组 → 显式拒绝，不静默丢弃（与 normalizeAssets 同纪律）。
+    const riskAssessments = Object.prototype.hasOwnProperty.call(src, 'riskAssessments')
+      ? src.riskAssessments : preservedCompanions.riskAssessments;
+    if (riskAssessments !== undefined) {
+      if (!Array.isArray(riskAssessments)) {
+        throw Object.assign(new Error('riskAssessments 必须是数组'), { code: 'invalid_asset_collection' });
+      }
+      writeRiskAssessments(db, riskAssessments);
+    }
+    // Phase 5C 的两个集合与评估同一纪律：显式存在才逐条校验写入（任一条非法整体回滚），
+    // 缺省 = 清空，存在但不是数组 = 显式拒绝。目标必须能在同一份载荷里找到它引用的评估。
+    const allocationTargets = Object.prototype.hasOwnProperty.call(src, 'allocationTargets')
+      ? src.allocationTargets : preservedCompanions.allocationTargets;
+    if (allocationTargets !== undefined) {
+      if (!Array.isArray(allocationTargets)) {
+        throw Object.assign(new Error('allocationTargets 必须是数组'), { code: 'invalid_asset_collection' });
+      }
+      writeAllocationTargets(db, allocationTargets);
+    }
+    const approvedInstruments = Object.prototype.hasOwnProperty.call(src, 'approvedInstruments')
+      ? src.approvedInstruments : preservedCompanions.approvedInstruments;
+    if (approvedInstruments !== undefined) {
+      if (!Array.isArray(approvedInstruments)) {
+        throw Object.assign(new Error('approvedInstruments 必须是数组'), { code: 'invalid_asset_collection' });
+      }
+      writeApprovedInstruments(db, approvedInstruments);
+    }
+    // 建议产物排在评估与目标之后：它按 RESTRICT 引用两者，必须在同一事务里能看到被引用的行。
+    const recommendations = Object.prototype.hasOwnProperty.call(src, 'recommendations')
+      ? src.recommendations : preservedCompanions.recommendations;
+    if (recommendations !== undefined) {
+      if (!Array.isArray(recommendations)) {
+        throw Object.assign(new Error('recommendations 必须是数组'), { code: 'invalid_asset_collection' });
+      }
+      writeRecommendations(db, recommendations);
+    }
     return { ok: true };
   });
 }
@@ -1960,6 +2731,41 @@ function upsertEntitlement(db, e, options) {
 
 /* ------------------------------ Phase 3：月度结账与快照 ------------------------------ */
 
+function readCloseSnapshots(db) {
+  return all(db, 'SELECT id FROM close_snapshots ORDER BY captured_at, id').map(row => getCloseSnapshot(db, row.id));
+}
+
+function writeCloseHistory(db, closes, snapshots) {
+  for (const rows of [closes, snapshots]) {
+    if (rows !== undefined && !Array.isArray(rows)) throw Object.assign(new Error('月结与快照必须是数组'), { code: 'invalid_asset_collection' });
+  }
+  const ids = new Map(), months = new Set(), snapIds = new Set();
+  for (const c of closes || []) {
+    if (!c || typeof c !== 'object' || !INSTRUMENT_ID_RE.test(c.id || '') ||
+        !/^\d{4}-(0[1-9]|1[0-2])$/.test(c.month || '') || !isDateStr(c.dataCutoff) ||
+        !TARGET_ISO_RE.test(c.completedAt || '') || !['formal', 'estimate'].includes(c.status) ||
+        !Array.isArray(c.blockers) || ids.has(c.id) || months.has(c.month)) {
+      throw Object.assign(new Error('月结历史不合法或重复'), { code: 'invalid_state' });
+    }
+    ids.set(c.id, c); months.add(c.month);
+    upsertMonthlyClose(db, c);
+  }
+  for (const s of snapshots || []) {
+    if (!s || typeof s !== 'object' || !INSTRUMENT_ID_RE.test(s.id || '') || snapIds.has(s.id) ||
+        !ids.has(s.closeId) || ids.get(s.closeId).month !== s.month ||
+        !TARGET_ISO_RE.test(s.capturedAt || '') || typeof s.payloadJson !== 'string' ||
+        sha256Hex(s.payloadJson) !== s.payloadHash) {
+      throw Object.assign(new Error('月结快照引用或哈希不合法'), { code: 'invalid_state' });
+    }
+    try { const payload = JSON.parse(s.payloadJson); if (!payload || payload.month !== s.month) throw new Error(); }
+    catch (_) { throw Object.assign(new Error('月结快照内容不合法'), { code: 'invalid_state' }); }
+    snapIds.add(s.id); insertCloseSnapshot(db, s);
+  }
+  for (const c of closes || []) {
+    if (c.snapshot && !snapIds.has(c.snapshot.id)) throw Object.assign(new Error('月结缺少引用快照'), { code: 'invalid_state' });
+  }
+}
+
 function listMonthlyCloses(db) {
   return all(db, 'SELECT * FROM monthly_closes ORDER BY month DESC').map((row) => {
     let blockers = [];
@@ -2118,5 +2924,33 @@ module.exports = {
   validateFxRow,
   upsertSecurityEvent,
   getSecurityEvent,
-  upsertPortfolioOpening
+  upsertPortfolioOpening,
+  readRiskAssessments,
+  getRiskAssessment,
+  insertRiskAssessment,
+  writeRiskAssessments,
+  validateRiskAssessmentRow,
+  /* Phase 5C：目标版本（追加式）与用户认可标的映射 */
+  readAllocationTargets,
+  getAllocationTarget,
+  insertAllocationTarget,
+  writeAllocationTargets,
+  validateAllocationTargetRow,
+  readApprovedInstruments,
+  readApprovedMappingView,
+  writeApprovedInstruments,
+  replaceApprovedInstrumentClass,
+  // Phase 5D：建议产物（不可变计算结果）与哈希口径
+  readRecommendations,
+  readRecommendationView,
+  getRecommendation,
+  insertRecommendation,
+  writeRecommendations,
+  validateRecommendationRow,
+  recommendationInputHash,
+  recommendationRecordId,
+  canonicalJson,
+  sha256Hex,
+  validateApprovedInstrumentRow,
+  approvedInstrumentId
 };

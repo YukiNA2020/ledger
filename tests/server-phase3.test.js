@@ -320,21 +320,19 @@ test('S3.3 应急金覆盖月数由服务端按必要支出重算', async () => 
   }
 });
 
-test('未实现的 Phase 5 写接口仍返回 501 并说明所属阶段', async () => {
+test('Phase 5 建议写入口已实现并进入真实校验；Phase 6 决策事件仍是 501', async () => {
   const ctx = setup('ledger-p3-');
   const srv = await startServer(ctx);
   try {
-    const cases = [
-      // portfolio-openings 已在 Phase 4C 实现（D-042）；market-data/refresh 已在 Phase 4D 实现（D-044），
-      // 两者都不再是 501 —— 4D 的行情刷新语义见 tests/server-phase4d.test.js。
-      ['/api/v1/risk-assessments', 'Phase 5'],
-      ['/api/v1/recommendations', 'Phase 5']
-    ];
-    for (const [path, phase] of cases) {
-      const res = await post(srv.port, path, {});
-      assert.strictEqual(res.status, 501, path + ' 应为 501');
-      assert.ok(String(res.json.error.message).indexOf(phase) >= 0, path + ' 应说明所属阶段 ' + phase);
-    }
+    // portfolio-openings（4C）/ market-data/refresh（4D）/ risk-assessments（5B）/ targets 与
+    // approved-instruments（5C）/ recommendations（5D）都已从延后登记变成真实路由：
+    // 空载荷一律进入校验并按 4xx 拒绝，不再伪装成 501。
+    const rec = await post(srv.port, '/api/v1/recommendations', {});
+    assert.strictEqual(rec.status, 400);
+    assert.strictEqual(rec.json.error.code, 'invalid_snapshot_ref', '缺引用绑定按 5A 冻结的引用错误码拒绝');
+    const events = await post(srv.port, '/api/v1/decisions/dc-1/events', { toState: 'accepted' });
+    assert.strictEqual(events.status, 501, '决策事件仍属 Phase 6');
+    assert.ok(String(events.json.error.message).indexOf('Phase 6') >= 0);
   } finally {
     srv.close();
     ctx.close();

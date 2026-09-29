@@ -18,6 +18,7 @@ const crypto = require('node:crypto');
 
 const dbm = require('./db');
 const R = require('./repository');
+const Recommendations = require('./recommendations');
 const backupLib = require('./backup');
 const keychain = require('./keychain');
 const migrations = require('./migrations');
@@ -32,6 +33,8 @@ const KeychainKey = require('./providers/keychain-key');
 const MarketData = require('./market-data');
 const Domain = require('../js/domain.js');
 const Core = require('../js/core.js');
+// 5E-5（D-052）：新建议在 gate 区封存生成时的知识卡解释版本；与前端同一份静态目录。
+const Knowledge = require('../js/knowledge.js');
 
 const API_PREFIX = '/api/v1';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
@@ -60,11 +63,11 @@ const MIME = {
 // Phase 4C 已实现：portfolio-openings / security-events（D-042）。
 // Phase 4D 已实现：quotes（手动补价）与 market-data/refresh（汇率自动更新；行情自动抓取受 D-038 门禁，
 // 默认关闭 → 该作用域返回 200 + skipped(auto_fetch_disabled)，不发起任何请求）。
+// Phase 5B 已实现：risk-assessments（追加式风险评估写入 + 只读查询，D-047）。
 // 注意：本表已不含 market-data/refresh —— 它在 4D 被实现，不再是"留给后续阶段"的占位。
-const DEFERRED_WRITES = {
-  'POST /api/v1/risk-assessments': 'Phase 5',
-  'POST /api/v1/recommendations': 'Phase 5'
-};
+// Phase 5D 已实现：recommendations（不可变建议产物 + 正式建议门禁，D-049）。
+// 注意：本表已不含 POST /api/v1/recommendations —— 它在 5D 被实现，不再是"留给后续阶段"的占位。
+const DEFERRED_WRITES = {};
 
 /* ------------------------------ 校验 ------------------------------ */
 
@@ -294,17 +297,63 @@ const DOMAIN_ERROR_STATUS = {
   invalid_price_date: 400,
   invalid_fx: 400,
   invalid_provider: 400,
-  currency_mismatch: 422
+  currency_mismatch: 422,
+  // Phase 5B（D-047）：风险评估写路径。5A 冻结的稳定错误码在这里获得唯一一份 HTTP 映射，
+  // 页面与 API 客户端不另写第二套判断（不变量 3）；全部属"客户端可修正" → 4xx。
+  invalid_answers: 400,
+  unknown_question: 400,
+  unknown_option: 400,
+  duplicate_answer: 400,
+  missing_answer: 400,
+  invalid_assessment_date: 400,
+  invalid_reassess_reason: 400,
+  invalid_rule_version: 400,
+  duplicate_assessment: 409,
+  // Phase 5C（D-048）：目标版本与认可标的映射的写入路径。规则同 5B ——
+  // 「载荷形状/日期不合法」400，「与既有事实冲突且客户端可修正」409/422，
+  // 只有服务端自己算不出来的（invalid_valuation_input）才是 5xx。
+  invalid_target_template: 400,
+  invalid_proportion: 400,
+  invalid_approved_instruments: 400,
+  invalid_target_payload: 400,
+  invalid_target_record: 400,
+  invalid_effective_date: 400,
+  invalid_mapping_payload: 400,
+  duplicate_mapping: 400,
+  assessment_expired: 409,
+  no_valid_assessment: 409,
+  invalid_assessment_records: 409,
+  duplicate_target: 409,
+  instrument_already_mapped: 409,
+  class_mismatch: 422,
+  invalid_assessment_ref: 422,
+  classification_unconfirmed: 422,
+  invalid_valuation_input: 500,
+  // Phase 5D（D-049）：建议写入口的载荷问题 400、引用不存在 409、「同一输入已有另一条产物」409；
+  // invalid_recommendation_output 只可能是服务端自己算错 → 500。
+  // 门禁不满足（行情过期 / 月结非正式 / 快照哈希不符…）**不是 HTTP 错误**：
+  // 响应仍是 200 + status:'estimate' + formalRecommendation:null，页面才能同时给出估算与待办。
+  invalid_new_funds_request: 400,
+  invalid_new_funds: 400,
+  recommendation_amount_overflow: 422,
+  unknown_close: 409,
+  unknown_snapshot: 409,
+  unknown_target: 409,
+  unknown_assessment: 409,
+  no_target: 409,
+  snapshot_hash_mismatch: 409,
+  close_not_formal: 409,
+  target_assessment_mismatch: 409,
+  invalid_recommendation_record: 400,
+  invalid_recommendation_output: 500,
+  duplicate_recommendation: 409
 };
 
 // 幂等键必须绑定“同一路径的同一份请求语义”，不能让同一个 key 悄悄吞掉另一笔事件。
 // 对象键排序后再哈希，避免 JSON 字段顺序不同被误判为不同请求。
+// 规范化与 sha256 口径唯一取自仓储（建议产物的 payload_hash 用同一份，D-025）。
 function canonicalJson(value) {
-  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
-  if (value && typeof value === 'object') {
-    return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
-  }
-  return JSON.stringify(value);
+  return R.canonicalJson(value);
 }
 
 function requestFingerprint(value) {
@@ -407,7 +456,12 @@ function createHandler(ctx) {
         );
       }
     }
-    R.writeState(ctx.db, state);
+    // 页面五键保存不表达删除追加式事实。由仓储在同一个 SQLite 事务里读取并保留
+    // 调用方未显式给出的集合，避免客户端 GET→PUT 之间的并发新增被旧快照覆盖。
+    // 未携带该显式标志时仍保持历史「缺键即清空」语义，供旧备份完整恢复使用。
+    R.writeState(ctx.db, state, {
+      preserveMissingCompanionCollections: bodyWrapsState && body.preserveCompanionCollections === true
+    });
     let backup = null;
     try {
       backup = await backupLib.createBackupAfterWrite(ctx.db, ctx.paths, {
@@ -448,7 +502,11 @@ function createHandler(ctx) {
 
   api['GET /api/v1/overview'] = (req, res) => {
     const state = R.readState(ctx.db);
-    const asOf = isDateStr(req.query.asOf) ? req.query.asOf : localDateStr();
+    // 判定日与其余端点同一口径：ctx.today 可注入（测试固定时钟），否则取服务端本地日。
+    // 5E-6 发现：此处曾直用 localDateStr()，注入时钟时与 /targets/current 的 blocker 集合错位。
+    const asOf = isDateStr(req.query.asOf)
+      ? req.query.asOf
+      : (typeof ctx.today === 'function' ? ctx.today() : localDateStr());
     const overview = Domain.computeOverview(state.assets, {
       now: asOf,
       settings: state.settings || {}
@@ -962,6 +1020,435 @@ function createHandler(ctx) {
 
   api['GET /api/v1/security-events'] = (req, res) => {
     sendJson(res, 200, { items: R.readSecurityEvents(ctx.db) });
+  };
+
+  /* ---------- Phase 5B：风险评估与复评机制（D-047） ---------- */
+
+  // 客户端只提交原始答案 / 评估日期 / 复评原因；双评分、等级、上限、硬封顶与到期日
+  // 全部由服务端用 5A 冻结领域规则重算（PHASE5_BREAKDOWN §5.3）。载荷里出现任何派生字段
+  // （capacityScore / riskCeiling / status…）都会被领域入口的精确键白名单拒绝。
+  // 追加式写入：同 id 重放 → 409 duplicate_assessment；HTTP 重试由 Idempotency-Key 回放，
+  // 评估事实与幂等记录同一事务提交（沿用 G4C-7 纪律）。
+  api['POST /api/v1/risk-assessments'] = async (req, res) => {
+    const body = await readBody(req);
+    const idemKey = req.headers['idempotency-key'];
+    const fingerprint = requestFingerprint(body);
+    if (idemKey) {
+      const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/risk-assessments');
+      if (cached) {
+        if (cached.__requestFingerprint) {
+          if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+            return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于不同的风险评估', false);
+          }
+          return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+        }
+        return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      }
+    }
+    const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    const computed = Domain.computeRiskAssessment(body && typeof body === 'object' ? body : {}, { today: today });
+    if (!computed.ok) {
+      const code = (computed.error && computed.error.code) || 'invalid_answers';
+      const status = DOMAIN_ERROR_STATUS[code] || 400;
+      // detail 只报结构问题，不回显答案原文（5A 口径）
+      return fail(res, status, code, '风险评估请求不合法：' + (computed.error && computed.error.detail ? computed.error.detail : code), false);
+    }
+    const record = Object.assign({ id: newResourceId('ra') }, computed.record, {
+      createdAt: typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString()
+    });
+    try {
+      const response = dbm.transaction(ctx.db, () => {
+        const item = R.insertRiskAssessment(ctx.db, record);
+        const result = { ok: true, item: item };
+        if (idemKey) {
+          R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/risk-assessments', {
+            __requestFingerprint: fingerprint,
+            response: result
+          });
+        }
+        return result;
+      });
+      return sendJson(res, 201, response);
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  api['GET /api/v1/risk-assessments'] = (req, res) => {
+    const rows = R.readRiskAssessments(ctx.db);
+    const items = [];
+    let invalidCount = 0;
+    rows.forEach((row) => {
+      const checked = Domain.validateRiskAssessmentRecord(row);
+      if (checked.ok) items.push(checked.record);
+      else invalidCount += 1;
+    });
+    // 历史列表也必须走重算闸：被篡改或当前规则目录无法解释的记录不向页面暴露为
+    // 可用评估，但通过 invalidCount / total 留下显式证据，不能静默消失（D-047 ⑥）。
+    sendJson(res, 200, { items: items, invalidCount: invalidCount, total: rows.length });
+  };
+
+  // 当前有效评估的只读视图：由确定性领域规则选出（服务端不读客户端时钟；
+  // 判定日与 POST 同一口径：ctx.today 可注入（测试固定时钟），否则取服务端本地日；
+  // asOf 仅供页面预览某一天的有效性判定）。过期只使评估失效，绝不删除历史。
+  api['GET /api/v1/risk-assessments/current'] = (req, res) => {
+    const items = R.readRiskAssessments(ctx.db);
+    const serverToday = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    const hasAsOf = Object.prototype.hasOwnProperty.call(req.query, 'asOf');
+    if (hasAsOf && !isDateStr(req.query.asOf)) {
+      return fail(res, 400, 'invalid_assessment_date', 'asOf 必须是真实存在的 YYYY-MM-DD', false);
+    }
+    const now = hasAsOf ? req.query.asOf : serverToday;
+    const sel = Domain.selectCurrentAssessment(items, now);
+    if (!sel.ok) {
+      const code = (sel.error && sel.error.code) || 'invalid_assessment_date';
+      return fail(res, DOMAIN_ERROR_STATUS[code] || 400, code, '无法判定当前评估：' + (sel.error && sel.error.detail ? sel.error.detail : code), false);
+    }
+    sendJson(res, 200, {
+      ok: true,
+      now: now,
+      status: sel.status,
+      current: sel.current ? { assessment: sel.current.record, validity: sel.current.validity } : null,
+      expiredRef: sel.expiredRef,
+      invalidCount: sel.invalidCount,
+      total: items.length
+    });
+  };
+
+  /* ------------------------- Phase 5C：目标配置与认可标的映射 ------------------------- */
+  // 目标版本的数值全部由服务端按「当前有效评估的上限 + 5A 冻结模板」派生（D-048 ①）：
+  // 载荷只允许 effectiveFrom，出现 level / classes / templateVersion 等派生字段即在入口拒绝。
+  // 历史目标永不 UPDATE：评估或模板变化时追加新版本，旧版本继续可读（§6.2 工作项 5）。
+  api['GET /api/v1/targets'] = (req, res) => {
+    const rows = R.readAllocationTargets(ctx.db);
+    const assessments = {};
+    R.readRiskAssessments(ctx.db).forEach((a) => { assessments[a.id] = a; });
+    const items = [];
+    let invalidCount = 0;
+    rows.forEach((row) => {
+      const checked = Domain.validateAllocationTargetRecord(row, assessments[row.assessmentId] || null);
+      if (checked.ok) items.push(checked.record);
+      else invalidCount += 1;
+    });
+    // 与 5B 的历史列表同一纪律：被篡改或无法按冻结契约解释的记录不冒充可用目标，但显式留痕。
+    sendJson(res, 200, { items: items, invalidCount: invalidCount, total: rows.length });
+  };
+
+  api['POST /api/v1/targets'] = async (req, res) => {
+    const body = await readBody(req);
+    const idemKey = req.headers['idempotency-key'];
+    const fingerprint = requestFingerprint(body);
+    if (idemKey) {
+      const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/targets');
+      if (cached) {
+        if (cached.__requestFingerprint) {
+          if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+            return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于另一次目标生成', false);
+          }
+          return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+        }
+        return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      }
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return fail(res, 400, 'invalid_target_payload', '目标生成请求必须是 JSON 对象', false);
+    }
+    const payload = body;
+    const hasEffectiveFrom = Object.prototype.hasOwnProperty.call(payload, 'effectiveFrom');
+    if (!hasEffectiveFrom && Object.keys(payload).length !== 0) {
+      return fail(res, 400, 'invalid_target_payload', '目标生成请求只接受可选的 effectiveFrom 字段', false);
+    }
+    if (hasEffectiveFrom && !Domain.isCalendarDate(payload.effectiveFrom)) {
+      return fail(res, 400, 'invalid_effective_date', 'effectiveFrom 必须是真实存在的 YYYY-MM-DD', false);
+    }
+    const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    const sel = Domain.selectCurrentAssessment(R.readRiskAssessments(ctx.db), today);
+    if (!sel.ok) {
+      return fail(res, DOMAIN_ERROR_STATUS[(sel.error && sel.error.code) || ''] || 400,
+        (sel.error && sel.error.code) || 'invalid_assessment_date',
+        '无法判定当前评估：' + (sel.error && sel.error.detail ? sel.error.detail : ''), false);
+    }
+    if (sel.status !== 'current') {
+      const code = sel.status === 'all_expired' ? 'assessment_expired'
+        : sel.status === 'invalid_records' ? 'invalid_assessment_records' : 'no_valid_assessment';
+      const message = sel.status === 'all_expired' ? '风险评估已过期，请先复评再生成目标配置'
+        : sel.status === 'invalid_records' ? '已保存的评估与当前规则复核不一致，不能据此生成目标'
+          : '还没有有效的风险评估，不能生成目标配置';
+      return fail(res, DOMAIN_ERROR_STATUS[code] || 409, code, message, false);
+    }
+    const computed = Domain.computeAllocationTarget(sel.current.record, {
+      today: today,
+      effectiveFrom: hasEffectiveFrom ? payload.effectiveFrom : undefined
+    });
+    if (!computed.ok) {
+      const code = (computed.error && computed.error.code) || 'invalid_target_record';
+      return fail(res, DOMAIN_ERROR_STATUS[code] || 400, code,
+        '无法生成目标配置：' + (computed.error && computed.error.detail ? computed.error.detail : code), false);
+    }
+    // 自然键（评估 + 模板版本 + 生效日）已有目标 → 不追加第二行，直接回放既有版本。
+    const existing = R.readAllocationTargets(ctx.db).filter((t) =>
+      t.assessmentId === computed.target.assessmentId &&
+      t.templateVersion === computed.target.templateVersion &&
+      t.effectiveFrom === computed.target.effectiveFrom)[0];
+    if (existing) {
+      const checkedExisting = Domain.validateAllocationTargetRecord(existing, sel.current.record);
+      if (!checkedExisting.ok) {
+        return fail(res, 409, 'duplicate_target', '该评估在此生效日已有目标版本，且内容与当前规则不一致', false);
+      }
+      return sendJson(res, 200, { ok: true, created: false, item: checkedExisting.record, assessmentId: sel.current.record.id });
+    }
+    const record = Object.assign({ id: newResourceId('at'), createdAt: typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString() }, computed.target);
+    try {
+      const response = dbm.transaction(ctx.db, () => {
+        const item = R.insertAllocationTarget(ctx.db, record, { assessment: sel.current.record });
+        const result = { ok: true, created: true, item: item, assessmentId: sel.current.record.id };
+        if (idemKey) {
+          R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/targets', {
+            __requestFingerprint: fingerprint,
+            response: result
+          });
+        }
+        return result;
+      });
+      return sendJson(res, 201, response);
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  // 当前生效目标 + 当前配置偏离 + 认可标的映射的只读组合视图。
+  // 页面不再自己算第二遍（不变量 3 / D-025）：估值只走 computeOverview 这一遍，
+  // 比例与偏离由 5C 领域函数在同一份估值结果上派生；blockers / canAdvise 原样透传总览。
+  api['GET /api/v1/targets/current'] = (req, res) => {
+    const serverToday = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    const hasAsOf = Object.prototype.hasOwnProperty.call(req.query, 'asOf');
+    if (hasAsOf && !isDateStr(req.query.asOf)) {
+      return fail(res, 400, 'invalid_assessment_date', 'asOf 必须是真实存在的 YYYY-MM-DD', false);
+    }
+    const now = hasAsOf ? req.query.asOf : serverToday;
+    const state = R.readState(ctx.db);
+    const assessmentSel = Domain.selectCurrentAssessment(state.riskAssessments, now);
+    if (!assessmentSel.ok) {
+      return fail(res, 400, (assessmentSel.error && assessmentSel.error.code) || 'invalid_assessment_date',
+        '无法判定当前评估：' + (assessmentSel.error && assessmentSel.error.detail ? assessmentSel.error.detail : ''), false);
+    }
+    const currentAssessment = assessmentSel.status === 'current' ? assessmentSel.current.record : null;
+    const tsel = Domain.selectCurrentTarget(state.allocationTargets, currentAssessment, now);
+    const base = {
+      ok: true,
+      now: now,
+      status: tsel.ok ? tsel.status : 'invalid_records',
+      assessmentStatus: assessmentSel.status,
+      assessment: currentAssessment,
+      validity: assessmentSel.status === 'current' ? assessmentSel.current.validity : null,
+      target: null,
+      allocation: null,
+      mapping: null,
+      missingClasses: [],
+      invalidCount: tsel.ok ? tsel.invalidCount : 0,
+      total: tsel.ok ? tsel.total : 0,
+      versions: { ruleVersion: Domain.RISK_RULE_VERSION, targetVersion: Domain.RISK_TARGET_VERSION }
+    };
+    if (!tsel.ok || tsel.status !== 'current') {
+      // 没有生效目标时仍然返回映射与评估状态：维护认可标的不依赖目标是否已生成。
+      const view = R.readApprovedMappingView(ctx.db);
+      base.mapping = {
+        rows: view.rows, validCount: view.validCount, issueCount: view.issueCount,
+        invalidCount: view.invalidCount, total: view.total
+      };
+      return sendJson(res, 200, base);
+    }
+    const target = tsel.current.target;
+    const reassessed = Domain.validateAllocationTargetRecord(target, currentAssessment);
+    if (!reassessed.ok) {
+      return fail(res, 409, (reassessed.error && reassessed.error.code) || 'invalid_target_record',
+        '目标版本与所引用评估不一致：' + (reassessed.error && reassessed.error.detail ? reassessed.error.detail : ''), false);
+    }
+    const overview = Domain.computeOverview(state.assets, { now: now, settings: state.settings || {} });
+    const deviation = Domain.computeAllocationDeviation(target, overview);
+    if (!deviation.ok) {
+      return fail(res, 500, 'invalid_valuation_input', '无法在当前估值结果上计算类别偏离', false);
+    }
+    const view = R.readApprovedMappingView(ctx.db);
+    const missing = Domain.classesMissingMapping(target, view);
+    sendJson(res, 200, Object.assign(base, {
+      target: target,
+      allocation: deviation,
+      mapping: {
+        rows: view.rows, validCount: view.validCount, issueCount: view.issueCount,
+        invalidCount: view.invalidCount, total: view.total
+      },
+      missingClasses: missing.ok ? missing.missingClasses : []
+    }));
+  };
+
+  api['GET /api/v1/approved-instruments'] = (req, res) => {
+    const view = R.readApprovedMappingView(ctx.db);
+    sendJson(res, 200, {
+      ok: true,
+      rows: view.rows,
+      byClass: view.byClass,
+      validCount: view.validCount,
+      issueCount: view.issueCount,
+      invalidCount: view.invalidCount,
+      total: view.total
+    });
+  };
+
+  // 用户判断的唯一写入口：按「整类替换」建模（顺序即用户给的顺序）。
+  // 行情 / 目录 provider 的刷新路径不经过这里，也不写这张表 —— 刷新不可能加入、删除或改写认可标的。
+  api['POST /api/v1/approved-instruments'] = async (req, res) => {
+    const body = await readBody(req);
+    const idemKey = req.headers['idempotency-key'];
+    const fingerprint = requestFingerprint(body);
+    if (idemKey) {
+      const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/approved-instruments');
+      if (cached) {
+        if (cached.__requestFingerprint) {
+          if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+            return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于另一份认可标的清单', false);
+          }
+          return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+        }
+        return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      }
+    }
+    const checked = Domain.validateApprovedMappingRequest(body && typeof body === 'object' ? body : {});
+    if (!checked.ok) {
+      const code = (checked.error && checked.error.code) || 'invalid_mapping_payload';
+      return fail(res, DOMAIN_ERROR_STATUS[code] || 400, code,
+        '认可标的请求不合法：' + (checked.error && checked.error.detail ? checked.error.detail : code), false);
+    }
+    try {
+      const response = dbm.transaction(ctx.db, () => {
+        const items = R.replaceApprovedInstrumentClass(ctx.db, checked.assetClass, checked.instrumentIds, {
+          now: typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString()
+        });
+        const result = { ok: true, assetClass: checked.assetClass, items: items };
+        if (idemKey) {
+          R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/approved-instruments', {
+            __requestFingerprint: fingerprint,
+            response: result
+          });
+        }
+        return result;
+      });
+      return sendJson(res, 200, response);
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  /* ------------------------- Phase 5D：新增资金优先再平衡与正式建议门禁 -------------------------
+   * 服务端重新读取全部事实并按 D-049 的七条门禁逐项判定；客户端提交的当前比例、分数、目标、
+   * blocker 与认可标的一律不采信（`approvedInstruments` 出现在载荷即 400）。
+   * 门禁不过不是 HTTP 错误：响应仍是 200 + status:'estimate' + formalRecommendation:null，
+   * 页面据此显示估算与待办；前端的按钮禁用永远不能代替这道服务端门禁（§7.3）。
+   */
+  api['POST /api/v1/recommendations'] = async (req, res) => {
+    const body = await readBody(req);
+    const idemKey = req.headers['idempotency-key'];
+    const fingerprint = requestFingerprint(body);
+    if (idemKey) {
+      const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/recommendations');
+      if (cached) {
+        if (cached.__requestFingerprint) {
+          if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+            return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于另一次建议请求', false);
+          }
+          return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+        }
+        return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+      }
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return fail(res, 400, 'invalid_new_funds_request', '建议请求必须是 JSON 对象', false);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'approvedInstruments')) {
+      return fail(res, 400, 'invalid_approved_instruments',
+        '认可标的只由服务端从本机事实读取，不接受请求体提交的映射', false);
+    }
+    const checked = Domain.validateRecommendationRequest(body);
+    if (!checked.ok) {
+      const code = (checked.error && checked.error.code) || 'invalid_new_funds_request';
+      return fail(res, DOMAIN_ERROR_STATUS[code] || 400, code,
+        '建议请求不合法：' + (checked.error && checked.error.detail ? checked.error.detail : code), false);
+    }
+    const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+    const state = R.readState(ctx.db);
+    const snap = R.getCloseSnapshot(ctx.db, body.snapshotRef.snapshotId);
+    const close = R.listMonthlyCloses(ctx.db).find(c => c.id === body.snapshotRef.closeId) || null;
+    const capture = Recommendations.normalizeInput({
+      algorithmVersion: Recommendations.ALGORITHM_VERSION,
+      request: body, asOf: today, assets: state.assets, settings: state.settings || {},
+      riskAssessments: state.riskAssessments, allocationTargets: state.allocationTargets,
+      approvedInstruments: state.approvedInstruments, close, snapshot: snap
+    });
+    let computed;
+    try { computed = Recommendations.calculate(capture); } catch (err) { return upsertFail(res, err); }
+    const { versions, allocation } = computed;
+    const partial = {
+      id: '', createdAt: typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString(),
+      status: computed.status,
+      ruleVersion: versions.ruleVersion, targetVersion: versions.targetVersion,
+      assessmentId: versions.assessmentId, targetId: versions.targetId,
+      closeId: versions.closeId, snapshotId: versions.snapshotId, snapshotPayloadHash: versions.snapshotPayloadHash,
+      dataCutoff: versions.dataCutoff, asOf: versions.asOf,
+      requestedNewFundsMinor: allocation.requestedNewFundsMinor,
+      newFundsAvailableMinor: allocation.newFundsAvailableMinor,
+      allocatableNewFundsMinor: allocation.allocatableNewFundsMinor,
+      allocatedTotalMinor: allocation.allocatedTotalMinor,
+      inputHash: '',
+      // D-052：explanationVersion 是 gate 区的可选封存键（与 checks / capture 并列）。
+      // 不进 capture → 不改变 inputHash / id / 重放等式；旧记录没有此键照常有效，也永不回填。
+      gate: { checks: computed.checks, capture, explanationVersion: Knowledge.EXPLANATION_VERSION },
+      todos: computed.todos, result: computed.result
+    };
+    partial.inputHash = R.recommendationInputHash(partial);
+    partial.id = R.recommendationRecordId(partial.inputHash);
+    const existed = !!R.getRecommendation(ctx.db, partial.id);
+    try {
+      const item = dbm.transaction(ctx.db, () => {
+        const stored = R.insertRecommendation(ctx.db, partial);
+        const result = recommendationResponse(stored, existed);
+        if (idemKey) {
+          R.rememberIdempotent(ctx.db, String(idemKey), 'POST', '/api/v1/recommendations', {
+            __requestFingerprint: fingerprint,
+            response: result
+          });
+        }
+        return result;
+      });
+      return sendJson(res, existed ? 200 : 201, item);
+    } catch (err) {
+      return upsertFail(res, err);
+    }
+  };
+
+  // 建议产物的响应形状：正式建议与估算互斥，绝不同时给出两份数字让人猜哪份作数
+  function recommendationResponse(record, created) {
+    const formal = record.status === 'formal' ? record.result : null;
+    return {
+      ok: true,
+      created: !created,
+      id: record.id,
+      status: record.status,
+      inputHash: record.inputHash,
+      recommendation: record,
+      formalRecommendation: formal,
+      estimate: formal ? null : record.result
+    };
+  }
+
+  api['GET /api/v1/recommendations'] = (req, res) => {
+    const view = R.readRecommendationView(ctx.db);
+    // 与 5B / 5C 的列表同一纪律：复核不过或封存哈希被改动的行不冒充可用建议，但显式留痕
+    sendJson(res, 200, {
+      items: view.items,
+      invalidCount: view.invalidCount,
+      total: view.total,
+      versions: { ruleVersion: Domain.RISK_RULE_VERSION, targetVersion: Domain.RISK_TARGET_VERSION }
+    });
   };
 
   api['GET /api/v1/quotes'] = (req, res) => {

@@ -1,0 +1,20 @@
+{
+  "label": "A",
+  "port": 18631,
+  "url": "http://127.0.0.1:18631/tests/app-wiring.html",
+  "summary": "完成：29 项通过，0 项失败",
+  "dataset": "pass",
+  "failures": [],
+  "pass_count": 29,
+  "item_count": 29,
+  "console_errors": [
+    "A bad HTTP response code (404) was received when fetching the script.",
+    "Failed to load resource: the server responded with a status of 401 (Unauthorized)",
+    "Failed to load resource: the server responded with a status of 401 (Unauthorized)",
+    "Failed to load resource: the server responded with a status of 415 (Unsupported Media Type)",
+    "Failed to load resource: the server responded with a status of 400 (Bad Request)",
+    "Failed to load resource: the server responded with a status of 400 (Bad Request)",
+    "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)",
+    "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+  ]
+}

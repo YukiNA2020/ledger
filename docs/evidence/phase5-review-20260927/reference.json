@@ -1,0 +1,47 @@
+{
+  "checks": [
+    {
+      "name": "complete JSON restore into empty database",
+      "pass": true
+    },
+    {
+      "name": "native SQLite backup and restore full chain",
+      "pass": true
+    },
+    {
+      "name": "invalid snapshot restore rejected and rolled back",
+      "pass": true,
+      "status": 400
+    },
+    {
+      "name": "different_level",
+      "pass": false,
+      "expected": "reject mismatched referenced immutable records and roll back",
+      "restoreStatus": 200,
+      "invalidCount": 0,
+      "recommendationStatus": "formal",
+      "liveCeiling": 1,
+      "capturedCeiling": 3,
+      "liveCapacityScore": 2,
+      "capturedCapacityScore": 7,
+      "assessmentIdSame": true,
+      "targetIdSame": true
+    },
+    {
+      "name": "same_level_different_answers",
+      "pass": false,
+      "expected": "reject mismatched referenced immutable records and roll back",
+      "restoreStatus": 200,
+      "invalidCount": 0,
+      "recommendationStatus": "formal",
+      "liveCeiling": 3,
+      "capturedCeiling": 3,
+      "liveCapacityScore": 8,
+      "capturedCapacityScore": 7,
+      "assessmentIdSame": true,
+      "targetIdSame": true
+    }
+  ],
+  "passed": 3,
+  "failed": 2
+}

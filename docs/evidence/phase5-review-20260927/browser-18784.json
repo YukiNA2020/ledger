@@ -1,0 +1,158 @@
+{
+  "port": 18784,
+  "console": [
+    {
+      "type": "error",
+      "text": "A bad HTTP response code (404) was received when fetching the script."
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 401 (Unauthorized)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 401 (Unauthorized)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 415 (Unsupported Media Type)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+    },
+    {
+      "type": "log",
+      "text": "DRILL: ① 净资产 1,470,000.00；② 可投资 970,000.00；③ 主要风险暴露 现金 500,000.00（占可投资 51.5%）；④ 新增资金方向 宽基权益偏离 -985bps 低于目标区间 → 本月可新增 500,000.00 中请求的 2,000 元已全部补宽基"
+    },
+    {
+      "type": "log",
+      "text": "DRILL: 数据同源核对 overview={\"netWorthMinor\":147000000,\"investableMinor\":97000000,\"newFundsAvailableMinor\":50000000,\"broadEquityDeviationBps\":-985,\"adviceAllocatedBroadMinor\":200000}"
+    }
+  ],
+  "pageErrors": [],
+  "externalRequests": [],
+  "server": {
+    "pid": 13763,
+    "port": 18784,
+    "dir": "/var/folders/r3/x_nhgfs13gq2_kjhlmxyb_9m0000gn/T/ledger-fix5d-browser-D8xtAf"
+  },
+  "elapsedSeconds": 9.455,
+  "result": "pass",
+  "summary": "完成：34 项通过，0 项失败",
+  "checks": [
+    "✅ 本地服务可达且事实源为 SQLite",
+    "✅ 应用启动渲染资产决策台空状态并可进入现金流页",
+    "✅ 导入向导文件选择事件触发解析预览",
+    "✅ JSON 备份恢复入口弹出确认并覆盖恢复",
+    "✅ v1 备份恢复后资产集合初始化为空且决策台空状态",
+    "✅ v2 资产备份恢复后决策台展示精确口径",
+    "✅ SQLite 是唯一事实源且 IndexedDB 未被双写",
+    "✅ 非法写请求被拒绝且当前只读可用",
+    "✅ JSON 恢复前强制留 pre-import 备份（节流窗口内也可回滚）",
+    "✅ 资产录入页可维护双币种并记录不计收支的换汇，且不被全量写回抹掉",
+    "✅ 月度结账按上月口径生成清单并可保存估算快照",
+    "✅ 福利预设四类分流：明确余额计一次、无余额资格不计入、社保卡独立",
+    "✅ 上月核对日期 + 手动汇率可完成正式结账，历史金额可下钻到来源",
+    "✅ 标的目录：检索加入 → 确认分类并锁定 → 刷新不覆盖已确认值",
+    "✅ 标的目录：缺交易所的本地标的与参考数据合成一条候选（不重复展示）",
+    "✅ 持仓与证券事件：期初+买入−卖出推导持有数量，事件不被全量写回抹掉",
+    "✅ 行情区块：默认不自动抓取；手动补价写入事实源并渲染价格与来源",
+    "✅ 启动时自动更新汇率开关：默认关闭，切换可写入 settings 并回读",
+    "✅ 刷新报告的界面渲染：逐作用域状态如实提示，且不改动已登记的手动价格",
+    "✅ 估值下钻：四维度合计与总览自洽，逐持仓可追溯到价格与汇率来源",
+    "✅ 收益归因：基准取自已结账月快照，价格+汇率+未分解恒等于估值变化",
+    "✅ 篡改快照打开决策台：完整性失败时不给任何归因行",
+    "✅ 风险评估：问卷提交 → 服务端重算落库 → 结果/复评追加/历史渲染",
+    "✅ 目标配置：生成目标版本 → 类别偏离与总览同源 → 认可标的维护与反例",
+    "✅ 新增资金建议：页面生成正式建议 → 金额守恒且只引用认可标的 → 门禁不过时只给估算",
+    "✅ 5E-5 审计追溯：未封存旧建议显式标注，重复生成不倒填解释版本",
+    "✅ 清空账本经本地服务生效",
+    "✅ 决策台风险摘要：四态与 API、风险页同源，过期不冒充当前有效",
+    "✅ 决策台配置对照：六类与 /targets/current 同源，缺数据不冒充",
+    "✅ 本地知识卡：已知 id 打开、未知 id 显式降级、离线无建议边界",
+    "✅ 服务中断时记账：不报已入账、回滚界面、进入只读降级",
+    "✅ 5E-6 状态矩阵：无正式月结 / 0 元 / 分类未确认 / 行情过期的建议与决策台页面态",
+    "✅ 5E-6 三层复核：领域 = API = 页面（S5.1 能力约束意愿 + S5.2 分配与解释码 + S5.3 追溯）",
+    "✅ 5E-6 一分钟理解演练：净资产 / 可投资 / 主要风险暴露 / 新增资金方向 与 API 同源"
+  ],
+  "wiringConsole": [
+    {
+      "type": "error",
+      "text": "A bad HTTP response code (404) was received when fetching the script."
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 401 (Unauthorized)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 401 (Unauthorized)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 415 (Unsupported Media Type)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+    },
+    {
+      "type": "log",
+      "text": "DRILL: ① 净资产 1,470,000.00；② 可投资 970,000.00；③ 主要风险暴露 现金 500,000.00（占可投资 51.5%）；④ 新增资金方向 宽基权益偏离 -985bps 低于目标区间 → 本月可新增 500,000.00 中请求的 2,000 元已全部补宽基"
+    },
+    {
+      "type": "log",
+      "text": "DRILL: 数据同源核对 overview={\"netWorthMinor\":147000000,\"investableMinor\":97000000,\"newFundsAvailableMinor\":50000000,\"broadEquityDeviationBps\":-985,\"adviceAllocatedBroadMinor\":200000}"
+    }
+  ],
+  "mappingRevocationProbe": {
+    "currentMappingCount": 0,
+    "adviceStatus": "formal",
+    "adviceText": "正式建议\n全部门禁通过\n请求 2,000.00 · 可分配 2,000.00 · 实际分配 2,000.00 · 未分配 0.00 · 先补低于区间下限的类别\n守恒：实际分配 2,000.00 + 未分配 0.00 = 可分配 2,000.00\n排序依据：第一步：先补低于区间下限的类别；高配与已在目标之上的类别不参与追加；现金不自买并保留下限。 新增资金优先说明\n现金保底：转配只动投资池内现金，保留现金配置下限，不向现金自身分配；本轮无未分配余量。\n默认不卖出：现金 为高配：本轮分配为 0，只提示风险，不生成卖出指令。 为何不默认卖出\n· 第一步：先补低于区间下限的类别\n· 高配类别不加仓也不卖出（只提示风险）\n现金\n0.00\n高配：不加仓也不卖出\n固收\n0.00\n低于目标权重\n宽基权益\n2,000.00\n低于下限 · 锚点 10% → E6VOO 1,000.00 · E6VGT 1,000.00\n主题权益\n0.00\n已在目标之上\n个股\n0.00\n已在目标之上\n其他\n0.00\n已在目标之上\n尾差：缺口降序 → 同缺口按排列顺序 → 逐类别取整后余额给排序最前者。\n边界：默认不卖出现有资产；高配类别只提示风险。未映射的类别需先确认认可标的。\n追溯：快照 snap-7dd2219e81209d04 · 月结 close-465b918855ca0b4d · 快照哈希 511003127d09… · 月结数据截止 2026-09-30（月结快照是基准，不等同于计算输入）\n计算日输入：判定日 2026-09-27 · 算法版本 cash-reallocation-v1 · 本次计算输入 0465736b6d9a…（余额、持仓、价格、汇率及映射已本机封存）\n版本与记录：建议 rec-0465736b6d9a25d6 · payloadHash cb359cd84974… · 规则 risk-rules-v1 · 目标 risk-targets-v1（L2） · 评估 ra-7be1075edd005c59 · 目标配置 at-eb513e6b4ced66c2\n解释版本：本条建议生成时封存 v1；当前知识卡 v1",
+    "unchangedAfterRevocation": true
+  },
+  "staleUpdateStatus": 200,
+  "staleQuoteProbe": {
+    "apiCanAdvise": false,
+    "pageSaysEstimate": true,
+    "adviceStatus": "formal",
+    "adviceText": "正式建议\n全部门禁通过\n请求 2,000.00 · 可分配 2,000.00 · 实际分配 2,000.00 · 未分配 0.00 · 先补低于区间下限的类别\n守恒：实际分配 2,000.00 + 未分配 0.00 = 可分配 2,000.00\n排序依据：第一步：先补低于区间下限的类别；高配与已在目标之上的类别不参与追加；现金不自买并保留下限。 新增资金优先说明\n现金保底：转配只动投资池内现金，保留现金配置下限，不向现金自身分配；本轮无未分配余量。\n默认不卖出：现金 为高配：本轮分配为 0，只提示风险，不生成卖出指令。 为何不默认卖出\n· 第一步：先补低于区间下限的类别\n· 高配类别不加仓也不卖出（只提示风险）\n现金\n0.00\n高配：不加仓也不卖出\n固收\n0.00\n低于目标权重\n宽基权益\n2,000.00\n低于下限 · 锚点 10% → E6VOO 1,000.00 · E6VGT 1,000.00\n主题权益\n0.00\n已在目标之上\n个股\n0.00\n已在目标之上\n其他\n0.00\n已在目标之上\n尾差：缺口降序 → 同缺口按排列顺序 → 逐类别取整后余额给排序最前者。\n边界：默认不卖出现有资产；高配类别只提示风险。未映射的类别需先确认认可标的。\n追溯：快照 snap-7dd2219e81209d04 · 月结 close-465b918855ca0b4d · 快照哈希 511003127d09… · 月结数据截止 2026-09-30（月结快照是基准，不等同于计算输入）\n计算日输入：判定日 2026-09-27 · 算法版本 cash-reallocation-v1 · 本次计算输入 0465736b6d9a…（余额、持仓、价格、汇率及映射已本机封存）\n版本与记录：建议 rec-0465736b6d9a25d6 · payloadHash cb359cd84974… · 规则 risk-rules-v1 · 目标 risk-targets-v1（L2） · 评估 ra-7be1075edd005c59 · 目标配置 at-eb513e6b4ced66c2\n解释版本：本条建议生成时封存 v1；当前知识卡 v1"
+  },
+  "offlineProbe": {
+    "body": "资产决策台\n数据日 2026-09-27\n空状态\n🧭\n还没有资产数据\n这里将展示净资产、可投资资产、安全储备与风险配比。\n从资产录入开始：机构 → 账户 → 余额；也可通过「我的 → 恢复备份」导入包含资产数据的备份文件。\n录入资产去记一笔现金流\n风险评估\n未连接服务\n风险上限的判定由本地服务按冻结规则给出。运行 start.command（或 node server/main.js）后可在这里查看当前评估。\n评估详情与历史\n开始评估问卷\n配置对照\n未连接服务\n配置对照由本地服务在同一遍估值上给出当前与目标偏离。运行 start.command（或 node server/main.js）后可在这里查看。\n目标配置与维护\n目标配置\n本地服务运行后可维护\n›",
+    "catalogLoaded": true,
+    "knowledgeEntryCount": 0,
+    "serviceWorkerControlled": true
+  },
+  "findings": [
+    "revoked_mapping_still_in_formal_advice",
+    "stale_valuation_still_displays_all_gates_passed",
+    "cached_knowledge_has_no_offline_ui_entry"
+  ],
+  "auditPassed": false
+}

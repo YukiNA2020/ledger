@@ -397,8 +397,8 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
 
     const cases = [
       // market-data/refresh 已在 Phase 4D 实现（D-044）：不再是 501，见下方专项断言
-      ['POST', '/api/v1/risk-assessments', 'Phase 5'],
-      ['POST', '/api/v1/recommendations', 'Phase 5']
+      // risk-assessments 已在 Phase 5B 实现（D-047）：不再是 501，空载荷按 400 拒绝
+      // recommendations 已在 Phase 5D 实现（D-049）：不再是 501，见下方按 400 的载荷校验断言
     ];
     for (const [method, pathname, phase] of cases) {
       const res = await request(srv.port, method, pathname, {
@@ -409,6 +409,22 @@ test('后续阶段的写接口返回 501 而不是 404，资源边界对前端�
       assert.strictEqual(res.json.error.code, 'not_implemented');
       assert.ok(res.json.error.message.indexOf(phase) !== -1, pathname + ' 应说明所属阶段');
     }
+
+    // Phase 5B：risk-assessments 已实现，空载荷是客户端可修正的载荷问题 → 400 而非 501
+    const emptyRisk = await request(srv.port, 'POST', '/api/v1/risk-assessments', {
+      headers: writeHeaders(ctx),
+      body: '{}'
+    });
+    assert.strictEqual(emptyRisk.status, 400);
+    assert.strictEqual(emptyRisk.json.error.code, 'invalid_answers');
+
+    // Phase 5D：建议写入已实现，空载荷按 400 拒绝（引用绑定缺失属客户端可修正问题）
+    const emptyRec = await request(srv.port, 'POST', '/api/v1/recommendations', {
+      headers: writeHeaders(ctx),
+      body: '{}'
+    });
+    assert.strictEqual(emptyRec.status, 400);
+    assert.strictEqual(emptyRec.json.error.code, 'invalid_snapshot_ref');
 
     // Phase 4D：行情刷新已实现；自动行情抓取受 D-038 门禁约束默认关闭，
     // 因此 quotes 作用域是 200 + skipped(auto_fetch_disabled)，而不是 501。

@@ -22,6 +22,10 @@
  *     把「同一持仓只有一行期初事实」提升为数据库不变量（G4C-3）。
  *   - v7（Phase 4D）给 quotes 加 source_symbol 列，承载行情 provider 返回的原始代码（追溯要求）。
  *     只有加列、不加索引：报价的「(标的, 价格日) 元素键」由写入路径强制，原因见 v7 迁移内的注释。
+ *   - v8（Phase 5B）新增 risk_assessments 追加版本表（D-047）：一行一次评估，
+ *     原始答案与当时规则版本一起封存；历史行不被新规则重算改写，复评只追加不覆盖。
+ *   - v9（Phase 5C）新增 allocation_targets（目标版本，追加式，D-048）与
+ *     approved_instruments（资产类别 → 用户认可标的的白名单，仅用户判断可写）。
  *   - 已发布版本不做破坏性修改；v2 只新增表与索引，旧版本代码忽略新表仍可工作。
  */
 'use strict';
@@ -412,6 +416,150 @@ const MIGRATIONS = [
        * 收紧成 (instrument_id, price_date) 会推翻该已发布断言（并可能拒绝合法历史快照）。
        * 该取舍已记入 DECISIONS.md D-044 与 PHASE4D 证据。 */
       db.exec('ALTER TABLE quotes ADD COLUMN source_symbol TEXT;');
+    }
+  },
+  {
+    version: 8,
+    name: 'phase5b-risk-assessments',
+    up(db) {
+      /* Phase 5B（D-047）：风险评估追加版本表。
+       * - 一行 = 一次评估：原始答案 + 当时 ruleVersion + 全部派生值一起封存；
+       *   历史行永不被新规则静默重算改写（§5.3 门禁），复评即追加新行，不 UPDATE 旧行；
+       * - answers/hard_caps/explain_codes 用 JSON 文本无损往返（沿用 extra_json 纪律），
+       *   CHECK 只挡结构（合法 JSON 数组且非对象），逐字段校验在仓储写入路径；
+       * - assessed_at/expiry 是日历日；rule_version/reason 词表校验在仓储写入路径，
+       *   与 quotes 元素键同一取舍（D-044）：语义约束留在唯一实现，DB 只挡明显畸形；
+       * - 旧库前向迁移后本表为空 —— 不伪造默认评估（D-047 停止条件）。 */
+      db.exec(`
+        CREATE TABLE risk_assessments (
+          id                TEXT PRIMARY KEY,
+          rule_version      TEXT NOT NULL,
+          answers_json      TEXT NOT NULL CHECK (json_valid(answers_json) AND json_type(answers_json) = 'array'),
+          capacity_score    INTEGER NOT NULL CHECK (capacity_score >= 0 AND capacity_score <= 15),
+          willingness_score INTEGER NOT NULL CHECK (willingness_score >= 0 AND willingness_score <= 12),
+          capacity_level    INTEGER NOT NULL CHECK (capacity_level BETWEEN 1 AND 5),
+          willingness_level INTEGER NOT NULL CHECK (willingness_level BETWEEN 1 AND 5),
+          risk_ceiling      INTEGER NOT NULL CHECK (risk_ceiling BETWEEN 1 AND 5),
+          ceiling_source    TEXT NOT NULL CHECK (ceiling_source IN ('capacity','willingness','equal','hard_cap')),
+          hard_caps_json    TEXT NOT NULL CHECK (json_valid(hard_caps_json) AND json_type(hard_caps_json) = 'array'),
+          explain_codes_json TEXT NOT NULL CHECK (json_valid(explain_codes_json) AND json_type(explain_codes_json) = 'array'),
+          assessed_at       TEXT NOT NULL,
+          expiry            TEXT NOT NULL,
+          reason            TEXT NOT NULL,
+          created_at        TEXT NOT NULL
+        );
+        CREATE INDEX idx_risk_assessments_assessed ON risk_assessments(assessed_at, created_at, id);
+      `);
+    }
+  },
+  {
+    version: 9,
+    name: 'phase5c-allocation-targets',
+    up(db) {
+      /* Phase 5C（D-048）：目标配置版本 + 用户认可标的映射。
+       *
+       * allocation_targets —— 一行 = 一个目标版本（**追加式**，历史行永不 UPDATE）：
+       *   - level / classes 全部由服务端按「所引用评估的上限 + 5A 冻结模板」派生后封存，
+       *     同时保存 assessment_id、assessed_at、assessment_expiry 与 effective_from，
+       *     使「这一版目标来自哪一份评估、何时生效」可追溯（§6.2 工作项 1/5）；
+       *   - 自然键唯一索引 (assessment_id, template_version, effective_from)：
+       *     同一评估 + 同一模板版本 + 同一生效日只有一个版本，重复请求不产生第二行；
+       *   - assessment_id 用 ON DELETE RESTRICT：目标存在时不得级联删掉它所引用的评估（§10.6）。
+       *
+       * approved_instruments —— 「资产类别 → 用户认可标的」白名单，一行一条映射：
+       *   - 只有用户判断写入本表；行情 / 目录 provider 的刷新路径不触碰本表任何列（§6.2 工作项 7）；
+       *   - UNIQUE(instrument_id)：同一标的只能属于一个类别（标的的 asset_class 唯一，
+       *     两处并存必然是分类冲突）；UNIQUE(asset_class, position)：类别内顺序不重复，
+       *     顺序本身是用户判断（§6.2 工作项 6）；
+       *   - instrument_id 用 ON DELETE RESTRICT：删标的必须先显式解除用户映射，
+       *     不让引用静默悬空（失效引用由读取路径显式报告，不靠级联删除掩盖）；
+       *   - 唯一约束按名称显式建索引（不写内联 UNIQUE），server/backup.js 才能按名校验该不变量。
+       *
+       * classes_json 用 JSON 文本无损往返（沿用 extra_json 纪律）；CHECK 只挡结构
+       * （合法 JSON 对象），逐字段比例校验留在仓储 / 领域唯一实现（与 D-044 / D-047 同一取舍）。
+       * 旧库前向迁移后两表为空 —— 不替用户伪造目标或认可标的（D-034 禁止编造个人财务事实）。 */
+      db.exec(`
+        CREATE TABLE allocation_targets (
+          id                TEXT PRIMARY KEY,
+          template_version  TEXT NOT NULL,
+          rule_version      TEXT NOT NULL,
+          level             INTEGER NOT NULL CHECK (level BETWEEN 1 AND 5),
+          classes_json      TEXT NOT NULL CHECK (json_valid(classes_json) AND json_type(classes_json) = 'object'),
+          assessment_id     TEXT NOT NULL REFERENCES risk_assessments(id) ON DELETE RESTRICT,
+          assessed_at       TEXT NOT NULL,
+          assessment_expiry TEXT NOT NULL,
+          effective_from    TEXT NOT NULL,
+          created_at        TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_allocation_targets_natural
+          ON allocation_targets(assessment_id, template_version, effective_from);
+        CREATE INDEX idx_allocation_targets_effective
+          ON allocation_targets(effective_from, created_at, id);
+
+        CREATE TABLE approved_instruments (
+          id            TEXT PRIMARY KEY,
+          asset_class   TEXT NOT NULL CHECK (asset_class IN
+                        ('cash','fixed_income','broad_equity','theme_equity','stock','other')),
+          instrument_id TEXT NOT NULL REFERENCES instruments(id) ON DELETE RESTRICT,
+          position      INTEGER NOT NULL CHECK (position >= 0),
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_approved_instruments_slot
+          ON approved_instruments(asset_class, position);
+        CREATE UNIQUE INDEX uq_approved_instruments_instrument
+          ON approved_instruments(instrument_id);
+      `);
+    }
+  },
+  {
+    version: 10,
+    name: 'phase5d-recommendations',
+    up(db) {
+      /* Phase 5D（D-049）：新增资金再平衡的**不可变计算结果**。
+       *
+       * 一行 = 一次建议产物（追加式，永不 UPDATE）：请求绑定「快照 + 评估 + 目标 + 规则版本 + 金额」，
+       * 结果本身连同 gate / todos / result 一起封存，使 Phase 6 可以直接接管这份草案，
+       * 而不必重算 —— 重算会读到已经变动的估值，用户当时看到的数字就永远复现不出来了。
+       *
+       * - input_hash 唯一索引：id 由它导出，因此同一份输入重复请求返回同一行（幂等），
+       *   事实变了才产生新的一行；
+       * - assessment_id / target_id 用 ON DELETE RESTRICT（§10.6：正式建议引用的评估与目标
+       *   不得被级联删除，删掉用户事实前必须先处理这些建议）；
+       * - close_id / snapshot_id / snapshot_hash 是**封存审计引用**而不是活动外键：全量写入
+       *   （PUT /state / 旧备份恢复）会整体重建 monthly_closes 与 close_snapshots，
+       *   给它们加 RESTRICT 会让「保留建议、重建账务事实」这条路径直接失败。
+       *   建议行自身带着 payload_hash，被引用的快照是否存在不影响这份产物当时说了什么；
+       * - gate_json / result_json / todos_json 用 JSON 文本无损往返；CHECK 只挡结构，
+       *   逐字段语义与「门禁不过却标 formal」这类伪造在仓储 / 领域唯一实现里复核（D-044 取舍）；
+       * - 旧库前向迁移后本表为空：不替用户伪造任何一条历史建议。 */
+      db.exec(`
+        CREATE TABLE recommendations (
+          id                          TEXT PRIMARY KEY,
+          status                      TEXT NOT NULL CHECK (status IN ('formal','estimate')),
+          rule_version                TEXT NOT NULL,
+          target_version              TEXT NOT NULL,
+          assessment_id               TEXT NOT NULL REFERENCES risk_assessments(id) ON DELETE RESTRICT,
+          target_id                   TEXT NOT NULL REFERENCES allocation_targets(id) ON DELETE RESTRICT,
+          close_id                    TEXT NOT NULL,
+          snapshot_id                 TEXT NOT NULL,
+          snapshot_hash               TEXT NOT NULL,
+          data_cutoff                 TEXT NOT NULL,
+          as_of                       TEXT NOT NULL,
+          requested_new_funds_minor   INTEGER NOT NULL CHECK (requested_new_funds_minor >= 0),
+          available_new_funds_minor   INTEGER NOT NULL CHECK (available_new_funds_minor >= 0),
+          allocatable_new_funds_minor INTEGER NOT NULL CHECK (allocatable_new_funds_minor >= 0),
+          allocated_total_minor       INTEGER NOT NULL CHECK (allocated_total_minor >= 0),
+          input_hash                  TEXT NOT NULL,
+          gate_json                   TEXT NOT NULL CHECK (json_valid(gate_json) AND json_type(gate_json) = 'object'),
+          todos_json                  TEXT NOT NULL CHECK (json_valid(todos_json) AND json_type(todos_json) = 'array'),
+          result_json                 TEXT NOT NULL CHECK (json_valid(result_json) AND json_type(result_json) = 'object'),
+          payload_hash                TEXT NOT NULL,
+          created_at                  TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_recommendations_input ON recommendations(input_hash);
+        CREATE INDEX idx_recommendations_created ON recommendations(created_at, id);
+      `);
     }
   }
 ];

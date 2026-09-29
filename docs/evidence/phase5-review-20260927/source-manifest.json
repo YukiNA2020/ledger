@@ -1,0 +1,13 @@
+{
+  "js/app.js": "b1cb869de087c4a52f297dd28ceed780fee152e9a4ed80e828b8b35083319bc6",
+  "js/core.js": "851ed002455b48522cb98660191ecde35b68d9f3a8abdabf72061e9f075f8c44",
+  "js/domain.js": "7c6d25a095ed0dd9a2222b4b89c2cc7c315ee0b6522f2e5c525b3b4db81b9ea2",
+  "js/store.js": "ff789994b53d976a557bb6bef49f92de743d53c6d25ff80ed45cc11c398a7dae",
+  "js/knowledge.js": "aa03fe9af0be5c77d690c94f17d521766267fbb550628bf733c5ea00b98052ba",
+  "sw.js": "cbb6a1ed1967b9c19612a562ad9b752d05d3aff49ced3a910c047a2fd5702da9",
+  "server/api.js": "2bb56296d45b94b2dd8a0adef0ae72d4722e22ec341d5966fc09d91bd2d41997",
+  "server/repository.js": "19b99ee20ba6aefe9ffa88bbfa947b268762eecee301cb303565b6f7c1a03ba5",
+  "server/recommendations.js": "f1738808c0628aec5e609598d62af50c2ef9078b2a0d2d85e05f19a0ceb1008c",
+  "tests/app-wiring.js": "91b7b668b82f52112bb575b759fb13dc0e749180e0a83336946aff3fa567ead6",
+  "nodeVersion": "v26.7.0"
+}

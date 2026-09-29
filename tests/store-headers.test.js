@@ -167,3 +167,67 @@ test('高风险覆盖写入透传：forceBackup 出现在 PUT /state 请求体�
     Store.resetDetection();
   }
 });
+
+/* ---------------- Phase 5C（D-048）：服务端事务内保留追加式事实集合 ---------------- */
+
+test('saveAll 用单次 PUT 请求服务端原子保留未显式集合，显式集合仍以调用方为准', async () => {
+  const origFetch = globalThis.fetch;
+  const serverState = {
+    accounts: [], categories: [], txns: [], settings: {}, assets: {},
+    riskAssessments: [{ id: 'ra-keep' }],
+    allocationTargets: [{ id: 'at-keep' }],
+    approvedInstruments: [{ id: 'aim-keep' }],
+    recommendations: [{ id: 'rec-keep' }]
+  };
+  Store.resetDetection();
+  try {
+    globalThis.fetch = function (url, init) {
+      calls.push({ url: url, init: init });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(serverState) });
+    };
+    calls.length = 0;
+    // 页面记账路径的五键载荷（不含四份集合）
+    await Store.saveAll({ accounts: [], categories: [], txns: [], settings: {}, assets: {} });
+    const put = calls.filter((c) => c.init.method === 'PUT').pop();
+    assert.ok(put, '应发出 PUT /state');
+    const wrapped = JSON.parse(put.init.body);
+    const sent = wrapped.state;
+    const stateCalls = calls.filter((c) => /\/state$/.test(c.url));
+    assert.strictEqual(stateCalls.length, 1, '普通保存对 /state 只能发出一次 PUT，不能留下 GET→PUT 的并发覆盖窗口');
+    assert.strictEqual(stateCalls[0].init.method, 'PUT');
+    assert.strictEqual(wrapped.preserveCompanionCollections, true,
+      '未显式给出追加式集合时，必须请求服务端在同一事务内保留当前事实');
+    Store.COMPANION_KEYS.forEach((key) => {
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(sent, key), false,
+        key + ' 不应由客户端先读后写回旧快照');
+    });
+
+    // 显式给出（JSON 恢复路径）时以调用方为准，不被服务端现值覆盖
+    calls.length = 0;
+    await Store.saveAll({
+      accounts: [], categories: [], txns: [], settings: {}, assets: {},
+      allocationTargets: [{ id: 'at-from-backup' }], approvedInstruments: []
+    });
+    const put2 = calls.filter((c) => c.init.method === 'PUT').pop();
+    const wrapped2 = JSON.parse(put2.init.body);
+    const sent2 = wrapped2.state;
+    assert.deepStrictEqual(sent2.allocationTargets, [{ id: 'at-from-backup' }], '恢复写入必须整份覆盖');
+    assert.deepStrictEqual(sent2.approvedInstruments, [], '显式空集合就是清空');
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(sent2, 'riskAssessments'), false,
+      '未提到的集合不应携带客户端旧快照');
+    assert.strictEqual(wrapped2.preserveCompanionCollections, true,
+      '只要仍有未提到的集合（5D 起含建议产物），就由服务端事务内保留');
+
+    calls.length = 0;
+    await Store.saveAll({
+      accounts: [], categories: [], txns: [], settings: {}, assets: {},
+      riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: [], monthlyCloses: [], closeSnapshots: []
+    });
+    const wrapped3 = JSON.parse(lastCall().init.body);
+    assert.strictEqual(wrapped3.preserveCompanionCollections, false,
+      '全部附属集合显式给出时就是完整覆盖，不请求保留');
+  } finally {
+    globalThis.fetch = origFetch;
+    Store.resetDetection();
+  }
+});

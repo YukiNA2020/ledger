@@ -1798,7 +1798,8 @@
     'overseas_status_change', 'major_goal_change', 'liquidity_change', 'manual'
   ];
 
-  // 稳定错误码：5A 只冻结词表（HTTP 映射属 5B）；缺答 / 未知选项一律 fail closed，不猜默认值。
+  // 稳定错误码：5A 冻结词表，5B 落地 HTTP 状态映射（server/api.js 的 DOMAIN_ERROR_STATUS）；
+  // 缺答 / 未知选项一律 fail closed，不猜默认值。
   var RISK_ERROR_CODES = [
     'invalid_answers', 'unknown_question', 'unknown_option', 'duplicate_answer', 'missing_answer',
     'invalid_assessment_date', 'invalid_reassess_reason', 'invalid_rule_version',
@@ -2178,6 +2179,1679 @@
     });
   }
 
+  /* ------------------- 风险评估记录与复评机制（Phase 5B，D-047） -------------------
+   * 5B 把 5A 冻结的规则做成可保存、可追溯、可到期的评估记录。本段仍是纯函数：
+   * 不读存储、不发网络、不读系统时钟（`today` 一律由调用方传入，保证可复算，不变量 6）。
+   * 客户端只提交原始答案、评估日期与复评原因；分数 / 等级 / 上限 / 到期日等派生值
+   * 只能由本段（内部即 5A 的 scoreRiskAnswers）计算（5.3 门禁）。
+   */
+
+  // 提交载荷的精确键白名单：派生字段根本不在允许集合内，客户端伪装分数在入口即被拒绝。
+  var RISK_ASSESSMENT_REQUEST_KEYS = ['answers', 'assessedAt', 'reason'];
+  var RISK_ASSESSMENT_REQUEST_REQUIRED = ['answers', 'assessedAt', 'reason'];
+  // 落库记录的精确键白名单（`id` 与审计字段由服务端/仓储在写入时绑定）。
+  var RISK_ASSESSMENT_RECORD_KEYS = [
+    'id', 'ruleVersion', 'answers', 'capacityScore', 'willingnessScore',
+    'capacityLevel', 'willingnessLevel', 'ceiling', 'ceilingSource', 'hardCaps',
+    'explainCodes', 'assessedAt', 'expiry', 'reason', 'createdAt'
+  ];
+  var RISK_ASSESSMENT_RECORD_REQUIRED = RISK_ASSESSMENT_RECORD_KEYS.slice();
+  // 当前有效评估的判定态：没有一条未过期记录时的三种可区分结果。
+  var RISKASSESS_SELECT_NONE_STATES = ['no_assessment', 'all_expired', 'invalid_records'];
+
+  function riskassFail(code, detail) {
+    return { ok: false, error: { code: code, detail: detail } };
+  }
+
+  // 问卷载荷校验：fail closed。除答案/日期/原因外的任何键（含显式 null 的派生字段）一律拒绝。
+  function validateRiskAssessmentRequest(payload) {
+    if (!hasExactRiskKeys(payload, RISK_ASSESSMENT_REQUEST_KEYS, RISK_ASSESSMENT_REQUEST_REQUIRED)) {
+      return riskassFail('invalid_answers', '问卷载荷必须只包含自有数据字段 answers / assessedAt / reason');
+    }
+    if (copyRiskDenseDataArray(payload.answers) === null) {
+      return riskassFail('invalid_answers', 'answers 必须是稠密的普通答案数组');
+    }
+    if (!isCalendarDate(payload.assessedAt)) {
+      return riskassFail('invalid_assessment_date', '评估日期必须是真实存在的 YYYY-MM-DD');
+    }
+    if (!isRiskNonEmptyString(payload.reason)) {
+      return riskassFail('invalid_reassess_reason', '复评原因必须是非空字符串');
+    }
+    return { ok: true };
+  }
+
+  // 本地日历日（YYYY-MM-DD，不读 UTC 时区偏移）—— 服务端与页面共用同一口径，
+  // 但本函数**不是**可复算路径的一部分：调用方必须把结果显式传给 computeRiskAssessment。
+  function localTodayISO(now) {
+    var d = now instanceof Date ? now : new Date();
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+
+  // 从原始答案重算一条评估记录的全部派生值。评分唯一来源是 5A 的 scoreRiskAnswers；
+  // 这里不保留第二套规则（5.2 工作项 1）。
+  function computeRiskAssessment(payload, options) {
+    var opts = options || {};
+    var today = opts.today;
+    if (!isCalendarDate(today)) {
+      return riskassFail('invalid_assessment_date', 'options.today 必须是真实存在的 YYYY-MM-DD');
+    }
+    var v = validateRiskAssessmentRequest(payload);
+    if (!v.ok) return v;
+    if (payload.ruleVersion != null && payload.ruleVersion !== RISK_RULE_VERSION) {
+      // 5A 没有规则目录；钉住历史版本的重算请求一律拒绝，不猜旧规则（5.3 门禁）。
+      return riskassFail('invalid_rule_version', '规则版本与当前可用版本不一致');
+    }
+    var s = scoreRiskAnswers(payload.answers);
+    if (!s.ok) return { ok: false, error: s.error };
+    if (!isReassessReason(payload.reason)) {
+      return riskassFail('invalid_reassess_reason', '复评原因不在冻结词表内');
+    }
+    var val = assessmentValidity(payload.assessedAt, today);
+    if (!val.ok) return { ok: false, error: val.error };
+    return {
+      ok: true,
+      record: {
+        ruleVersion: s.ruleVersion,
+        answers: s.scored.map(function (a) {
+          return { questionId: a.questionId, optionId: a.optionId, score: a.score, kind: a.kind, dimension: a.dimension };
+        }),
+        capacityScore: s.capacityScore,
+        willingnessScore: s.willingnessScore,
+        capacityLevel: s.capacityLevel,
+        willingnessLevel: s.willingnessLevel,
+        ceiling: s.ceiling,
+        ceilingSource: s.ceilingSource,
+        hardCaps: s.hardCaps.map(function (c) { return { code: c.code, maxLevel: c.maxLevel, explainKey: c.explainKey }; }),
+        explainCodes: s.explainCodes.slice(),
+        assessedAt: payload.assessedAt,
+        expiry: val.expiry,
+        reason: payload.reason
+      }
+    };
+  }
+
+  // 已落库记录的反序列化校验：字段形状 + 按冻结规则**重算核对**。
+  // 任何派生值与答案 + ruleVersion 的重算结果不一致（旧库被改、规则漂移、伪造备份）
+  // 一律 fail closed —— 这是「记录不可被新规则静默重算改写」的机器兜底。
+  function validateRiskAssessmentRecord(record) {
+    if (!hasExactRiskKeys(record, RISK_ASSESSMENT_RECORD_KEYS, RISK_ASSESSMENT_RECORD_REQUIRED)) {
+      return riskassFail('invalid_answers', '评估记录字段不符合冻结契约');
+    }
+    if (!isRiskNonEmptyString(record.id) || !isRiskNonEmptyString(record.createdAt)) {
+      return riskassFail('invalid_answers', '评估记录缺少 id 或 createdAt');
+    }
+    if (record.ruleVersion !== RISK_RULE_VERSION) {
+      return riskassFail('invalid_rule_version', '评估记录引用了当前规则目录之外的版本');
+    }
+    if (!isCalendarDate(record.assessedAt) || !isCalendarDate(record.expiry)) {
+      return riskassFail('invalid_assessment_date', '评估/到期日期必须是真实存在的 YYYY-MM-DD');
+    }
+    if (!isReassessReason(record.reason)) {
+      return riskassFail('invalid_reassess_reason', '复评原因不在冻结词表内');
+    }
+    var answerRows = copyRiskDenseDataArray(record.answers);
+    if (answerRows === null) return riskassFail('invalid_answers', 'answers 必须是稠密数组');
+    for (var i = 0; i < answerRows.length; i++) {
+      if (!hasExactRiskKeys(answerRows[i], ['questionId', 'optionId', 'score', 'kind', 'dimension'],
+        ['questionId', 'optionId', 'score', 'kind', 'dimension'])) {
+        return riskassFail('invalid_answers', '第 ' + (i + 1) + ' 条答案字段不符合冻结契约');
+      }
+    }
+    var hardCapRows = copyRiskDenseDataArray(record.hardCaps);
+    var explainRows = copyRiskStringArray(record.explainCodes);
+    if (hardCapRows === null || explainRows === null) {
+      return riskassFail('invalid_answers', 'hardCaps / explainCodes 必须是普通稠密数组');
+    }
+    for (var h = 0; h < hardCapRows.length; h++) {
+      if (!hasExactRiskKeys(hardCapRows[h], ['code', 'maxLevel', 'explainKey'], ['code', 'maxLevel', 'explainKey'])) {
+        return riskassFail('invalid_answers', '第 ' + (h + 1) + ' 条硬封顶字段不符合冻结契约');
+      }
+    }
+    // 重算只喂「题目 → 选项」这一客户端事实；记录里冗余的 score/kind/dimension
+    // 必须与按冻结规则重算出的规范化结果逐字段相等，而不是被采信。
+    var bareRows = [];
+    for (var b = 0; b < answerRows.length; b++) {
+      bareRows.push({ questionId: answerRows[b].questionId, optionId: answerRows[b].optionId });
+    }
+    var recomputed = computeRiskAssessment(
+      { answers: bareRows, assessedAt: record.assessedAt, reason: record.reason },
+      { today: record.assessedAt }
+    );
+    if (!recomputed.ok) {
+      return { ok: false, error: recomputed.error, mismatch: true, code: recomputed.error.code };
+    }
+    var expected = recomputed.record;
+    var scalarKeys = ['ruleVersion', 'capacityScore', 'willingnessScore', 'capacityLevel',
+      'willingnessLevel', 'ceiling', 'ceilingSource', 'assessedAt', 'expiry', 'reason'];
+    for (var k = 0; k < scalarKeys.length; k++) {
+      if (record[scalarKeys[k]] !== expected[scalarKeys[k]]) {
+        return riskassFail('invalid_answers', '评估记录的派生值与答案重算结果不一致');
+      }
+    }
+    if (JSON.stringify(record.answers) !== JSON.stringify(expected.answers)) {
+      return riskassFail('invalid_answers', '评估记录的答案明细与规范化重算结果不一致');
+    }
+    if (JSON.stringify(record.hardCaps) !== JSON.stringify(expected.hardCaps)) {
+      return riskassFail('invalid_answers', '评估记录的硬封顶明细与重算结果不一致');
+    }
+    if (JSON.stringify(record.explainCodes) !== JSON.stringify(expected.explainCodes)) {
+      return riskassFail('invalid_answers', '评估记录的解释码与重算结果不一致');
+    }
+    return { ok: true, record: riskCopy(record) };
+  }
+
+  // 确定性排序：assessedAt 降序 → createdAt 降序 → id 升序。与数据库行序无关（不变量 6）。
+  function compareRiskAssessments(a, b) {
+    if (a.assessedAt !== b.assessedAt) return a.assessedAt < b.assessedAt ? 1 : -1;
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  }
+
+  function sortRiskAssessments(list) {
+    var rows = copyRiskDenseDataArray(list);
+    if (rows === null) return null;
+    return rows.sort(compareRiskAssessments);
+  }
+
+  // 「当前有效评估」的确定性选出（5.2 工作项 3）：
+  // 未过期（valid / expiring_soon）记录中最新的一条即当前评估；全部过期 / 无记录 /
+  // 记录不可解析分别返回可区分的空态。过期只使评估失效，不删除历史（5.3 门禁）。
+  function selectCurrentAssessment(records, now) {
+    if (!isCalendarDate(now)) return riskassFail('invalid_assessment_date', 'now 必须是真实存在的 YYYY-MM-DD');
+    var rows = copyRiskDenseDataArray(records);
+    if (rows === null) return riskassFail('invalid_answers', 'records 必须是稠密数组');
+    if (rows.length === 0) {
+      return { ok: true, status: 'no_assessment', current: null, candidates: [], expiredRef: null, invalidCount: 0 };
+    }
+    var parsed = [], invalidCount = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var r = validateRiskAssessmentRecord(rows[i]);
+      if (r.ok) parsed.push(r.record); else invalidCount += 1;
+    }
+    parsed.sort(compareRiskAssessments);
+    var validOnes = [], latest = parsed.length ? parsed[0] : null, latestExpiry = null;
+    for (var j = 0; j < parsed.length; j++) {
+      var val = assessmentValidity(parsed[j].assessedAt, now);
+      if (val.ok && val.status !== 'expired') validOnes.push({ record: parsed[j], validity: val });
+    }
+    if (latest) {
+      var lv = assessmentValidity(latest.assessedAt, now);
+      latestExpiry = lv.ok ? { assessedAt: latest.assessedAt, expiry: lv.expiry } : null;
+    }
+    if (validOnes.length) {
+      return {
+        ok: true,
+        status: 'current',
+        current: { record: validOnes[0].record, validity: validOnes[0].validity },
+        candidates: validOnes.map(function (x) { return x.record.id; }),
+        expiredRef: null,
+        invalidCount: invalidCount
+      };
+    }
+    if (parsed.length === 0) {
+      return { ok: true, status: 'invalid_records', current: null, candidates: [], expiredRef: latestExpiry, invalidCount: invalidCount };
+    }
+    return { ok: true, status: 'all_expired', current: null, candidates: [], expiredRef: latestExpiry, invalidCount: invalidCount };
+  }
+
+  // 契约快照：5B 落库 / API / 页面从这里取键集合与词表，避免各处硬编码分叉。
+  function riskAssessmentContract() {
+    return riskCopy({
+      ruleVersion: RISK_RULE_VERSION,
+      requestKeys: RISK_ASSESSMENT_REQUEST_KEYS,
+      requestRequired: RISK_ASSESSMENT_REQUEST_REQUIRED,
+      recordKeys: RISK_ASSESSMENT_RECORD_KEYS,
+      recordRequired: RISK_ASSESSMENT_RECORD_REQUIRED,
+      statuses: ASSESSMENT_STATUSES,
+      reassessReasons: REASSESS_REASONS,
+      validDays: ASSESSMENT_VALID_DAYS,
+      expiringDays: ASSESSMENT_EXPIRING_DAYS,
+      selectNoneStates: RISKASSESS_SELECT_NONE_STATES,
+      orderingRule: 'assessedAt 降序 → createdAt 降序 → id 升序（与数据库行序无关）'
+    });
+  }
+
+  /* ------------------- 目标配置与认可标的映射（Phase 5C，D-048） -------------------
+   * 5C 把 5B 的**有效风险评估**确定性映射为 5A 已冻结的目标区间，并把「资产类别 → 用户认可标的」
+   * 落成用户维护的白名单。本段仍是纯函数：不读存储、不发网络、不读系统时钟
+   * （判定日 / 生效日一律由调用方注入，保证可复算，不变量 6）。
+   * 范围边界（PHASE5_BREAKDOWN §6.4）：不接收新增资金金额、不计算买入金额、不生成 recommendation、
+   * 不创建 Phase 6 的接受 / 暂缓 / 执行 / 复盘状态。
+   */
+
+  // 目标记录 = 一次目标版本的封存事实（id / createdAt 由服务端绑定，历史行永不 UPDATE）。
+  var ALLOCATION_TARGET_RECORD_KEYS = [
+    'id', 'templateVersion', 'ruleVersion', 'level', 'classes',
+    'assessmentId', 'assessedAt', 'assessmentExpiry', 'effectiveFrom', 'createdAt'
+  ];
+  var ALLOCATION_TARGET_RECORD_REQUIRED = ALLOCATION_TARGET_RECORD_KEYS.slice();
+  // computeAllocationTarget 产出的内容体：记录键去掉服务端字段，用于自然键与幂等比较。
+  var ALLOCATION_TARGET_CONTENT_KEYS = [
+    'templateVersion', 'ruleVersion', 'level', 'classes',
+    'assessmentId', 'assessedAt', 'assessmentExpiry', 'effectiveFrom'
+  ];
+  // 客户端唯一可提交的自有字段：生效日期（可缺省 → 服务端今天）。level / classes 等派生值不在允许集合内。
+  var ALLOCATION_TARGET_REQUEST_KEYS = ['effectiveFrom'];
+  var APPROVED_INSTRUMENT_RECORD_KEYS = ['id', 'assetClass', 'instrumentId', 'position', 'createdAt', 'updatedAt'];
+  var APPROVED_INSTRUMENT_RECORD_REQUIRED = APPROVED_INSTRUMENT_RECORD_KEYS.slice();
+  // 认可标的的写入口按「整类替换」建模：用户判断就是这一类的有序清单，provider 没有对应字段。
+  var APPROVED_MAPPING_REQUEST_KEYS = ['assetClass', 'instrumentIds'];
+  var APPROVED_MAPPING_REQUEST_REQUIRED = ['assetClass', 'instrumentIds'];
+
+  var ALLOCATION_TARGET_STATUSES = ['current', 'no_target', 'no_assessment', 'stale_assessment', 'invalid_records'];
+  // 偏离计算的空态：投资池为 0 时不出比例，不冒充「全部 0% 在区间内」。
+  var ALLOCATION_DEVIATION_STATUSES = ['ok', 'no_investable'];
+  var ALLOCATION_MAPPING_ROW_STATUSES = ['ok', 'invalid'];
+  // 认可标的引用的失效原因（`classification_unconfirmed` / `unknown_instrument` 沿用既有词表，不新造第二套）
+  var ALLOCATION_MAPPING_ISSUE_CODES = ['instrument_missing', 'classification_unconfirmed', 'class_mismatch'];
+  // 5C 稳定错误码：5A 的 RISK_ERROR_CODES 是已冻结词表（fixture 逐字段比对），因此 5C 新增码
+  // 单列一张表，HTTP 映射在 server/api.js 的 DOMAIN_ERROR_STATUS 唯一落地（不变量 3）。
+  var ALLOCATION_ERROR_CODES = [
+    'invalid_target_payload', 'invalid_target_record', 'invalid_effective_date', 'assessment_expired',
+    'no_valid_assessment', 'invalid_assessment_records', 'duplicate_target', 'invalid_valuation_input',
+    'invalid_mapping_payload', 'duplicate_mapping', 'instrument_already_mapped', 'unknown_instrument',
+    'class_mismatch'
+  ];
+  var APPROVED_INSTRUMENT_MAX = 50;
+  // 比例守恒的稳定键：与 5A 的金额尾差规则分开（那条属 5D 的资金分配），两者都不得按行序取巧。
+  var ALLOCATION_BPS_ROUNDING_RULE =
+    'pctBps 用最大余数法：floor 后按余数降序补 1，余数相同按 RISK_CLASSES 顺序；ΣpctBps 恒等于 10000';
+  var ALLOCATION_TARGET_ORDER_RULE = 'effectiveFrom 降序 → createdAt 降序 → id 升序（与数据库行序无关）';
+
+  [
+    ALLOCATION_TARGET_RECORD_KEYS, ALLOCATION_TARGET_RECORD_REQUIRED, ALLOCATION_TARGET_CONTENT_KEYS,
+    ALLOCATION_TARGET_REQUEST_KEYS, APPROVED_INSTRUMENT_RECORD_KEYS, APPROVED_INSTRUMENT_RECORD_REQUIRED,
+    APPROVED_MAPPING_REQUEST_KEYS, APPROVED_MAPPING_REQUEST_REQUIRED, ALLOCATION_TARGET_STATUSES,
+    ALLOCATION_DEVIATION_STATUSES, ALLOCATION_MAPPING_ROW_STATUSES, ALLOCATION_MAPPING_ISSUE_CODES,
+    ALLOCATION_ERROR_CODES
+  ].forEach(deepFreezeRisk);
+
+  function allocFail(code, detail) {
+    return { ok: false, error: { code: code, detail: detail } };
+  }
+
+  // 自然键：同一条评估 + 同一模板版本 + 同一生效日期只可能有一个目标版本（重复请求不追加新行）。
+  function allocationTargetNaturalKey(t) {
+    return String(t.assessmentId) + '|' + String(t.templateVersion) + '|' + String(t.effectiveFrom);
+  }
+
+  /* ① 有效评估 → 目标版本（确定性映射，5A 模板是唯一数值来源） */
+
+  function computeAllocationTarget(assessment, options) {
+    var opts = options || {};
+    if (!isCalendarDate(opts.today)) return allocFail('invalid_assessment_date', 'options.today 必须是真实存在的 YYYY-MM-DD');
+    var checked = validateRiskAssessmentRecord(assessment);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    var rec = checked.record;
+    var val = assessmentValidity(rec.assessedAt, opts.today);
+    if (!val.ok) return { ok: false, error: val.error };
+    if (val.status === 'expired') {
+      return allocFail('assessment_expired', '所引用的风险评估已于 ' + rec.expiry + ' 过期，须先复评才能生成目标配置');
+    }
+    var effectiveFrom = opts.effectiveFrom == null ? opts.today : opts.effectiveFrom;
+    if (!isCalendarDate(effectiveFrom)) return allocFail('invalid_effective_date', '生效日期必须是真实存在的 YYYY-MM-DD');
+    if (effectiveFrom < rec.assessedAt) {
+      return allocFail('invalid_effective_date', '目标生效日期不得早于所引用评估的日期');
+    }
+    if (effectiveFrom > opts.today) {
+      return allocFail('invalid_effective_date', '目标生效日期不得晚于判定日（预排未来目标不属本阶段）');
+    }
+    // 不再单独检查「生效日 > 到期日」：走到这里必然未过期（today <= expiry）且 effectiveFrom <= today，
+    // 该不变量由上面两条前置检查保证；读取路径仍会复核 effectiveFrom <= assessmentExpiry。
+    var tpl = targetTemplateForLevel(rec.ceiling);
+    if (!tpl) return allocFail('invalid_target_template', '当前模板版本没有该风险上限对应的目标模板');
+    var tplCheck = validateTargetTemplate(tpl);
+    if (!tplCheck.ok) return { ok: false, error: tplCheck.error };
+    var target = {
+      templateVersion: RISK_TARGET_VERSION,
+      ruleVersion: rec.ruleVersion,
+      level: rec.ceiling,
+      classes: tpl.classes,
+      assessmentId: rec.id,
+      assessedAt: rec.assessedAt,
+      assessmentExpiry: rec.expiry,
+      effectiveFrom: effectiveFrom
+    };
+    return { ok: true, target: target, naturalKey: allocationTargetNaturalKey(target) };
+  }
+
+  /* ② 读取即复核：目标记录必须能被「模板版本 + 等级 + 所引用评估」重新解释 */
+
+  function validateAllocationTargetRecord(record, assessment) {
+    if (!hasExactRiskKeys(record, ALLOCATION_TARGET_RECORD_KEYS, ALLOCATION_TARGET_RECORD_REQUIRED)) {
+      return allocFail('invalid_target_record', '目标记录字段不符合冻结契约');
+    }
+    if (!isRiskNonEmptyString(record.id) || !isRiskNonEmptyString(record.assessmentId)) {
+      return allocFail('invalid_target_record', '目标记录缺少 id 或所引用的评估 id');
+    }
+    if (record.templateVersion !== RISK_TARGET_VERSION) {
+      return allocFail('invalid_target_template', '目标记录引用了当前目录之外的模板版本');
+    }
+    if (record.ruleVersion !== RISK_RULE_VERSION) {
+      return allocFail('invalid_rule_version', '目标记录引用了当前规则目录之外的版本');
+    }
+    if (!isRiskNonNegInt(record.level) || RISK_LEVELS.indexOf(record.level) === -1) {
+      return allocFail('invalid_target_record', '目标记录的风险上限不是 1–5 的等级');
+    }
+    // 比例必须逐字段等于该等级在冻结模板下的唯一定义：同版本偷换一组自洽比例同样 fail closed。
+    var tplCheck = validateTargetTemplate({
+      level: record.level, templateVersion: record.templateVersion, classes: record.classes
+    });
+    if (!tplCheck.ok) return { ok: false, error: tplCheck.error };
+    if (!isCalendarDate(record.assessedAt) || !isCalendarDate(record.assessmentExpiry) || !isCalendarDate(record.effectiveFrom)) {
+      return allocFail('invalid_effective_date', '评估日 / 到期日 / 生效日必须是真实存在的 YYYY-MM-DD');
+    }
+    if (record.effectiveFrom < record.assessedAt) {
+      return allocFail('invalid_effective_date', '目标生效日期早于所引用评估的日期');
+    }
+    if (record.effectiveFrom > record.assessmentExpiry) {
+      return allocFail('invalid_effective_date', '目标生效日期晚于所引用评估的到期日');
+    }
+    if (record.assessmentExpiry !== addCalendarDays(record.assessedAt, ASSESSMENT_VALID_DAYS)) {
+      return allocFail('invalid_target_record', '评估到期日与冻结有效期不一致');
+    }
+    if (assessment !== undefined && assessment !== null) {
+      var av = validateRiskAssessmentRecord(assessment);
+      if (!av.ok) return { ok: false, error: av.error };
+      var a = av.record;
+      if (a.id !== record.assessmentId || a.ruleVersion !== record.ruleVersion ||
+        a.assessedAt !== record.assessedAt || a.expiry !== record.assessmentExpiry || a.ceiling !== record.level) {
+        return allocFail('invalid_target_record', '目标记录与所引用评估不一致');
+      }
+    }
+    return { ok: true, record: riskCopy(record) };
+  }
+
+  function compareAllocationTargets(a, b) {
+    if (a.effectiveFrom !== b.effectiveFrom) return a.effectiveFrom < b.effectiveFrom ? 1 : -1;
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  }
+
+  function sortAllocationTargets(list) {
+    var rows = copyRiskDenseDataArray(list);
+    if (rows === null) return null;
+    return rows.sort(compareAllocationTargets);
+  }
+
+  // 「当前生效目标」的确定性选出（与 5B 的当前评估同一纪律）：
+  // 空态必须按「用户下一步动作不同」拆开，不得合并成一个「没有数据」。
+  function selectCurrentTarget(records, currentAssessment, now) {
+    if (!isCalendarDate(now)) return allocFail('invalid_assessment_date', 'now 必须是真实存在的 YYYY-MM-DD');
+    var rows = copyRiskDenseDataArray(records);
+    if (rows === null) return allocFail('invalid_target_record', 'records 必须是稠密数组');
+    if (rows.length === 0) {
+      return { ok: true, status: currentAssessment ? 'no_target' : 'no_assessment', current: null, invalidCount: 0, total: 0 };
+    }
+    var parsed = [], invalidCount = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var r = validateAllocationTargetRecord(rows[i]);
+      if (r.ok) parsed.push(r.record); else invalidCount += 1;
+    }
+    if (parsed.length === 0) {
+      return { ok: true, status: 'invalid_records', current: null, invalidCount: invalidCount, total: rows.length };
+    }
+    parsed.sort(compareAllocationTargets);
+    if (!currentAssessment) {
+      return { ok: true, status: 'no_assessment', current: null, invalidCount: invalidCount, total: rows.length };
+    }
+    var assessmentId = currentAssessment.id;
+    var matchesAssessment = false;
+    for (var j = 0; j < parsed.length; j++) {
+      if (parsed[j].assessmentId !== assessmentId) continue;
+      matchesAssessment = true;
+      if (parsed[j].effectiveFrom <= now) {
+        return {
+          ok: true, status: 'current', current: {
+            target: parsed[j], assessment: riskCopy(currentAssessment)
+          }, invalidCount: invalidCount, total: rows.length
+        };
+      }
+    }
+    // 引用对了但生效日还没到 → 与「引用的是另一份评估」是两种不同的下一步，不得合并
+    return {
+      ok: true,
+      status: matchesAssessment ? 'no_target' : 'stale_assessment',
+      current: null,
+      invalidCount: invalidCount,
+      total: rows.length
+    };
+  }
+
+  /* ③ 当前配置与偏离：**只消费 computeOverview 的同一遍估值**（D-025 / 不变量 3） */
+
+  // bps 最大余数法（D-048 ⑤ 冻结的唯一取整实现）：floor 后按余数降序补 1，同余数按 RISK_CLASSES 序。
+  // 5C 用它出当前比例，5D 用它复核「传进来的比例确实是同一遍估值」——两处共用同一份，不各写一遍。
+  function bpsByLargestRemainder(byClass, total) {
+    var base = [], assigned = 0, overflow = false;
+    RISK_CLASSES.forEach(function (k) {
+      var scaled = byClass[k] * BPS_TOTAL;
+      // 定点放缩超出安全整数就 fail closed（与 mulMinor 同一纪律）：
+      // 浮点尾差会让 ΣpctBps 不再精确等于 10000，宁可拒绝也不给一个「差 1bp」的比例。
+      if (!Number.isSafeInteger(scaled)) overflow = true;
+      var whole = Math.floor(scaled / total);
+      assigned += whole;
+      base.push({ assetClass: k, bps: whole, remainder: scaled - whole * total });
+    });
+    if (overflow) return { overflow: true };
+    var order = base.map(function (x, idx) { return idx; });
+    order.sort(function (x, y) {
+      if (base[x].remainder !== base[y].remainder) return base[y].remainder - base[x].remainder;
+      return x - y; // 同余数按 RISK_CLASSES 序（base 已按该序构造）
+    });
+    var leftover = BPS_TOTAL - assigned;
+    for (var s = 0; s < leftover; s++) base[order[s]].bps += 1;
+    var map = {};
+    base.forEach(function (x) { map[x.assetClass] = x.bps; });
+    return { overflow: false, map: map };
+  }
+
+  function computeAllocationDeviation(target, overview) {
+    var tv = validateAllocationTargetRecord(target);
+    if (!tv.ok) return { ok: false, error: tv.error };
+    var t = tv.record;
+    if (!isRiskObject(overview) || !isRiskObject(overview.pools)) {
+      return allocFail('invalid_valuation_input', '必须传入 computeOverview 的结果');
+    }
+    var rows = copyRiskDenseDataArray(overview.riskClasses);
+    if (rows === null) return allocFail('invalid_valuation_input', 'overview.riskClasses 必须是稠密数组');
+    if (rows.length !== RISK_CLASSES.length) {
+      return allocFail('invalid_valuation_input', 'overview.riskClasses 必须恰好覆盖六个资产类别');
+    }
+    var byClass = {};
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!isRiskObject(row) || RISK_CLASSES.indexOf(row.assetClass) === -1 || byClass[row.assetClass]) {
+        return allocFail('invalid_valuation_input', '估值结果含未知或重复的资产类别');
+      }
+      if (!isRiskNonNegInt(row.valueMinor)) {
+        return allocFail('invalid_valuation_input', '类别 ' + row.assetClass + ' 的估值必须是整数最小货币单位');
+      }
+      byClass[row.assetClass] = row.valueMinor;
+    }
+    for (var c = 0; c < RISK_CLASSES.length; c++) {
+      if (!Object.prototype.hasOwnProperty.call(byClass, RISK_CLASSES[c])) {
+        return allocFail('invalid_valuation_input', '估值结果缺少类别：' + RISK_CLASSES[c]);
+      }
+    }
+    var total = overview.pools.investableMinor;
+    if (!isRiskNonNegInt(total)) return allocFail('invalid_valuation_input', 'pools.investableMinor 必须是非负安全整数');
+    var classSum = 0;
+    RISK_CLASSES.forEach(function (k) { classSum += byClass[k]; });
+    // 总览与类别合计同源（同一遍估值），不一致说明传入的不是 computeOverview 的原始结果。
+    if (classSum !== total) {
+      return allocFail('invalid_valuation_input', '类别估值合计与投资池不一致');
+    }
+
+    var classes = [];
+    var status = total > 0 ? 'ok' : 'no_investable';
+    if (total === 0) {
+      // 空组合 / 投资池为零：不出比例、不出容忍带，避免把「算不出」显示成「全部在区间内」。
+      RISK_CLASSES.forEach(function (k) {
+        classes.push({
+          assetClass: k, valueMinor: byClass[k], pctBps: null,
+          minBps: t.classes[k].minBps, targetBps: t.classes[k].targetBps, maxBps: t.classes[k].maxBps,
+          band: null, deviationBps: null
+        });
+      });
+    } else {
+      var bps = bpsByLargestRemainder(byClass, total);
+      if (bps.overflow) return allocFail('invalid_valuation_input', '估值金额超出定点计算的安全整数范围');
+      RISK_CLASSES.forEach(function (k) {
+        var range = t.classes[k];
+        classes.push({
+          assetClass: k, valueMinor: byClass[k], pctBps: bps.map[k],
+          minBps: range.minBps, targetBps: range.targetBps, maxBps: range.maxBps,
+          band: compareToRange(bps.map[k], range.minBps, range.maxBps),
+          deviationBps: bps.map[k] - range.targetBps
+        });
+      });
+    }
+    var summary = { belowMin: 0, within: 0, aboveMax: 0 };
+    classes.forEach(function (x) {
+      if (x.band === 'below_min') summary.belowMin += 1;
+      else if (x.band === 'within') summary.within += 1;
+      else if (x.band === 'above_max') summary.aboveMax += 1;
+    });
+    var blockerRows = copyRiskDenseDataArray(overview.blockers || []);
+    return {
+      ok: true,
+      status: status,
+      asOf: typeof overview.asOf === 'string' ? overview.asOf : null,
+      valuationStatus: overview.valuationStatus || null,
+      canAdvise: overview.canAdvise === true,
+      investableTotalMinor: total,
+      targetLevel: t.level,
+      targetVersion: t.templateVersion,
+      classes: classes,
+      summary: summary,
+      // 阻塞项与「能否给正式建议」一律透传总览（不另写一套判断）
+      blockers: blockerRows === null ? [] : blockerRows.map(function (b) {
+        return isRiskObject(b) ? { code: b.code == null ? null : b.code, detail: b.detail == null ? '' : b.detail } : null;
+      }).filter(Boolean),
+      roundingRule: ALLOCATION_BPS_ROUNDING_RULE
+    };
+  }
+
+  /* ④ 认可标的映射：只有用户判断，引用必须已存在、已确认且类别一致 */
+
+  function validateApprovedMappingRequest(payload) {
+    if (!hasExactRiskKeys(payload, APPROVED_MAPPING_REQUEST_KEYS, APPROVED_MAPPING_REQUEST_REQUIRED)) {
+      return allocFail('invalid_mapping_payload', '载荷必须只包含自有数据字段 assetClass / instrumentIds');
+    }
+    if (RISK_CLASSES.indexOf(payload.assetClass) === -1) {
+      return allocFail('invalid_mapping_payload', 'assetClass 不在冻结的资产类别词表内');
+    }
+    var ids = copyRiskDenseDataArray(payload.instrumentIds);
+    if (ids === null) return allocFail('invalid_mapping_payload', 'instrumentIds 必须是普通、稠密的数组');
+    if (ids.length > APPROVED_INSTRUMENT_MAX) {
+      return allocFail('invalid_mapping_payload', '单个类别的认可标的不得超过 ' + APPROVED_INSTRUMENT_MAX + ' 条');
+    }
+    var out = [], seen = {};
+    for (var i = 0; i < ids.length; i++) {
+      if (!isRiskNonEmptyString(ids[i])) {
+        return allocFail('invalid_mapping_payload', '第 ' + (i + 1) + ' 项标的 id 必须是非空字符串');
+      }
+      if (seen[ids[i]]) return allocFail('duplicate_mapping', '同一类别重复引用同一标的：第 ' + (i + 1) + ' 项');
+      seen[ids[i]] = true;
+      out.push(ids[i]);
+    }
+    return { ok: true, assetClass: payload.assetClass, instrumentIds: out };
+  }
+
+  function validateApprovedInstrumentRecord(record) {
+    if (!hasExactRiskKeys(record, APPROVED_INSTRUMENT_RECORD_KEYS, APPROVED_INSTRUMENT_RECORD_REQUIRED)) {
+      return allocFail('invalid_mapping_payload', '认可标的记录字段不符合冻结契约');
+    }
+    if (!isRiskNonEmptyString(record.id)) return allocFail('invalid_mapping_payload', '认可标的记录缺少 id');
+    if (RISK_CLASSES.indexOf(record.assetClass) === -1) {
+      return allocFail('invalid_mapping_payload', '认可标的的资产类别不在冻结词表内');
+    }
+    if (!isRiskNonEmptyString(record.instrumentId)) {
+      return allocFail('invalid_mapping_payload', '认可标的缺少标的 id');
+    }
+    if (!isRiskNonNegInt(record.position)) {
+      return allocFail('invalid_mapping_payload', '认可标的的排序位置必须是非负安全整数');
+    }
+    return { ok: true, record: riskCopy(record) };
+  }
+
+  // 顺序即用户判断：按 RISK_CLASSES 序 → position 升序 → instrumentId 升序（position 冲突时仍可确定复现）。
+  function compareApprovedInstruments(a, b) {
+    var ca = RISK_CLASSES.indexOf(a.assetClass), cb = RISK_CLASSES.indexOf(b.assetClass);
+    if (ca !== cb) return ca - cb;
+    if (a.position !== b.position) return a.position - b.position;
+    if (a.instrumentId === b.instrumentId) return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+    return a.instrumentId < b.instrumentId ? -1 : 1;
+  }
+
+  function sortApprovedInstruments(list) {
+    var rows = copyRiskDenseDataArray(list);
+    if (rows === null) return null;
+    return rows.sort(compareApprovedInstruments);
+  }
+
+  // 引用完整性是**读取时**判定的：标的被删、分类被改回 suggested、类别被改成别的，
+  // 映射行都保持原样并显式报失效原因 —— provider 刷新与目录变更都不能改写用户判断。
+  function checkApprovedMapping(records, instruments) {
+    var rows = copyRiskDenseDataArray(records);
+    if (rows === null) return allocFail('invalid_mapping_payload', 'records 必须是稠密数组');
+    var insList = copyRiskDenseDataArray(instruments);
+    if (insList === null) return allocFail('invalid_mapping_payload', 'instruments 必须是稠密数组');
+    var instById = {};
+    for (var i = 0; i < insList.length; i++) {
+      var it = insList[i];
+      if (isRiskObject(it) && isRiskNonEmptyString(it.id) && !Object.prototype.hasOwnProperty.call(instById, it.id)) {
+        instById[it.id] = it;
+      }
+    }
+    var checked = [], invalidCount = 0;
+    for (var r = 0; r < rows.length; r++) {
+      var v = validateApprovedInstrumentRecord(rows[r]);
+      if (!v.ok) { invalidCount += 1; continue; }
+      var rec = v.record;
+      var inst = Object.prototype.hasOwnProperty.call(instById, rec.instrumentId) ? instById[rec.instrumentId] : null;
+      var issues = [];
+      if (!inst) issues.push('instrument_missing');
+      else {
+        if (inst.classificationStatus !== 'confirmed') issues.push('classification_unconfirmed');
+        if (!inst.assetClass || inst.assetClass !== rec.assetClass) issues.push('class_mismatch');
+      }
+      checked.push({
+        id: rec.id,
+        assetClass: rec.assetClass,
+        instrumentId: rec.instrumentId,
+        position: rec.position,
+        createdAt: rec.createdAt,
+        updatedAt: rec.updatedAt,
+        symbol: inst && isRiskNonEmptyString(inst.symbol) ? inst.symbol : null,
+        instrumentName: inst && isRiskNonEmptyString(inst.name) ? inst.name : null,
+        instrumentAssetClass: inst && isRiskNonEmptyString(inst.assetClass) ? inst.assetClass : null,
+        classificationStatus: inst && isRiskNonEmptyString(inst.classificationStatus) ? inst.classificationStatus : null,
+        status: issues.length ? 'invalid' : 'ok',
+        issues: issues
+      });
+    }
+    checked.sort(compareApprovedInstruments);
+    var byClass = {};
+    RISK_CLASSES.forEach(function (k) { byClass[k] = []; });
+    checked.forEach(function (x) { byClass[x.assetClass].push(x); });
+    var validCount = 0, issueCount = 0;
+    checked.forEach(function (x) {
+      if (x.status === 'ok') validCount += 1; else issueCount += 1;
+    });
+    return {
+      ok: true,
+      rows: checked,
+      byClass: byClass,
+      validCount: validCount,
+      issueCount: issueCount,
+      invalidCount: invalidCount,
+      total: rows.length
+    };
+  }
+
+  // 缺映射：目标比例 > 0 却没有任何「引用有效」的标的。
+  // 注意：这只影响「能不能落到具体证券」，不阻止显示类别偏离（§6.3）。
+  function classesMissingMapping(target, mapping) {
+    var tv = validateAllocationTargetRecord(target);
+    if (!tv.ok) return { ok: false, error: tv.error };
+    var m = isRiskObject(mapping) && mapping.byClass ? mapping : null;
+    if (!m) return allocFail('invalid_mapping_payload', '必须传入 checkApprovedMapping 的结果');
+    var missing = [];
+    RISK_CLASSES.forEach(function (k) {
+      if (tv.record.classes[k].targetBps <= 0) return;
+      var rows = Array.isArray(m.byClass[k]) ? m.byClass[k] : [];
+      var usable = rows.filter(function (x) { return x && x.status === 'ok'; });
+      if (!usable.length) missing.push(k);
+    });
+    return { ok: true, missingClasses: missing };
+  }
+
+  // 契约快照：迁移 / 仓储 / API / 页面从这里取键集合与词表，避免各处硬编码分叉。
+  function allocationContract() {
+    return riskCopy({
+      targetVersion: RISK_TARGET_VERSION,
+      ruleVersion: RISK_RULE_VERSION,
+      targetRecordKeys: ALLOCATION_TARGET_RECORD_KEYS,
+      targetContentKeys: ALLOCATION_TARGET_CONTENT_KEYS,
+      targetRequestKeys: ALLOCATION_TARGET_REQUEST_KEYS,
+      targetStatuses: ALLOCATION_TARGET_STATUSES,
+      targetOrderingRule: ALLOCATION_TARGET_ORDER_RULE,
+      instrumentRecordKeys: APPROVED_INSTRUMENT_RECORD_KEYS,
+      mappingRequestKeys: APPROVED_MAPPING_REQUEST_KEYS,
+      mappingRowStatuses: ALLOCATION_MAPPING_ROW_STATUSES,
+      mappingIssueCodes: ALLOCATION_MAPPING_ISSUE_CODES,
+      mappingMaxPerClass: APPROVED_INSTRUMENT_MAX,
+      deviationStatuses: ALLOCATION_DEVIATION_STATUSES,
+      deviationRoundingRule: ALLOCATION_BPS_ROUNDING_RULE,
+      errorCodes: ALLOCATION_ERROR_CODES,
+      classes: RISK_CLASSES,
+      toleranceBands: TOLERANCE_BANDS,
+      bpsTotal: BPS_TOTAL
+    });
+  }
+
+  /* ------------------- 新增资金优先再平衡与正式建议（Phase 5D，D-049） -------------------
+   * 5D 把 5C 的目标版本、同一遍 Phase 4 估值与用户认可标的转化为「这笔新增资金怎么分」。
+   * 本段仍是纯函数：不读存储、不发网络、不读系统时钟（判定日与估值一律由调用方注入，不变量 6）。
+   * 三条硬边界：
+   *   ① 只补低配类别——高配类别得到 0 与风险提示，任何情况下都不返回负金额或卖出指令；
+   *   ② 金额守恒——各类别分配之和恒等于「实际分配金额」，尾差按 5A 冻结的稳定键处理并说明；
+   *   ③ 正式建议只有一套门禁——本段只把服务端重读的事实折叠成 formal / estimate，
+   *      不重跑估值、不新写第二套「能不能建议」的判断（canAdvise 来自 computeOverview）。
+   */
+
+  // 分配轮次的稳定结论词表（输出必须落在这里，页面与 Phase 6 不得各自解释）
+  var NEW_FUND_ADJUSTMENTS = [
+    'fill_below_min',        // 存在低于下限的类别，本轮先补区间
+    'converge_to_target',    // 无低配（或已补满）后向 targetBps 收敛
+    'within_tolerance',      // 全部类别都在容忍带内：无需调整，不强造分配
+    'no_investable',         // 投资池为 0：没有可依赖的比例基准，不做分配
+    'zero_allocatable'       // 可分配金额为 0（输入 0 或可新增投资资金为 0）
+  ];
+  // 每个类别本轮承接资金的身份（解释用，不改变金额）
+  var NEW_FUND_CLASS_BASES = ['below_min', 'below_target', 'above_max', 'at_or_above_target', 'unknown_base'];
+  // 解释码：5E 的本地知识卡按这些稳定 id 出解释，本阶段不写文案卡
+  var RECOMMENDATION_EXPLAIN_CODES = [
+    'new_funds_below_min_first',
+    'new_funds_converge_to_target',
+    'new_funds_within_tolerance',
+    'new_funds_no_investable',
+    'new_funds_zero_amount',
+    'new_funds_capped_by_available',
+    'new_funds_rounding_remainder',
+    'new_funds_above_max_no_sell',
+    'new_funds_missing_approved_instrument',
+    'formal_gate_blocked'
+  ];
+  // 正式建议门禁：条件集合冻结，服务端逐条给出 passed，折叠成 status 的唯一实现在本段
+  var RECOMMENDATION_GATE_CHECKS = [
+    'snapshot_ref',                 // 引用的月结与快照真实存在且属于同一份结账
+    'close_formal',                 // 月结已完成（formal），估算结账不能支撑正式建议
+    'snapshot_hash',                // 快照原文 sha256 与封存 payloadHash 一致
+    'can_advise',                   // computeOverview.canAdvise === true（无行情/汇率/分类/余额阻塞）
+    'assessment_valid',             // 风险评估仍是当前有效那一份且规则版本可用
+    'target_matches_assessment',    // 目标版本与被引用评估匹配且仍在生效
+    'new_funds_within_available'    // 新增资金不超过当时的可新增投资资金
+  ];
+  var RECOMMENDATION_INSTRUMENT_STATUSES = ['mapped', 'needs_approved_instrument'];
+  var RECOMMENDATION_TODO_CODES = ['missing_approved_instrument', 'invalid_instrument_reference'];
+  // 5D 稳定错误码（与 5A 的 RISK_ERROR_CODES / 5C 的 ALLOCATION_ERROR_CODES 分开，不改已冻结词表）
+  var RECOMMENDATION_ERROR_CODES = [
+    'invalid_new_funds_request', 'recommendation_amount_overflow', 'unknown_close', 'unknown_snapshot',
+    'snapshot_hash_mismatch', 'close_not_formal', 'unknown_target', 'unknown_assessment',
+    'target_assessment_mismatch', 'invalid_recommendation_record', 'invalid_recommendation_output',
+    'duplicate_recommendation'
+  ];
+
+  var NEW_FUND_ALLOCATION_KEYS = [
+    'status', 'requestedNewFundsMinor', 'newFundsAvailableMinor', 'allocatableNewFundsMinor',
+    'cappedToAvailable', 'investableTotalMinor', 'plannedTotalMinor', 'adjustment',
+    'allocatedTotalMinor', 'unallocatedMinor', 'classes', 'belowMinClasses', 'aboveMaxClasses',
+    'rounding', 'explainCodes', 'targetLevel', 'targetVersion', 'asOf'
+  ];
+  var NEW_FUND_CLASS_ROW_KEYS = [
+    'assetClass', 'valueMinor', 'pctBps', 'minBps', 'targetBps', 'maxBps', 'band',
+    'goalBps', 'minNeedMinor', 'targetNeedMinor', 'allocatedMinor', 'basis'
+  ];
+  var NEW_FUND_ROUNDING_KEYS = ['rule', 'leftoverMinor', 'receivers', 'allocatedTotalMinor', 'unallocatedMinor'];
+  var RECOMMENDATION_CLASS_TARGET_KEYS = [
+    'assetClass', 'basis', 'goalBps', 'minNeedMinor', 'targetNeedMinor', 'allocatedMinor', 'instruments'
+  ];
+  var RECOMMENDATION_TODO_ROW_KEYS = ['code', 'assetClass', 'retainedMinor'];
+  var RECOMMENDATION_INSTRUMENT_ROW_KEYS = ['instrumentId', 'symbol', 'name', 'position', 'allocatedMinor'];
+  var RECOMMENDATION_VERSION_KEYS = [
+    'ruleVersion', 'targetVersion', 'targetLevel', 'assessmentId', 'targetId', 'closeId', 'snapshotId',
+    'snapshotPayloadHash', 'dataCutoff', 'asOf'
+  ];
+  var RECOMMENDATION_ROUNDING_NOTE_KEYS = [
+    'rule', 'leftoverMinor', 'receivers', 'adjustment', 'requestedNewFundsMinor',
+    'allocatableNewFundsMinor', 'allocatedTotalMinor', 'unallocatedMinor', 'cappedToAvailable'
+  ];
+  var RECOMMENDATION_CURRENT_ROW_KEYS = ['assetClass', 'valueMinor', 'pctBps'];
+  var RECOMMENDATION_RANGE_ROW_KEYS = ['assetClass', 'minBps', 'targetBps', 'maxBps'];
+  var RECOMMENDATION_DEVIATION_ROW_KEYS = ['assetClass', 'pctBps', 'minBps', 'maxBps', 'targetBps', 'band', 'deviationBps'];
+  var RECOMMENDATION_GATE_ROW_KEYS = ['code', 'passed', 'detail'];
+  // D-052：gate 区是生成时封存的上下文 —— checks（门禁）、capture（计算日完整输入），
+  // 以及 5E-5 起可选的 explanationVersion（生成时的知识卡解释版本）。
+  // 旧记录只有 checks / capture 也必须照常通过：解释版本是可选键，不进 inputHash、
+  // 不进 result，历史记录永不回填。必需键只有 checks（capture 缺失时由读取视图计入
+  // invalidCount，不冒充可验证建议）。
+  var RECOMMENDATION_GATE_KEYS = ['checks', 'capture', 'explanationVersion'];
+  var RECOMMENDATION_GATE_REQUIRED_KEYS = ['checks'];
+  // 落库的建议产物 = 不可变计算结果（供 Phase 6 接管）：本表不携带任何决策状态字段（接受 / 暂缓 / 执行 / 复盘属 Phase 6）
+  // 顶层键集保持 5D 冻结不变；解释版本封存在 gate 内，不是顶层键。
+  var RECOMMENDATION_RECORD_KEYS = [
+    'id', 'createdAt', 'status', 'ruleVersion', 'targetVersion', 'assessmentId', 'targetId',
+    'closeId', 'snapshotId', 'snapshotPayloadHash', 'dataCutoff', 'asOf',
+    'requestedNewFundsMinor', 'newFundsAvailableMinor', 'allocatableNewFundsMinor',
+    'allocatedTotalMinor', 'inputHash', 'gate', 'todos', 'result'
+  ];
+  // 金额分配的稳定键：与 5A 冻结的类别序 / 尾差规则同一份文字，避免各处另写口径
+  var NEW_FUND_MONEY_ROUNDING_RULE = ALLOCATION_ROUNDING_RULE;
+
+  [
+    NEW_FUND_ADJUSTMENTS, NEW_FUND_CLASS_BASES, RECOMMENDATION_EXPLAIN_CODES,
+    RECOMMENDATION_GATE_CHECKS, RECOMMENDATION_INSTRUMENT_STATUSES, RECOMMENDATION_TODO_CODES,
+    RECOMMENDATION_ERROR_CODES, NEW_FUND_ALLOCATION_KEYS, NEW_FUND_CLASS_ROW_KEYS,
+    NEW_FUND_ROUNDING_KEYS, RECOMMENDATION_CLASS_TARGET_KEYS, RECOMMENDATION_INSTRUMENT_ROW_KEYS,
+    RECOMMENDATION_VERSION_KEYS, RECOMMENDATION_GATE_ROW_KEYS, RECOMMENDATION_RECORD_KEYS,
+    RECOMMENDATION_GATE_KEYS, RECOMMENDATION_GATE_REQUIRED_KEYS,
+    RECOMMENDATION_TODO_ROW_KEYS, RECOMMENDATION_ROUNDING_NOTE_KEYS,
+    RECOMMENDATION_CURRENT_ROW_KEYS, RECOMMENDATION_RANGE_ROW_KEYS, RECOMMENDATION_DEVIATION_ROW_KEYS
+  ].forEach(deepFreezeRisk);
+
+  function recFail(code, detail) {
+    return { ok: false, error: { code: code, detail: detail } };
+  }
+
+  // 非负整数的向上取整除法（金额一律整数最小货币单位，不变量 8）。
+  function ceilDivMinor(num, den) {
+    if (den <= 0) return null;
+    return Math.floor((num + den - 1) / den);
+  }
+
+  /* floor(a * b / den) 的精确整数版：a、b 各自都是安全整数时乘积仍可能超出 2^53
+   * （池子 1000 万 + 新增 100 万就会命中），双精度乘积会让「谁拿到尾差」随平台漂移。
+   * BigInt 只在这里做中间放大，输出仍是安全整数；三个入参先按安全整数收口。 */
+  function mulDivFloor(a, b, den) {
+    if (!isRiskNonNegInt(a) || !isRiskNonNegInt(b) || !isRiskNonNegInt(den) || den === 0) return null;
+    if (typeof BigInt !== 'function') return null;
+    return Number(BigInt(a) * BigInt(b) / BigInt(den));
+  }
+
+  /* 把类别拉到「在投出这笔钱之后的池子里恰好占 goalBps」所需的**最小**新增金额。
+   * D-049：资金来自已计入投资池的现金，投前投后总额相同，不重复扩大分母。 */
+  function gapToGoalMinor(goalBps, valueMinor, plannedTotalMinor) {
+    if (!isRiskNonNegInt(goalBps) || !isRiskNonNegInt(valueMinor) || !isRiskNonNegInt(plannedTotalMinor)) return null;
+    if (typeof BigInt !== 'function') return null;
+    var need = BigInt(goalBps) * BigInt(plannedTotalMinor) - BigInt(BPS_TOTAL) * BigInt(valueMinor);
+    if (need <= BigInt(0)) return 0;
+    var out = (need + BigInt(BPS_TOTAL - 1)) / BigInt(BPS_TOTAL);
+    if (out > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    return Number(out);
+  }
+
+  /* 按 5A 冻结的稳定键把一笔钱分到若干类别：缺口降序 → 同缺口按类别序 → 逐类别取整后余额给排序最前者。
+   * 乘积用 BigInt 放大（见 mulDivFloor），因此结果与调用顺序、对象键序、数据库行序都无关。 */
+  function distributeNewFunds(list, amount) {
+    var order = list.slice().sort(function (a, b) {
+      if (a.needMinor !== b.needMinor) return b.needMinor - a.needMinor;
+      return RISK_CLASSES.indexOf(a.assetClass) - RISK_CLASSES.indexOf(b.assetClass);
+    });
+    var needSum = 0;
+    order.forEach(function (x) { needSum += x.needMinor; });
+    var assigned = 0;
+    order.forEach(function (x) {
+      x.share = x.needMinor === 0 ? 0 : mulDivFloor(amount, x.needMinor, needSum);
+      if (x.share === null) return;
+      assigned += x.share;
+    });
+    if (order.some(function (x) { return x.share === null; })) return null;
+    var leftover = amount - assigned;
+    var receivers = [];
+    for (var s = 0; s < leftover; s++) {
+      order[s].share += 1;
+      receivers.push(order[s].assetClass);
+    }
+    return { shares: order, leftoverMinor: leftover, receivers: receivers };
+  }
+
+  /* ① 新增资金优先再平衡：先补 below_min，再向 targetBps 收敛；绝不卖出 */
+
+  function computeNewFundsAllocation(input) {
+    if (!hasExactRiskKeys(input,
+      ['target', 'deviation', 'requestedNewFundsMinor', 'newFundsAvailableMinor'],
+      ['target', 'deviation', 'requestedNewFundsMinor', 'newFundsAvailableMinor'])) {
+      return recFail('invalid_new_funds_request', '输入必须只包含自有数据字段 target / deviation / requestedNewFundsMinor / newFundsAvailableMinor');
+    }
+    var tv = validateAllocationTargetRecord(input.target);
+    if (!tv.ok) return { ok: false, error: tv.error };
+    var target = tv.record;
+
+    var req = input.requestedNewFundsMinor, avail = input.newFundsAvailableMinor;
+    if (!isRiskNonNegInt(req)) return recFail('invalid_new_funds', 'requestedNewFundsMinor 必须是非负安全整数（最小货币单位）');
+    if (!isRiskNonNegInt(avail)) return recFail('invalid_new_funds', 'newFundsAvailableMinor 必须是非负安全整数（最小货币单位）');
+
+    // 偏离结果必须是「同一份目标 + 同一遍估值」的产物：类别比例、金额与锚点全部交叉核对，
+    // 这样任何绕过 computeAllocationDeviation 自行拼出来的偏离都会在这里 fail closed。
+    var dev = input.deviation;
+    if (!isRiskObject(dev) || ALLOCATION_DEVIATION_STATUSES.indexOf(dev.status) === -1) {
+      return recFail('invalid_valuation_input', '必须传入 computeAllocationDeviation 的结果');
+    }
+    if (dev.targetLevel !== target.level || dev.targetVersion !== target.templateVersion) {
+      return recFail('invalid_valuation_input', '偏离结果与目标版本不是同一份（等级或模板版本不一致）');
+    }
+    var devRows = copyRiskDenseDataArray(dev.classes);
+    if (devRows === null || devRows.length !== RISK_CLASSES.length) {
+      return recFail('invalid_valuation_input', '偏离结果必须恰好覆盖六个资产类别');
+    }
+    var byClass = {}, valuesByClass = {};
+    var total = dev.investableTotalMinor;
+    if (!isRiskNonNegInt(total)) return recFail('invalid_valuation_input', 'investableTotalMinor 必须是非负安全整数');
+    for (var i = 0; i < devRows.length; i++) {
+      var d = devRows[i];
+      if (!isRiskObject(d) || RISK_CLASSES.indexOf(d.assetClass) === -1 || byClass[d.assetClass]) {
+        return recFail('invalid_valuation_input', '偏离结果含未知或重复的资产类别');
+      }
+      if (d.assetClass !== RISK_CLASSES[i]) {
+        return recFail('invalid_valuation_input', '偏离结果必须按冻结的资产类别顺序给出');
+      }
+      var rng = target.classes[d.assetClass];
+      if (!isRiskNonNegInt(d.valueMinor) || d.minBps !== rng.minBps || d.targetBps !== rng.targetBps || d.maxBps !== rng.maxBps) {
+        return recFail('invalid_valuation_input', '类别 ' + d.assetClass + ' 的估值或区间与目标版本不一致');
+      }
+      if (d.pctBps === null) {
+        if (dev.status !== 'no_investable') {
+          return recFail('invalid_valuation_input', '类别 ' + d.assetClass + ' 缺少比例，但估值状态并非 no_investable');
+        }
+      } else {
+        if (!isRiskNonNegInt(d.pctBps)) return recFail('invalid_valuation_input', '类别 ' + d.assetClass + ' 的比例非法');
+        if (compareToRange(d.pctBps, rng.minBps, rng.maxBps) !== d.band) {
+          return recFail('invalid_valuation_input', '类别 ' + d.assetClass + ' 的容忍带与比例不符');
+        }
+      }
+      byClass[d.assetClass] = d;
+      valuesByClass[d.assetClass] = d.valueMinor;
+    }
+    for (var c = 0; c < RISK_CLASSES.length; c++) {
+      if (!Object.prototype.hasOwnProperty.call(byClass, RISK_CLASSES[c])) {
+        return recFail('invalid_valuation_input', '偏离结果缺少类别：' + RISK_CLASSES[c]);
+      }
+    }
+    var classSum = 0;
+    RISK_CLASSES.forEach(function (k) { classSum += byClass[k].valueMinor; });
+    if (classSum !== total) return recFail('invalid_valuation_input', '类别估值合计与投资池不一致');
+    if (dev.status === 'ok' && total > 0) {
+      // 比例必须由 5C 冻结的唯一取整实现从同一份金额重新导出：被中途改写的「当前比例」在这里挡掉，
+      // 5D 不会因为调用方递来一个自洽但虚假的 pctBps 就换掉分配依据。
+      var rederived = bpsByLargestRemainder(valuesByClass, total);
+      if (rederived.overflow) return recFail('invalid_valuation_input', '估值金额超出定点计算的安全整数范围');
+      for (var rk = 0; rk < RISK_CLASSES.length; rk++) {
+        var cls = RISK_CLASSES[rk];
+        if (byClass[cls].pctBps !== rederived.map[cls]) {
+          return recFail('invalid_valuation_input', '类别 ' + cls + ' 的比例与同一遍估值的取整结果不符');
+        }
+      }
+    }
+
+    // 可分配金额取输入与「可新增投资资金」的较小值；超上限必须显式说明而不是静默当作可用（§7.2 工作项 1）
+    var allocatable = req < avail ? req : avail;
+    var capped = req > avail;
+
+    var base = {
+      status: dev.status,
+      requestedNewFundsMinor: req,
+      newFundsAvailableMinor: avail,
+      allocatableNewFundsMinor: allocatable,
+      cappedToAvailable: capped,
+      investableTotalMinor: total,
+      plannedTotalMinor: total,
+      targetLevel: target.level,
+      targetVersion: target.templateVersion,
+      asOf: typeof dev.asOf === 'string' ? dev.asOf : null
+    };
+    // 逐类别算出两档缺口金额（锚点 = 投出这笔钱之后的池子）
+    var rows = [], overflow = false;
+    RISK_CLASSES.forEach(function (k) {
+      var d = byClass[k], range = target.classes[k];
+      var minNeed = null, targetNeed = null;
+      if (d.pctBps != null) {
+        minNeed = gapToGoalMinor(range.minBps, d.valueMinor, base.plannedTotalMinor);
+        targetNeed = gapToGoalMinor(range.targetBps, d.valueMinor, base.plannedTotalMinor);
+        if (minNeed === null || targetNeed === null) overflow = true;
+      }
+      // basis 来自同一投资池的当前区间；池内现金转配不产生额外资产。
+      var basis = 'at_or_above_target';
+      if (d.pctBps == null) basis = 'unknown_base';
+      else if (d.band === 'below_min') basis = 'below_min';
+      else if (d.band === 'above_max') basis = 'above_max';
+      else if (targetNeed > 0) basis = 'below_target';
+      rows.push({
+        assetClass: k, valueMinor: d.valueMinor, pctBps: d.pctBps,
+        minBps: range.minBps, targetBps: range.targetBps, maxBps: range.maxBps, band: d.band,
+        goalBps: null, minNeedMinor: minNeed, targetNeedMinor: targetNeed,
+        allocatedMinor: 0, basis: basis
+      });
+    });
+    if (overflow) {
+      return recFail('recommendation_amount_overflow', '新增资金或投资池超出定点计算的安全整数范围');
+    }
+
+    var belowMinClasses = [], aboveMaxClasses = [], allWithin = true;
+    rows.forEach(function (r) {
+      if (r.basis === 'below_min') belowMinClasses.push(r.assetClass);
+      if (r.basis === 'above_max') aboveMaxClasses.push(r.assetClass);
+      if (r.band !== 'within') allWithin = false;
+    });
+
+    var rounding = { rule: NEW_FUND_MONEY_ROUNDING_RULE, leftoverMinor: 0, receivers: [] };
+    var stage2Used = false;
+
+    // 汇总成冻结形状：allocated / unallocated 一律**从逐类别结果求和**得到，
+    // 不另记第二份数字，否则「总和 == 实际分配金额」这条守恒会靠调用点自觉维持（不变量 8）。
+    function finish(adjustment) {
+      var allocatedTotal = 0;
+      rows.forEach(function (r) {
+        allocatedTotal += r.allocatedMinor;
+        if (!r.allocatedMinor) { r.goalBps = null; return; }
+        var shortOfMin = r.basis === 'below_min' && r.minNeedMinor != null && r.allocatedMinor < r.minNeedMinor;
+        r.goalBps = shortOfMin ? r.minBps : r.targetBps;
+      });
+      var unallocated = base.allocatableNewFundsMinor - allocatedTotal;
+      var flags = {
+        new_funds_below_min_first: belowMinClasses.length > 0,
+        new_funds_converge_to_target: stage2Used,
+        new_funds_within_tolerance: adjustment === 'within_tolerance',
+        new_funds_no_investable: adjustment === 'no_investable',
+        new_funds_zero_amount: adjustment === 'zero_allocatable',
+        new_funds_capped_by_available: capped,
+        new_funds_rounding_remainder: rounding.leftoverMinor > 0,
+        new_funds_above_max_no_sell: aboveMaxClasses.length > 0
+      };
+      // 解释码按冻结词表的顺序给出，不受分支进入顺序影响
+      var codes = RECOMMENDATION_EXPLAIN_CODES.filter(function (code) {
+        return Object.prototype.hasOwnProperty.call(flags, code) && flags[code] === true;
+      });
+      return {
+        ok: true,
+        allocation: riskCopy({
+          status: base.status,
+          requestedNewFundsMinor: base.requestedNewFundsMinor,
+          newFundsAvailableMinor: base.newFundsAvailableMinor,
+          allocatableNewFundsMinor: base.allocatableNewFundsMinor,
+          cappedToAvailable: base.cappedToAvailable,
+          investableTotalMinor: base.investableTotalMinor,
+          plannedTotalMinor: base.plannedTotalMinor,
+          adjustment: adjustment,
+          allocatedTotalMinor: allocatedTotal,
+          unallocatedMinor: unallocated,
+          classes: rows,
+          belowMinClasses: belowMinClasses,
+          aboveMaxClasses: aboveMaxClasses,
+          rounding: {
+            rule: rounding.rule,
+            leftoverMinor: rounding.leftoverMinor,
+            receivers: rounding.receivers,
+            allocatedTotalMinor: allocatedTotal,
+            unallocatedMinor: unallocated
+          },
+          explainCodes: codes,
+          targetLevel: base.targetLevel,
+          targetVersion: base.targetVersion,
+          asOf: base.asOf
+        })
+      };
+    }
+
+    // ② 三类「本轮不分钱」的确定结论：没有比例基准、没有可分配金额、全部在容忍带内
+    if (dev.status !== 'ok' || total === 0) return finish('no_investable');
+    if (allocatable === 0) return finish('zero_allocatable');
+    if (allWithin) {
+      // 容忍带就是「无需调整」的定义（5A 冻结端点含入）；为了凑建议强行分配会制造无谓交易
+      return finish('within_tolerance');
+    }
+
+    // D-049：这是池内现金转配，分母不变；保留现金目标下限，现金不再作为买入候选。
+    var cashFloor = gapToGoalMinor(target.classes.cash.minBps, 0, total);
+    var remaining = Math.min(allocatable, Math.max(0, byClass.cash.valueMinor - cashFloor));
+
+    // ③ 第一优先级：把低于 minBps 的类别补进区间
+    var stage1 = [], stage1Need = 0;
+    rows.forEach(function (r) {
+      if (r.assetClass === 'cash' || r.basis !== 'below_min' || !r.minNeedMinor) return;
+      stage1.push({ assetClass: r.assetClass, row: r, needMinor: r.minNeedMinor, share: 0 });
+      stage1Need += r.minNeedMinor;
+    });
+    if (stage1.length) {
+      if (stage1Need >= remaining) {
+        var d1 = distributeNewFunds(stage1, remaining);
+        if (!d1) return recFail('recommendation_amount_overflow', '缺口分配计算超出定点安全整数范围');
+        d1.shares.forEach(function (x) { x.row.allocatedMinor = x.share; });
+        rounding.leftoverMinor += d1.leftoverMinor;
+        d1.receivers.forEach(function (k) { rounding.receivers.push(k); });
+        return finish('fill_below_min');
+      }
+      stage1.forEach(function (x) { x.row.allocatedMinor = x.needMinor; });
+      remaining -= stage1Need;
+    }
+
+    // ④ 第二优先级：余下的钱向 targetBps 收敛（高配类别永远不在候选里：既不卖出也不追加）
+    var stage2 = [], stage2Need = 0;
+    rows.forEach(function (r) {
+      if (r.assetClass === 'cash' || r.basis === 'above_max' || r.pctBps === null) return;
+      var left = r.targetNeedMinor - r.allocatedMinor;
+      if (left <= 0) return;
+      stage2.push({ assetClass: r.assetClass, row: r, needMinor: left, share: 0 });
+      stage2Need += left;
+    });
+    if (stage2.length) stage2Used = true;
+    if (stage2Need >= remaining) {
+      var d2 = distributeNewFunds(stage2, remaining);
+      if (!d2) return recFail('recommendation_amount_overflow', '缺口分配计算超出定点安全整数范围');
+      d2.shares.forEach(function (x) { x.row.allocatedMinor += x.share; });
+      rounding.leftoverMinor += d2.leftoverMinor;
+      d2.receivers.forEach(function (k) { rounding.receivers.push(k); });
+      return finish('converge_to_target');
+    }
+    stage2.forEach(function (x) { x.row.allocatedMinor += x.needMinor; });
+    return finish('converge_to_target');
+  }
+
+  /* ② 落到具体证券：只用 5C 的用户认可标的（按 position 顺序），没有可用候选就留类别级待办。
+   * 用户没有提交「同类内份额」，等额分配是唯一不引入新判断的分法；顺序用于尾差与展示。
+   * 缺映射的类别**不转投陌生标的**（不变量 5），金额原样保留并显式报告。 */
+
+  function mapAllocationToApprovedInstruments(allocation, mapping) {
+    var al = isRiskObject(allocation) && hasExactRiskKeys(allocation, NEW_FUND_ALLOCATION_KEYS, NEW_FUND_ALLOCATION_KEYS)
+      ? allocation : null;
+    if (!al) return recFail('invalid_new_funds_request', '必须传入 computeNewFundsAllocation 的结果');
+    if (!isRiskObject(mapping) || !isRiskObject(mapping.byClass)) {
+      return recFail('invalid_mapping_payload', '必须传入 checkApprovedMapping 的结果');
+    }
+    var classes = [], todos = [], mappedTotal = 0, unmappedTotal = 0;
+    for (var i = 0; i < RISK_CLASSES.length; i++) {
+      var k = RISK_CLASSES[i];
+      var row = null;
+      for (var r = 0; r < al.classes.length; r++) if (al.classes[r].assetClass === k) row = al.classes[r];
+      if (!row) return recFail('invalid_new_funds_request', '分配结果缺少类别：' + k);
+      var amount = row.allocatedMinor;
+      var out = {
+        assetClass: k, basis: row.basis, goalBps: row.goalBps,
+        minNeedMinor: row.minNeedMinor, targetNeedMinor: row.targetNeedMinor,
+        allocatedMinor: amount, instruments: []
+      };
+      classes.push(out);
+      if (!amount) continue;
+      var rows = Array.isArray(mapping.byClass[k]) ? mapping.byClass[k] : [];
+      var usable = rows.filter(function (x) { return x && x.status === 'ok' && isRiskNonEmptyString(x.instrumentId); });
+      if (!usable.length) {
+        todos.push({
+          code: rows.length ? 'invalid_instrument_reference' : 'missing_approved_instrument',
+          assetClass: k,
+          retainedMinor: amount
+        });
+        unmappedTotal += amount;
+        continue;
+      }
+      var n = usable.length;
+      var each = Math.floor(amount / n);
+      var extra = amount - each * n;
+      usable.forEach(function (x, idx) {
+        out.instruments.push({
+          instrumentId: x.instrumentId,
+          symbol: x.symbol == null ? null : x.symbol,
+          name: x.instrumentName == null ? null : x.instrumentName,
+          position: x.position,
+          allocatedMinor: each + (idx < extra ? 1 : 0)
+        });
+      });
+      mappedTotal += amount;
+    }
+    if (mappedTotal + unmappedTotal !== al.allocatedTotalMinor) {
+      return recFail('invalid_new_funds_request', '标的级分配之和与类别级不一致');
+    }
+    return {
+      ok: true,
+      classes: classes,
+      todos: todos,
+      mappedTotalMinor: mappedTotal,
+      unmappedTotalMinor: unmappedTotal
+    };
+  }
+
+  /* ③ 正式建议门禁：条件由服务端逐条判定，本段只负责**唯一一次**折叠成 formal / estimate。
+   * 页面与仓储都不得再判一遍（不变量 3）。 */
+
+  function recommendationStatusFromGate(checks) {
+    var rows = copyRiskDenseDataArray(checks);
+    if (rows === null) return recFail('invalid_recommendation_record', 'gate.checks 必须是稠密数组');
+    var seen = {}, out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var c = rows[i];
+      if (!hasExactRiskKeys(c, RECOMMENDATION_GATE_ROW_KEYS, ['code', 'passed'])
+        || RECOMMENDATION_GATE_CHECKS.indexOf(c.code) === -1 || typeof c.passed !== 'boolean') {
+        return recFail('invalid_recommendation_record', '第 ' + (i + 1) + ' 项门禁条件不符合冻结词表');
+      }
+      if (seen[c.code]) return recFail('invalid_recommendation_record', '同一门禁条件重复给出：' + c.code);
+      seen[c.code] = true;
+      out.push({ code: c.code, passed: c.passed, detail: c.detail == null ? '' : String(c.detail) });
+    }
+    for (var g = 0; g < RECOMMENDATION_GATE_CHECKS.length; g++) {
+      if (!seen[RECOMMENDATION_GATE_CHECKS[g]]) {
+        return recFail('invalid_recommendation_record', '缺少门禁条件：' + RECOMMENDATION_GATE_CHECKS[g]);
+      }
+    }
+    // 顺序固定为冻结词表顺序，与调用方拼装顺序无关
+    out.sort(function (a, b) {
+      return RECOMMENDATION_GATE_CHECKS.indexOf(a.code) - RECOMMENDATION_GATE_CHECKS.indexOf(b.code);
+    });
+    var failed = out.filter(function (x) { return !x.passed; }).map(function (x) { return x.code; });
+    return { ok: true, checks: out, status: failed.length ? 'estimate' : 'formal', failedChecks: failed };
+  }
+
+  // 建议结果的冻结形状：十个顶层键 = 5A 的 RECOMMENDATION_OUTPUT_KEYS，逐子结构都有不变量断言。
+  function validateRecommendationOutput(o) {
+    if (!hasExactRiskKeys(o, RECOMMENDATION_OUTPUT_KEYS, RECOMMENDATION_OUTPUT_KEYS)) {
+      return recFail('invalid_recommendation_output', '建议结果字段不符合冻结契约');
+    }
+    if (RECOMMENDATION_STATUSES.indexOf(o.status) === -1) {
+      return recFail('invalid_recommendation_output', 'status 不在冻结的建议状态词表内');
+    }
+    var blockers = copyRiskDenseDataArray(o.blockers);
+    if (blockers === null) return recFail('invalid_recommendation_output', 'blockers 必须是稠密数组');
+    for (var b = 0; b < blockers.length; b++) {
+      if (!hasExactRiskKeys(blockers[b], ['code', 'detail'], ['code'])
+        || !isRiskNonEmptyString(blockers[b].code)) {
+        return recFail('invalid_recommendation_output', '第 ' + (b + 1) + ' 项阻塞项形状非法');
+      }
+    }
+    if (!isCalendarDate(o.dataCutoff)) return recFail('invalid_recommendation_output', 'dataCutoff 必须是真实存在的 YYYY-MM-DD');
+    if (!hasExactRiskKeys(o.versions, RECOMMENDATION_VERSION_KEYS, RECOMMENDATION_VERSION_KEYS)) {
+      return recFail('invalid_recommendation_output', 'versions 必须绑定全部版本与不可变引用');
+    }
+    var v = o.versions;
+    var refOk = true;
+    ['ruleVersion', 'targetVersion', 'assessmentId', 'targetId', 'closeId', 'snapshotId', 'dataCutoff', 'asOf'].forEach(function (key) {
+      if (!isRiskNonEmptyString(v[key])) refOk = false;
+    });
+    if (!refOk || !isRiskHex64(v.snapshotPayloadHash)) {
+      return recFail('invalid_recommendation_output', '版本引用含空值或快照哈希不是 64 位十六进制');
+    }
+    if (!isRiskNonNegInt(v.targetLevel) || RISK_LEVELS.indexOf(v.targetLevel) === -1) {
+      return recFail('invalid_recommendation_output', 'versions.targetLevel 不是 1–5 的风险上限');
+    }
+    if (v.ruleVersion !== RISK_RULE_VERSION || v.targetVersion !== RISK_TARGET_VERSION) {
+      return recFail('invalid_rule_version', '建议结果绑定的规则或目标版本不是当前可用版本');
+    }
+
+    function rows6(list, label, keys) {
+      var rows = copyRiskDenseDataArray(list);
+      if (rows === null || rows.length !== RISK_CLASSES.length) {
+        return { bad: label + ' 必须恰好按冻结顺序给出六个类别' };
+      }
+      for (var i = 0; i < rows.length; i++) {
+        if (!hasExactRiskKeys(rows[i], keys, keys)) return { bad: label + ' 第 ' + (i + 1) + ' 项字段不符合冻结契约' };
+        if (rows[i].assetClass !== RISK_CLASSES[i]) return { bad: label + ' 第 ' + (i + 1) + ' 项不是冻结的资产类别顺序' };
+      }
+      return { rows: rows };
+    }
+
+    var cur = rows6(o.currentAllocation, 'currentAllocation', RECOMMENDATION_CURRENT_ROW_KEYS);
+    if (cur.bad) return recFail('invalid_recommendation_output', cur.bad);
+    for (var ci = 0; ci < cur.rows.length; ci++) {
+      if (!isRiskNonNegInt(cur.rows[ci].valueMinor)) {
+        return recFail('invalid_recommendation_output', 'currentAllocation 必须是整数最小货币单位');
+      }
+      if (cur.rows[ci].pctBps !== null && !isRiskNonNegInt(cur.rows[ci].pctBps)) {
+        return recFail('invalid_recommendation_output', 'currentAllocation 的比例非法');
+      }
+    }
+    var classSum = 0;
+    cur.rows.forEach(function (x) { classSum += x.valueMinor; });
+
+    var ranges = rows6(o.targetRanges, 'targetRanges', RECOMMENDATION_RANGE_ROW_KEYS);
+    if (ranges.bad) return recFail('invalid_recommendation_output', ranges.bad);
+    var tplClasses = {}, rangeBad = false;
+    ranges.rows.forEach(function (x) {
+      ['minBps', 'targetBps', 'maxBps'].forEach(function (key) {
+        if (!isRiskNonNegInt(x[key]) || x[key] > BPS_TOTAL) rangeBad = true;
+      });
+      tplClasses[x.assetClass] = { minBps: x.minBps, targetBps: x.targetBps, maxBps: x.maxBps };
+    });
+    if (rangeBad) return recFail('invalid_proportion', '目标区间的比例非法');
+    // 区间直接复用 5A 的模板校验（Σtarget 精确 10000、min<=target<=max、内容与版本一致）：
+    // 建议里显示的目标区间必须能被冻结模板解释，不接受「自洽但被换过的一组比例」。
+    var tplCheck = validateTargetTemplate({
+      level: v.targetLevel, templateVersion: v.targetVersion, classes: tplClasses
+    });
+    if (!tplCheck.ok) return { ok: false, error: tplCheck.error };
+
+    var devs = rows6(o.deviations, 'deviations', RECOMMENDATION_DEVIATION_ROW_KEYS);
+    if (devs.bad) return recFail('invalid_recommendation_output', devs.bad);
+    for (var di = 0; di < devs.rows.length; di++) {
+      var d = devs.rows[di], range = tplClasses[d.assetClass];
+      if (d.minBps !== range.minBps || d.targetBps !== range.targetBps || d.maxBps !== range.maxBps) {
+        return recFail('invalid_recommendation_output', 'deviations 与 targetRanges 不是同一份区间');
+      }
+      if (d.pctBps === null) {
+        if (d.band !== null || d.deviationBps !== null) {
+          return recFail('invalid_recommendation_output', '没有比例时不得给出偏离');
+        }
+        continue;
+      }
+      if (d.pctBps !== cur.rows[di].pctBps) {
+        return recFail('invalid_recommendation_output', 'deviations 的比例与 currentAllocation 不一致');
+      }
+      if (d.deviationBps !== d.pctBps - d.targetBps) {
+        return recFail('invalid_recommendation_output', '偏离值必须是同一份比例与目标的差');
+      }
+      if (compareToRange(d.pctBps, d.minBps, d.maxBps) !== d.band) {
+        return recFail('invalid_recommendation_output', '容忍带与比例不符');
+      }
+    }
+
+    var allocs = rows6(o.categoryAllocations, 'categoryAllocations', RECOMMENDATION_CLASS_TARGET_KEYS);
+    if (allocs.bad) return recFail('invalid_recommendation_output', allocs.bad);
+    var allocSum = 0, todoClasses = [];
+    for (var ai = 0; ai < allocs.rows.length; ai++) {
+      var a = allocs.rows[ai];
+      if (NEW_FUND_CLASS_BASES.indexOf(a.basis) === -1) {
+        return recFail('invalid_recommendation_output', 'categoryAllocations 的 basis 不在冻结词表内');
+      }
+      if (!isRiskNonNegInt(a.allocatedMinor)) {
+        return recFail('invalid_recommendation_output', '类别分配必须是非负整数最小货币单位（绝不返回负数或卖出指令）');
+      }
+      if ((a.minNeedMinor !== null && !isRiskNonNegInt(a.minNeedMinor))
+        || (a.targetNeedMinor !== null && !isRiskNonNegInt(a.targetNeedMinor))) {
+        return recFail('invalid_recommendation_output', '缺口金额必须是非负整数或 null');
+      }
+      if (a.goalBps !== null && !isRiskNonNegInt(a.goalBps)) {
+        return recFail('invalid_recommendation_output', 'goalBps 非法');
+      }
+      if (a.basis === 'above_max' && a.allocatedMinor !== 0) {
+        return recFail('invalid_recommendation_output', '高配类别不得得到新增资金');
+      }
+      if (a.basis === 'at_or_above_target' && a.allocatedMinor !== 0) {
+        return recFail('invalid_recommendation_output', '已在目标之上的类别不得再追加新增资金');
+      }
+      var items = copyRiskDenseDataArray(a.instruments);
+      if (items === null) return recFail('invalid_recommendation_output', 'instruments 必须是稠密数组');
+      var itemSum = 0;
+      for (var ii = 0; ii < items.length; ii++) {
+        var it = items[ii];
+        if (!hasExactRiskKeys(it, RECOMMENDATION_INSTRUMENT_ROW_KEYS, RECOMMENDATION_INSTRUMENT_ROW_KEYS)
+          || !isRiskNonEmptyString(it.instrumentId) || !isRiskNonNegInt(it.position)
+          || !isRiskNonNegInt(it.allocatedMinor)) {
+          return recFail('invalid_recommendation_output', '认可标的分配行形状非法');
+        }
+        itemSum += it.allocatedMinor;
+      }
+      // 有标的时逐标的之和必须等于类别金额；没有可用标的时金额原样保留为类别级待办（不静默改投）
+      if (items.length && itemSum !== a.allocatedMinor) {
+        return recFail('invalid_recommendation_output', '标的级分配之和与类别级不一致：' + a.assetClass);
+      }
+      if (a.allocatedMinor && !items.length) todoClasses.push(a.assetClass);
+      allocSum += a.allocatedMinor;
+    }
+
+    var rn = o.roundingNote;
+    if (!hasExactRiskKeys(rn, RECOMMENDATION_ROUNDING_NOTE_KEYS, RECOMMENDATION_ROUNDING_NOTE_KEYS)) {
+      return recFail('invalid_recommendation_output', 'roundingNote 字段不符合冻结契约');
+    }
+    if (rn.rule !== NEW_FUND_MONEY_ROUNDING_RULE) {
+      return recFail('invalid_recommendation_output', '尾差规则文字必须来自 5A 冻结的稳定键');
+    }
+    if (NEW_FUND_ADJUSTMENTS.indexOf(rn.adjustment) === -1) {
+      return recFail('invalid_recommendation_output', 'adjustment 不在冻结词表内');
+    }
+    var rnNumbersOk = ['leftoverMinor', 'requestedNewFundsMinor', 'allocatableNewFundsMinor', 'allocatedTotalMinor', 'unallocatedMinor']
+      .every(function (key) { return isRiskNonNegInt(rn[key]); });
+    if (!rnNumbersOk) return recFail('invalid_recommendation_output', 'roundingNote 的金额必须是非负安全整数');
+    if (typeof rn.cappedToAvailable !== 'boolean') {
+      return recFail('invalid_recommendation_output', 'cappedToAvailable 必须是布尔值');
+    }
+    var receivers = copyRiskDenseDataArray(rn.receivers);
+    if (receivers === null) return recFail('invalid_recommendation_output', 'receivers 必须是稠密数组');
+    var receiversOk = receivers.every(function (k) { return RISK_CLASSES.indexOf(k) !== -1; });
+    if (!receiversOk) return recFail('invalid_recommendation_output', '尾差接收类别非法');
+    if (rn.leftoverMinor > receivers.length) {
+      return recFail('invalid_recommendation_output', '尾差必须逐单位说明接收类别');
+    }
+    // 守恒：类别之和 == 实际分配金额 == 可分配 − 未分配（不变量 8）
+    if (allocSum !== rn.allocatedTotalMinor) {
+      return recFail('invalid_recommendation_output', '各类别分配之和必须等于实际分配金额');
+    }
+    if (rn.allocatableNewFundsMinor !== rn.allocatedTotalMinor + rn.unallocatedMinor) {
+      return recFail('invalid_recommendation_output', '可分配金额必须等于已分配与未分配之和');
+    }
+    if (rn.allocatableNewFundsMinor < rn.requestedNewFundsMinor && !rn.cappedToAvailable) {
+      return recFail('invalid_recommendation_output', '实际可分配小于请求金额时必须显式标记上限截断');
+    }
+    if (rn.allocatableNewFundsMinor > rn.requestedNewFundsMinor) {
+      return recFail('invalid_recommendation_output', '可分配金额不得超过用户请求的新增资金');
+    }
+    if (classSum === 0 && rn.allocatedTotalMinor !== 0) {
+      return recFail('invalid_recommendation_output', '没有可依赖的投资池时不得给出分配金额');
+    }
+
+    var codes = copyRiskDenseDataArray(o.explainCodes);
+    if (codes === null) return recFail('invalid_recommendation_output', 'explainCodes 必须是稠密数组');
+    var codeSeen = {};
+    for (var e = 0; e < codes.length; e++) {
+      if (RECOMMENDATION_EXPLAIN_CODES.indexOf(codes[e]) === -1) {
+        return recFail('invalid_recommendation_output', '未知解释码：' + codes[e]);
+      }
+      if (codeSeen[codes[e]]) return recFail('invalid_recommendation_output', '解释码重复给出：' + codes[e]);
+      codeSeen[codes[e]] = true;
+    }
+    if (todoClasses.length && !codeSeen.new_funds_missing_approved_instrument) {
+      return recFail('invalid_recommendation_output', '有金额却没有可用标的时必须给出待办解释码');
+    }
+    return { ok: true, output: riskCopy(o), todoClasses: todoClasses };
+  }
+
+  // 把已通过校验的分片装成冻结输出：拼装位置只有一处，API / 仓储 / 页面不再各写一份形状。
+  function buildRecommendationResult(input) {
+    if (!hasExactRiskKeys(input,
+      ['status', 'blockers', 'dataCutoff', 'versions', 'deviation', 'allocation', 'mapping'],
+      ['status', 'blockers', 'dataCutoff', 'versions', 'deviation', 'allocation', 'mapping'])) {
+      return recFail('invalid_recommendation_output', '组装输入必须只包含 status / blockers / dataCutoff / versions / deviation / allocation / mapping');
+    }
+    var dev = input.deviation, al = input.allocation, mp = input.mapping;
+    if (!isRiskObject(dev) || !isRiskObject(al) || !isRiskObject(mp)) {
+      return recFail('invalid_recommendation_output', '必须传入偏离、分配与标的映射三份同遍结果');
+    }
+    var blockers = copyRiskDenseDataArray(input.blockers);
+    if (blockers === null) return recFail('invalid_recommendation_output', 'blockers 必须是稠密数组');
+    var out = {
+      status: input.status,
+      blockers: blockers.map(function (b) {
+        return { code: b.code == null ? '' : String(b.code), detail: b.detail == null ? '' : String(b.detail) };
+      }),
+      dataCutoff: input.dataCutoff,
+      currentAllocation: dev.classes.map(function (x) {
+        return { assetClass: x.assetClass, valueMinor: x.valueMinor, pctBps: x.pctBps };
+      }),
+      targetRanges: dev.classes.map(function (x) {
+        return { assetClass: x.assetClass, minBps: x.minBps, targetBps: x.targetBps, maxBps: x.maxBps };
+      }),
+      deviations: dev.classes.map(function (x) {
+        return {
+          assetClass: x.assetClass, pctBps: x.pctBps, minBps: x.minBps, maxBps: x.maxBps,
+          targetBps: x.targetBps, band: x.band, deviationBps: x.deviationBps
+        };
+      }),
+      categoryAllocations: mp.classes.map(function (x) {
+        return {
+          assetClass: x.assetClass, basis: x.basis, goalBps: x.goalBps,
+          minNeedMinor: x.minNeedMinor, targetNeedMinor: x.targetNeedMinor,
+          allocatedMinor: x.allocatedMinor, instruments: x.instruments
+        };
+      }),
+      roundingNote: {
+        rule: al.rounding.rule,
+        leftoverMinor: al.rounding.leftoverMinor,
+        receivers: al.rounding.receivers,
+        adjustment: al.adjustment,
+        requestedNewFundsMinor: al.requestedNewFundsMinor,
+        allocatableNewFundsMinor: al.allocatableNewFundsMinor,
+        allocatedTotalMinor: al.allocatedTotalMinor,
+        unallocatedMinor: al.unallocatedMinor,
+        cappedToAvailable: al.cappedToAvailable
+      },
+      explainCodes: al.explainCodes.indexOf('new_funds_missing_approved_instrument') !== -1 || !mp.todos.length
+        ? al.explainCodes
+        : al.explainCodes.concat(['new_funds_missing_approved_instrument']),
+      versions: input.versions
+    };
+    var checked = validateRecommendationOutput(out);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    return { ok: true, result: checked.output, todos: riskCopy(mp.todos) };
+  }
+
+  // 落库记录的读取即复核：伪造「正式」状态、偷换引用或破坏守恒都在这里挡下（与 5B/5C 同纪律）。
+  function validateRecommendationRecord(record) {
+    if (!hasExactRiskKeys(record, RECOMMENDATION_RECORD_KEYS, RECOMMENDATION_RECORD_KEYS)) {
+      return recFail('invalid_recommendation_record', '建议记录字段不符合冻结契约');
+    }
+    if (!isRiskNonEmptyString(record.id) || !isRiskHex64(record.inputHash)) {
+      return recFail('invalid_recommendation_record', '建议记录缺少 id 或 inputHash 不是 64 位十六进制');
+    }
+    if (typeof record.createdAt !== 'string' || !isRiskNonEmptyString(record.createdAt)) {
+      return recFail('invalid_recommendation_record', '建议记录缺少 createdAt');
+    }
+    if (RECOMMENDATION_STATUSES.indexOf(record.status) === -1) {
+      return recFail('invalid_recommendation_record', 'status 不在冻结的建议状态词表内');
+    }
+    var refBad = false;
+    ['ruleVersion', 'targetVersion', 'assessmentId', 'targetId', 'closeId', 'snapshotId', 'dataCutoff', 'asOf']
+      .forEach(function (k) {
+        if (!isRiskNonEmptyString(record[k])) refBad = true;
+      });
+    if (refBad || !isRiskHex64(record.snapshotPayloadHash)) {
+      return recFail('invalid_recommendation_record', '建议记录必须绑定全部不可变引用');
+    }
+    var amountBad = false;
+    ['requestedNewFundsMinor', 'newFundsAvailableMinor', 'allocatableNewFundsMinor', 'allocatedTotalMinor']
+      .forEach(function (k) {
+        if (!isRiskNonNegInt(record[k])) amountBad = true;
+      });
+    if (amountBad) return recFail('invalid_recommendation_record', '金额必须是非负安全整数');
+    if (record.allocatableNewFundsMinor > record.requestedNewFundsMinor
+      || record.allocatableNewFundsMinor > record.newFundsAvailableMinor) {
+      return recFail('invalid_recommendation_record', '可分配金额不得大于请求金额或可新增投资资金');
+    }
+    // D-052：gate 区键集显式化（checks 必需；capture / explanationVersion 可选）。
+    // 多余键或非对象一律拒绝；旧记录的 { checks } / { checks, capture } 形状照常通过。
+    if (!hasExactRiskKeys(record.gate, RECOMMENDATION_GATE_KEYS, RECOMMENDATION_GATE_REQUIRED_KEYS)) {
+      return recFail('invalid_recommendation_record', 'gate 必须是含 checks 的对象，且只允许 capture / explanationVersion 可选键');
+    }
+    if (record.gate.explanationVersion !== undefined
+      && (typeof record.gate.explanationVersion !== 'string' || record.gate.explanationVersion.trim() === '')) {
+      return recFail('invalid_recommendation_record', '解释版本必须是非空字符串');
+    }
+    var gate = recommendationStatusFromGate(record.gate && record.gate.checks);
+    if (!gate.ok) return { ok: false, error: gate.error };
+    if (gate.status !== record.status) {
+      return recFail('invalid_recommendation_record', '门禁结论与状态不符：任一条件不满足都不得标记为正式建议');
+    }
+    var todoRows = copyRiskDenseDataArray(record.todos);
+    if (todoRows === null) return recFail('invalid_recommendation_record', 'todos 必须是稠密数组');
+    for (var t = 0; t < todoRows.length; t++) {
+      var todo = todoRows[t];
+      if (!hasExactRiskKeys(todo, RECOMMENDATION_TODO_ROW_KEYS, RECOMMENDATION_TODO_ROW_KEYS)
+        || RECOMMENDATION_TODO_CODES.indexOf(todo.code) === -1
+        || RISK_CLASSES.indexOf(todo.assetClass) === -1
+        || !isRiskNonNegInt(todo.retainedMinor) || todo.retainedMinor <= 0) {
+        return recFail('invalid_recommendation_record', '第 ' + (t + 1) + ' 项待办不符合冻结契约');
+      }
+    }
+    var res = validateRecommendationOutput(record.result);
+    if (!res.ok) return { ok: false, error: res.error };
+    // 待办必须与「有金额却没有可用标的」的类别逐一对应：两边不一致说明有一侧被改写
+    var todoByClass = {};
+    todoRows.forEach(function (x) { todoByClass[x.assetClass] = x; });
+    if (Object.keys(todoByClass).length !== res.todoClasses.length) {
+      return recFail('invalid_recommendation_record', '类别级待办与未映射类别数量不一致');
+    }
+    var todoSum = 0, unmappedSum = 0;
+    todoRows.forEach(function (x) { todoSum += x.retainedMinor; });
+    res.output.categoryAllocations.forEach(function (row) {
+      if (row.allocatedMinor && !row.instruments.length) unmappedSum += row.allocatedMinor;
+    });
+    if (todoSum !== unmappedSum) {
+      return recFail('invalid_recommendation_record', '待办保留金额与未落到标的的分配不一致');
+    }
+    var v = res.output.versions;
+    if (res.output.status !== record.status) {
+      return recFail('invalid_recommendation_record', '结果状态与记录状态不一致');
+    }
+    if (v.assessmentId !== record.assessmentId || v.targetId !== record.targetId
+      || v.closeId !== record.closeId || v.snapshotId !== record.snapshotId
+      || v.snapshotPayloadHash !== record.snapshotPayloadHash || v.dataCutoff !== record.dataCutoff
+      || v.asOf !== record.asOf || v.ruleVersion !== record.ruleVersion || v.targetVersion !== record.targetVersion) {
+      return recFail('invalid_recommendation_record', '结果内引用的版本与记录绑定不一致');
+    }
+    if (res.output.roundingNote.allocatedTotalMinor !== record.allocatedTotalMinor) {
+      return recFail('invalid_recommendation_record', '实际分配金额与记录不一致');
+    }
+    return { ok: true, record: riskCopy(record), gate: gate };
+  }
+
+  // 建议历史排序：createdAt 降序 → id 升序（与数据库行序无关，不变量 6）。
+  function compareRecommendations(a, b) {
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  }
+
+  function sortRecommendations(list) {
+    var rows = copyRiskDenseDataArray(list);
+    if (rows === null) return null;
+    return rows.sort(compareRecommendations);
+  }
+
+  // 契约快照：迁移 / 仓储 / API / 页面从这里取键集合与词表，不得各自硬编码（D-025）。
+  function recommendation5DContract() {
+    return riskCopy({
+      allocationKeys: NEW_FUND_ALLOCATION_KEYS,
+      allocationClassRowKeys: NEW_FUND_CLASS_ROW_KEYS,
+      roundingKeys: NEW_FUND_ROUNDING_KEYS,
+      moneyRoundingRule: NEW_FUND_MONEY_ROUNDING_RULE,
+      adjustments: NEW_FUND_ADJUSTMENTS,
+      classBases: NEW_FUND_CLASS_BASES,
+      explainCodes: RECOMMENDATION_EXPLAIN_CODES,
+      gateChecks: RECOMMENDATION_GATE_CHECKS,
+      instrumentStatuses: RECOMMENDATION_INSTRUMENT_STATUSES,
+      todoCodes: RECOMMENDATION_TODO_CODES,
+      classTargetKeys: RECOMMENDATION_CLASS_TARGET_KEYS,
+      instrumentRowKeys: RECOMMENDATION_INSTRUMENT_ROW_KEYS,
+      versionKeys: RECOMMENDATION_VERSION_KEYS,
+      gateRowKeys: RECOMMENDATION_GATE_ROW_KEYS,
+      gateKeys: RECOMMENDATION_GATE_KEYS,
+      gateRequiredKeys: RECOMMENDATION_GATE_REQUIRED_KEYS,
+      recordKeys: RECOMMENDATION_RECORD_KEYS,
+      outputKeys: RECOMMENDATION_OUTPUT_KEYS,
+      statuses: RECOMMENDATION_STATUSES,
+      errorCodes: RECOMMENDATION_ERROR_CODES,
+      allocationOrder: RISK_CLASSES,
+      ruleVersion: RISK_RULE_VERSION,
+      targetVersion: RISK_TARGET_VERSION,
+      bpsTotal: BPS_TOTAL
+    });
+  }
+
+  /* ================= Phase 5 验收补口 G5-R2：建议封存输入与当前事实的身份比对 =================
+   * 历史建议生成后仍然可读，但事实只要变过，页面就不能再把它说成当前「全部门禁通过」——
+   * 「当时通过」不等于「当前可执行」。这里只回答一件事：**封存的输入与当前事实还是同一份吗**。
+   *   - 不重算偏离、不重跑门禁、不产出任何金额（不变量 3：判断仍来自服务端与计算时的门禁）；
+   *   - 页面拿到 reason 码自行翻译文案（js/app.js 的 ADVICE_STALE_LABELS），本层不含任何 UI 文本。 */
+  function canonicalJson(value) {
+    if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+    if (value && typeof value === 'object') {
+      return '{' + Object.keys(value).sort().map(function (k) {
+        return JSON.stringify(k) + ':' + canonicalJson(value[k]);
+      }).join(',') + '}';
+    }
+    return JSON.stringify(value === undefined ? null : value);
+  }
+
+  // 与 server/recommendations.js 的 normalizeInput 同一口径：先按内容给数组排序，再按键序序列化。
+  // 封存的 gate.capture 已按该口径存盘，页面读到的资产原文是数据库行序，两边都排过才可比。
+  function factSignature(value) {
+    var clone = JSON.parse(JSON.stringify(value === undefined ? null : value));
+    if (clone && typeof clone === 'object' && !Array.isArray(clone)) {
+      Object.keys(clone).forEach(function (k) {
+        if (Array.isArray(clone[k])) {
+          clone[k] = clone[k].slice().sort(function (a, b) {
+            var x = canonicalJson(a), y = canonicalJson(b);
+            return x < y ? -1 : x > y ? 1 : 0;
+          });
+        }
+      });
+    }
+    return canonicalJson(clone);
+  }
+
+  // 认可映射只比「类别 + 标的」这一层身份：读取视图的行带 symbol / status 等派生字段，
+  // 封存行是原始记录，比整行会永远不相等，等于把每份建议都误判成过期。
+  function mappingSignature(rows) {
+    return (rows || []).map(function (r) {
+      return String(r.assetClass) + '|' + String(r.instrumentId);
+    }).sort().join(',');
+  }
+
+  var ADVICE_STALE_REASON_CODES = [
+    'target_not_current',   // 当前没有生效的目标版本（评估或目标已被换掉）
+    'valuation_not_formal', // 服务端 canAdvise=false：行情过期 / 分类未确认等
+    'assessment_changed',   // 页面当前评估已不是建议引用的那一份
+    'target_changed',       // 页面当前目标已不是建议引用的那一份
+    'mapping_changed',      // 认可标的映射被撤销或改过
+    'assets_changed'        // 资产 / 持仓 / 行情 / 汇率与生成时不同
+  ];
+
+  // 估算建议从未声称「门禁通过」，改判过期只会把「未达门槛」和「已过期」两件事混在一起，
+  // 因此只对 formal 产物做身份比对；assetsSig 为 null 表示页面尚未读到资产，不据此判过期。
+  function adviceStaleness(item, view, assetsSig) {
+    if (!item || item.status !== 'formal' || !view) return [];
+    var rec = item.recommendation || {};
+    var capture = (rec.gate && rec.gate.capture) || {};
+    if (view.status !== 'current' || !view.target || !view.assessment) return ['target_not_current'];
+    var reasons = [];
+    if (view.allocation && view.allocation.canAdvise === false) reasons.push('valuation_not_formal');
+    if (rec.assessmentId && view.assessment.id !== rec.assessmentId) reasons.push('assessment_changed');
+    if (rec.targetId && view.target.id !== rec.targetId) reasons.push('target_changed');
+    if (mappingSignature((view.mapping && view.mapping.rows) || []) !==
+        mappingSignature(capture.approvedInstruments || [])) reasons.push('mapping_changed');
+    if (assetsSig != null && factSignature(capture.assets) !== assetsSig) reasons.push('assets_changed');
+    return reasons;
+  }
+
   return {
     CURRENCIES: CURRENCIES,
     POOLS: POOLS,
@@ -2260,6 +3934,68 @@
     targetTemplateForLevel: targetTemplateForLevel,
     compareToRange: compareToRange,
     validateRecommendationRequest: validateRecommendationRequest,
-    recommendationContract: recommendationContract
+    recommendationContract: recommendationContract,
+    /* Phase 5B：风险评估记录与复评机制（D-047）—— 纯函数；派生值一律由 5A 规则重算 */
+    RISK_ASSESSMENT_REQUEST_KEYS: RISK_ASSESSMENT_REQUEST_KEYS,
+    RISK_ASSESSMENT_RECORD_KEYS: RISK_ASSESSMENT_RECORD_KEYS,
+    RISKASSESS_SELECT_NONE_STATES: RISKASSESS_SELECT_NONE_STATES,
+    validateRiskAssessmentRequest: validateRiskAssessmentRequest,
+    computeRiskAssessment: computeRiskAssessment,
+    validateRiskAssessmentRecord: validateRiskAssessmentRecord,
+    compareRiskAssessments: compareRiskAssessments,
+    sortRiskAssessments: sortRiskAssessments,
+    selectCurrentAssessment: selectCurrentAssessment,
+    riskAssessmentContract: riskAssessmentContract,
+    /* Phase 5C：目标配置与认可标的映射（D-048）—— 纯函数；比例只复用 computeOverview 的同一遍估值 */
+    ALLOCATION_TARGET_RECORD_KEYS: ALLOCATION_TARGET_RECORD_KEYS,
+    ALLOCATION_TARGET_CONTENT_KEYS: ALLOCATION_TARGET_CONTENT_KEYS,
+    ALLOCATION_TARGET_STATUSES: ALLOCATION_TARGET_STATUSES,
+    ALLOCATION_DEVIATION_STATUSES: ALLOCATION_DEVIATION_STATUSES,
+    ALLOCATION_MAPPING_ISSUE_CODES: ALLOCATION_MAPPING_ISSUE_CODES,
+    ALLOCATION_ERROR_CODES: ALLOCATION_ERROR_CODES,
+    allocationTargetNaturalKey: allocationTargetNaturalKey,
+    computeAllocationTarget: computeAllocationTarget,
+    validateAllocationTargetRecord: validateAllocationTargetRecord,
+    compareAllocationTargets: compareAllocationTargets,
+    sortAllocationTargets: sortAllocationTargets,
+    selectCurrentTarget: selectCurrentTarget,
+    computeAllocationDeviation: computeAllocationDeviation,
+    validateApprovedMappingRequest: validateApprovedMappingRequest,
+    validateApprovedInstrumentRecord: validateApprovedInstrumentRecord,
+    sortApprovedInstruments: sortApprovedInstruments,
+    checkApprovedMapping: checkApprovedMapping,
+    classesMissingMapping: classesMissingMapping,
+    allocationContract: allocationContract,
+    /* Phase 5D：新增资金优先再平衡与正式建议门禁（D-049）—— 纯函数；估值与偏离只消费 5C 的同一遍结果 */
+    NEW_FUND_ADJUSTMENTS: NEW_FUND_ADJUSTMENTS,
+    NEW_FUND_CLASS_BASES: NEW_FUND_CLASS_BASES,
+    NEW_FUND_ALLOCATION_KEYS: NEW_FUND_ALLOCATION_KEYS,
+    NEW_FUND_CLASS_ROW_KEYS: NEW_FUND_CLASS_ROW_KEYS,
+    NEW_FUND_MONEY_ROUNDING_RULE: NEW_FUND_MONEY_ROUNDING_RULE,
+    RECOMMENDATION_EXPLAIN_CODES: RECOMMENDATION_EXPLAIN_CODES,
+    RECOMMENDATION_GATE_CHECKS: RECOMMENDATION_GATE_CHECKS,
+    RECOMMENDATION_INSTRUMENT_STATUSES: RECOMMENDATION_INSTRUMENT_STATUSES,
+    RECOMMENDATION_TODO_CODES: RECOMMENDATION_TODO_CODES,
+    RECOMMENDATION_ERROR_CODES: RECOMMENDATION_ERROR_CODES,
+    RECOMMENDATION_RECORD_KEYS: RECOMMENDATION_RECORD_KEYS,
+    RECOMMENDATION_GATE_KEYS: RECOMMENDATION_GATE_KEYS,
+    RECOMMENDATION_GATE_REQUIRED_KEYS: RECOMMENDATION_GATE_REQUIRED_KEYS,
+    RECOMMENDATION_VERSION_KEYS: RECOMMENDATION_VERSION_KEYS,
+    computeNewFundsAllocation: computeNewFundsAllocation,
+    mapAllocationToApprovedInstruments: mapAllocationToApprovedInstruments,
+    recommendationStatusFromGate: recommendationStatusFromGate,
+    buildRecommendationResult: buildRecommendationResult,
+    validateRecommendationOutput: validateRecommendationOutput,
+    validateRecommendationRecord: validateRecommendationRecord,
+    compareRecommendations: compareRecommendations,
+    sortRecommendations: sortRecommendations,
+    recommendation5DContract: recommendation5DContract,
+    /* Phase 5 验收补口 G5-R2：建议封存输入与当前事实的身份比对（纯函数，页面只翻译文案） */
+    canonicalJson: canonicalJson,
+    factSignature: factSignature,
+    mappingSignature: mappingSignature,
+    ADVICE_STALE_REASON_CODES: ADVICE_STALE_REASON_CODES,
+    adviceStaleness: adviceStaleness,
+    localTodayISO: localTodayISO
   };
 });

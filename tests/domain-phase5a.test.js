@@ -410,20 +410,30 @@ test('5A-17 容忍带端点含入区间，边界归属唯一', () => {
   assert.deepStrictEqual(Domain.TOLERANCE_BANDS, ['below_min', 'within', 'above_max']);
 });
 
-/* ------------------- 6. 范围守卫（5A 不做迁移 / API / 页面） ------------------- */
+/* ------------------- 6. 范围守卫（5A 零迁移；5B 只允许按冻结语义交付评估持久化） ------------------- */
 
-test('5A-18 范围守卫：零迁移、零新路由、零网络、零随机、不读系统时钟', () => {
+test('5A-18 范围守卫：5A 段落纯函数零时钟 / 零网络，5B/5C 边界只放开冻结交付物', () => {
   const M = require('../server/migrations.js');
-  assert.strictEqual(M.LATEST_VERSION, 7, '5A 不得新增迁移（5B 起才允许按冻结语义建表）');
+  // 5A 自身零迁移；5B 交付 v8（risk_assessments）、5C 交付 v9（目标版本与认可标的）、
+  // 5D 交付 v10（recommendations 建议产物）。除此之外不得预建后续阶段的表（Phase 6 的决策状态机）。
+  assert.strictEqual(M.LATEST_VERSION, 10, '迁移只允许推进到 5D 的 v10');
+  assert.strictEqual(M.MIGRATIONS[M.MIGRATIONS.length - 1].name, 'phase5d-recommendations');
+  assert.ok(!M.MIGRATIONS.some((m) => /decisions|decision_events/.test(m.name)), 'Phase 6 的表不得预建');
 
   const apiSrc = fs.readFileSync(path.join(ROOT, 'server/api.js'), 'utf8');
-  assert.match(apiSrc, /'POST \/api\/v1\/risk-assessments': 'Phase 5'/, '延后写入登记必须保留');
-  assert.strictEqual((apiSrc.match(/risk/gi) || []).length, 1, '5A 不得新增风险相关路由');
+  // 5A 期间这里是 DEFERRED_WRITES 延后登记；5B 已实现为真实路由（测试见 tests/server-phase5b.test.js）
+  assert.ok(!/'POST \/api\/v1\/risk-assessments': 'Phase 5'/.test(apiSrc), '延后登记应已被真实路由取代');
+  assert.ok(apiSrc.includes("api['POST /api/v1/risk-assessments']"), '5B 必须实现写入路由');
+  assert.ok(apiSrc.includes("api['POST /api/v1/targets']"), '5C 必须实现目标版本写入路由');
+  assert.ok(apiSrc.includes("api['POST /api/v1/approved-instruments']"), '5C 必须实现认可标的写入路由');
+  assert.ok(apiSrc.includes("api['POST /api/v1/recommendations']"), '5D 必须实现建议写入口');
+  assert.ok(!/'POST \/api\/v1\/recommendations': 'Phase 5'/.test(apiSrc), '延后登记应已被真实路由取代');
 
   const domSrc = fs.readFileSync(path.join(ROOT, 'js/domain.js'), 'utf8');
   const start = domSrc.indexOf('风险问卷规则与配置契约（Phase 5A');
-  const end = domSrc.indexOf('RISK_RULE_VERSION: RISK_RULE_VERSION');
-  assert.ok(start > 0 && end > start, '找不到 Phase 5A 段落');
+  // 段落止于 5A 的最后一段（recommendationContract 之后）；5B / 5C 的函数在守卫范围之外单独验收
+  const end = domSrc.indexOf('风险评估记录与复评机制（Phase 5B');
+  assert.ok(start > 0 && end > start, '找不到 Phase 5A 段落边界');
   const seg = domSrc.slice(start, end);
   ['Date.now', 'new Date()', 'fetch(', 'require(', 'XMLHttpRequest', 'Math.random', 'process.env'].forEach((frag) => {
     assert.strictEqual(seg.indexOf(frag), -1, 'Phase 5A 段落不得出现 ' + frag);

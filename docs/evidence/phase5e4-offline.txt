@@ -1,0 +1,12 @@
+2026-09-25 Phase 5E-4 独立离线复测（虚构数据，隔离临时数据库）
+
+服务：docs/evidence/phase5d-wiring-server.cjs，127.0.0.1:18651；fixture 离线 FX provider。
+浏览器：本机无界面 Chrome，新的 Playwright context，Service Worker 允许注册。
+
+1. 在线打开生产首页 /，等待应用就绪与 navigator.serviceWorker.controller 存在。
+2. Cache Storage 的 ledger-v2.4.18-phase5e4 含 ./js/knowledge.js 和 ./（首页缓存壳壳）。
+3. 浏览器切为 offline 后 reload /；页面及 window.Knowledge 仍加载。
+4. 触发 know:open / card-fx-risk；正文展示汇率风险概念，页脚展示“解释版本 1”及“不含你的账户事实，也不构成投资建议”。
+
+结果：通过。该检查证明本次安装后的知识卡可离线读取；不代表首次安装前可离线打开，也不验证财务事实离线写入。
+同轮完整浏览器 wiring：30/30；node --test：627/627；静态检查通过。

@@ -1,0 +1,15 @@
+node --check js/app.js: exit=0
+node --check js/core.js: exit=0
+node --check js/domain.js: exit=0
+node --check js/store.js: exit=0
+node --check js/knowledge.js: exit=0
+node --check sw.js: exit=0
+node --check server/api.js: exit=0
+node --check server/repository.js: exit=0
+node --check server/recommendations.js: exit=0
+node --check tests/app-wiring.js: exit=0
+node --check docs/evidence/phase5-review-20260927/numeric-review.cjs: exit=0
+node --check docs/evidence/phase5-review-20260927/reference-review.cjs: exit=0
+git diff --check: exit=0
+Python browser-review.py syntax: OK
+PHASE5_REVIEW.md local evidence links: OK

@@ -1,0 +1,15 @@
+2026-09-24 / APP_VERSION=2.4.16-phase5e3 / SQLite schema v10
+Provider: fixture.getFxRates; no real market-data provider.
+Run A: http://127.0.0.1:18631/tests/app-wiring.html
+Temporary database: isolated phase5d-wiring-server.cjs temp dir (ledger-fix5d-browser-*)
+Result: 完成：29 项通过，0 项失败 (body[data-result]=pass)
+Run B: http://127.0.0.1:18632/tests/app-wiring.html
+Temporary database: isolated phase5d-wiring-server.cjs temp dir (fresh, independent origin)
+Result: 完成：29 项通过，0 项失败 (body[data-result]=pass)
+Harness: /tmp/opencode/run_wiring_5e3.py (clean Chromium profile per run)
+node --test: 619/619; node --check js/app.js sw.js tests/app-wiring.js: OK; git diff --check: OK
+5E-3 scope verified by C7.11: formal explanation layer, estimate path (tampered product),
+unmapped counter-example (broad_equity cleared -> missing_approved_instrument, instrument-count=0,
+amount retained; remap restores), conservation line, above_max allocated=0.
+Expected console noise: /tests/sw.js 404, negative-path 401/400/415/422 responses.
+No test filtering/skipping.

@@ -25,7 +25,9 @@
       await fn();
       results.push({ name: name, pass: true });
     } catch (error) {
-      results.push({ name: name, pass: false, error: error && error.message || String(error) });
+      var diagnostic = document.querySelector('#view');
+      results.push({ name: name, pass: false, error: (error && error.message || String(error)) +
+        '；页面状态：' + (diagnostic ? diagnostic.textContent.slice(-2200) : '无页面') });
     }
   }
 
@@ -65,6 +67,20 @@
     var el = document.querySelector(selector);
     assert(el, '找不到元素 ' + selector);
     el.click();
+  }
+
+  // 5E-4：页面上的知识卡入口必须且只能指向已知卡（未知 id 不渲染入口，打开时再显式降级）
+  function assertKnowLinksResolve(scope, label) {
+    var links = (scope || document).querySelectorAll('[data-action="know:open"]');
+    for (var i = 0; i < links.length; i++) {
+      var id = links[i].getAttribute('data-card-id');
+      assert(window.Knowledge && window.Knowledge.getCard(id),
+        label + '：入口只允许指向已知知识卡，实际 ' + id);
+    }
+    return links.length;
+  }
+  function knowLink(scope, cardId) {
+    return (scope || document).querySelector('[data-action="know:open"][data-card-id="' + cardId + '"]');
   }
 
   // 3 笔虚构交易的备份文件（覆盖中文、逗号、双引号、转账、两位小数）
@@ -1063,8 +1079,7 @@
 
     await check('收益归因：基准取自已结账月快照，价格+汇率+未分解恒等于估值变化', async function () {
       // 前置：至少要两个已结账月，基准选择器才有可比对象。
-      // 注意：本仓库的「全量写入」是**先清后写**（clearState 会把 monthly_closes / close_snapshots
-      // 一并清掉），前面的持仓场景做过全量写回 —— 所以这里不能假设结账记录还在，缺什么就补什么。
+      // 当前普通保存保留月结与快照；本场景仍显式补齐比较所需的两个基准月。
       // 补造走的是与界面同一个结账接口；核对项不足的月份只会存成**估算**，不会伪造正式口径。
       var cur = new Date();
       var curYm = cur.getFullYear() + '-' + String(cur.getMonth() + 1).padStart(2, '0');
@@ -1111,6 +1126,9 @@
       clickAction('[data-action="nav:home"]');
       await waitFor(function () { return document.querySelector('#view [data-action="nav:close"]'); }, 8000, '决策台结账入口');
       clickAction('#view [data-action="nav:close"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-action="close:detail"][data-id="' + other.snapshot.id + '"]');
+      }, 8000, '月结页已读取新增的历史基准');
       clickAction('[data-action="nav:home"]');
       await waitFor(function () {
         var t2 = document.querySelector('#view [data-attr-totals]');
@@ -1153,12 +1171,18 @@
         '合计必须满足：价格影响 + 汇率影响 + 未分解 = 估值变化');
       equal(Number(totals.getAttribute('data-end')) - Number(totals.getAttribute('data-start')), tChange,
         '估值变化必须等于期末估值 − 期初估值');
+      var attrCard = document.querySelector('#view [data-attribution="ready"]');
+      assert(attrCard && knowLink(attrCard, 'card-fx-risk'), '归因口径说明处应给出汇率风险知识卡入口');
+      assert(assertKnowLinksResolve(attrCard, '归因卡') >= 1, '归因卡应给出知识卡入口');
 
       // 切换期初基准：换成更早那个已结账月后，卡片必须按新基准重算，而不是继续显示旧基准
       var sel = document.querySelector('#view #attr-baseline');
       assert(sel, '归因卡片必须提供期初基准选择器');
       sel.value = other.id;
+      equal(sel.value, other.id, '切换的月结必须在当前选择器中');
       sel.dispatchEvent(new Event('change', { bubbles: true }));
+      equal(document.querySelector('#view #attr-baseline').getAttribute('data-baseline'), other.id,
+        '切换事件必须更新选中基准');
       await waitFor(function () {
         var t2 = document.querySelector('#view [data-attr-totals]');
         return t2 && t2.getAttribute('data-baseline-id') === other.id;
@@ -1242,6 +1266,804 @@
       }
     });
 
+    // C7.9 Phase 5B（S5.1 浏览器层）：问卷只提交原始答案/日期/原因，
+    // 派生值（双评分、等级、硬封顶、上限、到期）全部由服务端按 5A 冻结规则重算。
+    await check('风险评估：问卷提交 → 服务端重算落库 → 结果/复评追加/历史渲染', async function () {
+      var Picked = [
+        ['q_income_stability', 'o_fixed_stable', 3],
+        ['q_emergency_fund', 'o_cover_12m_plus', 3],
+        ['q_debt_pressure', 'o_no_debt', 3],
+        ['q_horizon', 'o_horizon_5_10y', 2],
+        ['q_liquidity_need', 'o_minor_need', 2],
+        ['q_experience', 'o_exp_5y_plus', 3],
+        ['q_knowledge', 'o_know_solid', 3],
+        ['q_drawdown_tolerance', 'o_dd_20_30', 2],
+        ['q_fx_understanding', 'o_fx_clear', 3]
+      ];
+      var CAP_TOTAL = 13, WIL_TOTAL = 11, CEILING = 5;
+
+      function clickAnswer(i) {
+        clickAction('#view input[data-action="risk:answer"][name="' + Picked[i][0] + '"][data-o="' + Picked[i][1] + '"]');
+      }
+      function setAnswer(i) {
+        var el = document.querySelector('#view input[data-action="risk:answer"][name="' + Picked[i][0] + '"][data-o="' + Picked[i][1] + '"]');
+        assert(el, '问卷缺少选项 ' + Picked[i][0] + '/' + Picked[i][1]);
+        el.checked = true;
+        clickAnswer(i);
+      }
+      function cardsWith(re) {
+        return Array.prototype.filter.call(document.querySelectorAll('#view .card'), function (c) {
+          return re.test(c.textContent);
+        });
+      }
+      async function listItems() {
+        var r = await Store.listRiskAssessments();
+        return (r && r.items) || [];
+      }
+      // 服务端是唯一口径：只读接口 / 复算一致性 / 事实源三处必须给出同一条记录
+      async function assertStoredMatches(items, expectedReason) {
+        equal(items.length, 1, '评估记录条数不符');
+        var it = items[0];
+        equal(it.capacityScore, CAP_TOTAL, '承受能力总分应由服务端算出');
+        equal(it.capacityLevel, 5, '承受能力等级应由服务端算出');
+        equal(it.willingnessScore, WIL_TOTAL, '风险意愿总分应由服务端算出');
+        equal(it.willingnessLevel, 5, '风险意愿等级应由服务端算出');
+        equal(it.ceiling, CEILING, '最终上限应由服务端算出');
+        equal(it.ceilingSource, 'equal', '上限来源应由服务端算出');
+        assert(Array.isArray(it.hardCaps) && it.hardCaps.length === 0, '单项 2 分以上的作答不应触发硬封顶');
+        equal(it.reason, expectedReason, '复评原因应原样入库');
+        equal(it.ruleVersion, Domain.RISK_RULE_VERSION, '规则版本应为当前冻结版本');
+        equal(it.assessedAt, Core.todayStr(), '评估日期按提交当天记录');
+        var cur = await Store.riskAssessmentCurrent();
+        equal(cur.status, 'current', '刚保存的评估应为当前有效');
+        equal(cur.current.assessment.id, it.id, '当前判定应指向该记录');
+        equal(cur.current.validity.expiry, it.expiry, '到期日应由服务端按规则推出且两处一致');
+        var st = await apiState();
+        var rows = (st.riskAssessments || []).filter(function (r) { return r.id === it.id; });
+        equal(rows.length, 1, 'SQLite 事实源里应恰好有一条该评估');
+        equal(rows[0].ceiling, CEILING, '事实源中的派生值必须与服务端口径一致');
+        return it;
+      }
+
+      // 空状态：页面 → 风险 → 问卷入口
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:risk"]'); }, 8000, '决策台风险评估入口');
+      clickAction('#view [data-action="nav:risk"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="risk:start"]'); }, 8000, '开始评估问卷入口');
+      equal((await listItems()).length, 0, '开始测试前不应存在已保存的评估（草稿不得冒充已保存）');
+
+      // 取消即丢弃：草稿只存在于内存，未提交不算已保存的评估
+      clickAction('#view [data-action="risk:start"]');
+      await waitFor(function () { return document.querySelector('#view #risk-reason'); }, 5000, '问卷表单');
+      equal(document.querySelectorAll('#view [data-action="risk:answer"]').length,
+        Domain.RISK_QUESTIONS.length * 4, '每道题应渲染全部选项');
+      clickAnswer(0);
+      clickAction('#view [data-action="risk:cancel"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="risk:start"]'); }, 5000, '返回评估列表');
+      clickAction('#view [data-action="risk:start"]');
+      await waitFor(function () { return document.querySelector('#view #risk-reason'); }, 5000, '重新打开问卷');
+      equal(document.querySelectorAll('#view input[data-action="risk:answer"]:checked').length, 0,
+        '取消后重新打开问卷应为空白草稿');
+
+      // 反例：缺答被前端拒绝、不落库；补齐后服务端按 5A 规则重算全部派生值
+      var i;
+      for (i = 0; i < Picked.length - 1; i++) setAnswer(i);
+      document.querySelector('#view #risk-reason').value = 'income_change';
+      clickAction('#view [data-action="risk:submit"]');
+      await waitFor(function () {
+        return document.querySelector('#toast').textContent.indexOf('题未回答') >= 0 &&
+          cardsWith(/风险上限 L/).length === 0;
+      }, 5000, '缺答拒绝提示');
+      equal((await listItems()).length, 0, '缺答被拒绝后不得写入任何评估');
+      setAnswer(Picked.length - 1);
+      clickAction('#view [data-action="risk:submit"]');
+      await waitFor(function () { return cardsWith(/风险上限 L5/).length > 0; }, 8000, '评估结果卡');
+      var saved = await assertStoredMatches(await listItems(), 'income_change');
+      // 答案规范化：9 行、按题目顺序、分值由服务端按目录回填
+      equal(saved.answers.length, Domain.RISK_QUESTIONS.length, '应存 9 行原始答案');
+      for (i = 0; i < Picked.length; i++) {
+        equal(saved.answers[i].questionId, Picked[i][0], '第 ' + (i + 1) + ' 题顺序应为题目 id');
+        equal(saved.answers[i].optionId, Picked[i][1], '第 ' + (i + 1) + ' 题应存所选选项 id');
+        equal(saved.answers[i].score, Picked[i][2], '第 ' + (i + 1) + ' 题分值应由服务端按目录回填');
+      }
+      // 结果解释与历史：双评分、取较低一侧、5C/5D 边界声明
+      assert(cardsWith(/承受能力：13 分/).length > 0, '结果卡应展示承受能力得分');
+      assert(cardsWith(/风险意愿：11 分/).length > 0, '结果卡应展示风险意愿得分');
+      assert(cardsWith(/取.*较低/).length > 0, '结果卡必须说明上限取较低一侧');
+      assert(cardsWith(/5C/).length > 0 && cardsWith(/5D/).length > 0,
+        '结果卡应声明目标区间属 5C、新增资金建议属 5D，本页不做');
+      assert(document.querySelector('#view [data-action="nav:targets"]'),
+        '结果卡应给出通往 5C 目标配置页的入口');
+      assert(document.querySelector('#view').textContent.indexOf('收入变化') >= 0,
+        '当前评估卡应展示触发原因（中文标签）');
+
+      // 反例：客户端伪造派生值 / 缺字段 —— 服务端一律不采信，且错误不回显输入原文
+      var forged = await fetch('/api/v1/risk-assessments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-ledger-token': Store.readSessionToken() },
+        body: JSON.stringify({ answers: [], assessedAt: Core.todayStr(), reason: 'manual', ceiling: 1 })
+      });
+      equal(forged.status, 400, '伪造派生字段/空答案的提交应被拒绝');
+      var forgedBody = await forged.json();
+      equal(forgedBody.error.code, 'invalid_answers', '应返回稳定错误码');
+      assert(String(forgedBody.error.message).indexOf('ceiling') < 0, '错误说明不得回显输入字段名');
+      equal((await listItems()).length, 1, '非法请求不得写入记录');
+
+      // 复评追加新版本：不覆盖历史，两条记录并存且当前指向最新
+      await waitFor(function () {
+        return document.querySelector('#view [data-action="risk:start"][data-reason="manual"]');
+      }, 8000, '复评入口');
+      clickAction('#view [data-action="risk:start"][data-reason="manual"]');
+      await waitFor(function () { return document.querySelector('#view #risk-reason'); }, 5000, '复评问卷');
+      equal(document.querySelectorAll('#view input[data-action="risk:answer"]:checked').length, 0,
+        '复评应是空白草稿，不预填历史答案');
+      equal(document.querySelector('#view #risk-reason').value, 'manual', '复评入口应预置 manual 原因');
+      for (i = 0; i < Picked.length; i++) setAnswer(i);
+      clickAction('#view [data-action="risk:submit"]');
+      await waitFor(async function () { return (await listItems()).length === 2; }, 8000, '第二条评估落库');
+      var items2 = await listItems();
+      equal(items2[0].reason, 'manual', '最新版本应为复评触发');
+      equal(items2[1].reason, 'income_change', '历史版本的原因与答案保持原样');
+      assert(items2[0].id !== items2[1].id, '两条记录应有不同 id');
+      var cur2 = await Store.riskAssessmentCurrent();
+      equal(cur2.status, 'current', '存在未过期评估时应判定为 current');
+      equal(cur2.current.assessment.id, items2[0].id, '当前评估应指向最新一条');
+      await waitFor(function () {
+        return cardsWith(/评估日期 .* · 到期日/).length > 0 &&
+          document.querySelector('#view').textContent.indexOf('手动复评') >= 0;
+      }, 8000, '当前评估日期与触发原因');
+      assert(document.querySelector('#view').textContent.indexOf('评估历史') >= 0,
+        '页面应展示追加式评估历史（永不覆盖）');
+    });
+
+    // C7.10 Phase 5C：目标配置与认可标的映射（生成 → 偏离同源 → 映射维护 → 反例 → 全量保存不抹事实）
+    await check('目标配置：生成目标版本 → 类别偏离与总览同源 → 认可标的维护与反例', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      async function putState(mutate) {
+        var st = await apiState();
+        mutate(st);
+        var res = await fetch('/api/v1/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify({ state: st })
+        });
+        return res;
+      }
+      function cardsWith(re) {
+        return Array.prototype.filter.call(document.querySelectorAll('#view .card'), function (c) {
+          return re.test(c.textContent);
+        });
+      }
+      // 一份 L5 评估（能力 15 / 意愿 12）
+      var CAP = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'capacity'; });
+      var WIL = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'willingness'; });
+      function topAnswers() {
+        return CAP.map(function (q) { return { questionId: q.id, optionId: q.options[0].id }; })
+          .concat(WIL.map(function (q) { return { questionId: q.id, optionId: q.options[0].id }; }));
+      }
+      // 投资池：现金 30,000 + 宽基权益 70,000 + 固收 0；THM 分类未确认（不得成为候选）
+      function wiringAssets() {
+        var today = Core.todayStr();
+        return {
+          assetAccounts: [
+            { id: 'w-acc-cash', name: '投资现金户', kind: 'deposit', pool: 'investable', institution: '虚构机构' },
+            { id: 'w-acc-brk', name: '券商户', kind: 'broker', pool: 'investable', institution: '虚构机构' }
+          ],
+          assetUnits: [{ id: 'w-u-cash', accountId: 'w-acc-cash', currency: 'CNY', balanceMinor: 3000000, asOf: today, sourceType: 'manual' }],
+          liabilities: [], entitlements: [], assetTransfers: [], securityEvents: [], fxRates: [],
+          instruments: [
+            { id: 'w-ins-voo', symbol: 'VOOW', exchange: 'NYSEW', currency: 'USD', name: '宽基一号', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'US', classificationStatus: 'confirmed' },
+            { id: 'w-ins-vgt', symbol: 'VGTW', exchange: 'NYSEW', currency: 'USD', name: '宽基二号', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'US', classificationStatus: 'confirmed' },
+            { id: 'w-ins-thm', symbol: 'THMW', exchange: 'SSE', currency: 'CNY', name: '主题基金', instrumentType: 'fund', assetClass: 'theme_equity', exposureMarket: 'CN', classificationStatus: 'suggested' }
+          ],
+          holdings: [{ id: 'w-h-voo', accountId: 'w-acc-brk', instrumentId: 'w-ins-voo', quantity: '100', costMinor: 1000000, asOf: today }],
+          quotes: [{ instrumentId: 'w-ins-voo', priceMinor: 40000, currency: 'USD', priceDate: today, provider: 'manual', status: 'ok' }]
+        };
+      }
+
+      await Store.clearAll();
+      var seeded = await putState(function (st) {
+        st.assets = wiringAssets();
+        st.riskAssessments = [];
+        st.allocationTargets = [];
+        st.approvedInstruments = [];
+      });
+      equal(seeded.status, 200, '铺设定虚构资产应成功');
+      var ra = await Store.createRiskAssessment(
+        { answers: topAnswers(), assessedAt: Core.todayStr(), reason: 'initial' },
+        { idempotencyKey: Core.newId('ra') });
+      equal(ra.item.ceiling, 5, '前置：该评估的上限为 L5');
+
+      // 决策台入口 → 目标配置页：有评估但未生成目标
+      clickAction('#view [data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:targets"]'); }, 8000, '决策台目标配置入口');
+      clickAction('#view [data-action="nav:targets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="target:generate"]'); }, 8000, '生成目标入口');
+      assert(cardsWith(/还没有生成目标版本/).length > 0, '未生成目标时应显式说明，不显示编造的比例');
+      equal((await Store.listAllocationTargets()).items.length, 0, '生成前不得存在目标版本');
+
+      // 反例：客户端提交派生字段被服务端拒绝，且不落库
+      var forged = await fetch('/api/v1/targets', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+        body: JSON.stringify({ level: 1, classes: {} })
+      });
+      equal(forged.status, 400, '伪造派生字段的目标生成应被拒绝');
+      var forgedBody = await forged.json();
+      equal(forgedBody.error.code, 'invalid_target_payload', '应返回稳定错误码');
+      assert(String(forgedBody.error.message).indexOf('level') < 0, '错误说明不得回显输入字段名');
+      equal((await Store.listAllocationTargets()).items.length, 0, '非法生成不得写入目标');
+
+      // 生成：页面显示的等级与区间必须等于服务端按冻结模板派生的结果
+      clickAction('#view [data-action="target:generate"]');
+      await waitFor(function () { return cardsWith(/目标资产类别区间/).length > 0; }, 8000, '目标版本卡');
+      var cur = await Store.allocationCurrent();
+      equal(cur.status, 'current', '服务端应判定为有生效目标');
+      equal(cur.target.level, 5, '上限 L5 映射到 L5 模板');
+      equal(cur.target.assessmentId, ra.item.id, '目标必须记住它引用的评估');
+      equal(cur.target.effectiveFrom, Core.todayStr(), '缺省生效日期由服务端判定日给出');
+      equal(cur.allocation.classes.reduce(function (s, c) { return s + c.pctBps; }, 0), Domain.BPS_TOTAL,
+        '服务端给出的类别比例必须精确守恒');
+      assert(cardsWith(/上限 L5 · 模板 risk-targets-v1/).length > 0, '页面应展示等级与模板版本');
+      var allocCard = cardsWith(/当前配置与偏离/)[0];
+      assert(allocCard, '应渲染当前配置与偏离卡');
+      equal(allocCard.querySelectorAll('.risk-row').length, Domain.RISK_CLASSES.length, '六个类别各一行');
+      // 与决策台同一遍估值核对：现金 / 宽基权益金额逐分一致（USD 报价按手动汇率折算，两边同源）
+      var ov = await fetch('/api/v1/overview', { headers: { Accept: 'application/json' } }).then(function (r) { return r.json(); });
+      equal(cur.allocation.investableTotalMinor, ov.pools.investableMinor, '投资池总额与总览逐分一致');
+      Domain.RISK_CLASSES.forEach(function (k) {
+        var fromOv = ov.riskClasses.filter(function (x) { return x.assetClass === k; })[0];
+        var row = cur.allocation.classes.filter(function (x) { return x.assetClass === k; })[0];
+        equal(row.valueMinor, fromOv.valueMinor, k + ' 的估值必须来自同一遍计算');
+        equal(row.band, row.pctBps < row.minBps ? 'below_min' : (row.pctBps > row.maxBps ? 'above_max' : 'within'),
+          k + ' 的容忍带归属必须唯一');
+      });
+      // 5D 已实现：目标区块不再只是口头边界，而是把新增资金明确指向下方的 5D 面板
+      assert(allocCard.textContent.indexOf('新增资金怎么分见下方') >= 0,
+        '5C 区块必须把「这笔钱怎么分」指向 5D 面板');
+      assert(allocCard.textContent.indexOf('不接收新增资金金额') < 0,
+        '旧的口头边界文案不应继续声称本页不接收金额');
+
+      // 缺映射：目标比例 > 0 而没有任何认可标的
+      var missingBefore = cur.missingClasses.slice().sort().join(',');
+      assert(allocCard.textContent.indexOf('缺映射') >= 0, '未维护映射时应在偏离表上标出缺映射');
+      assert(missingBefore.indexOf('broad_equity') >= 0, '前置：宽基权益此时缺映射');
+
+      // 维护 UI：只有「已确认且类别一致」的标的才是候选
+      clickAction('#view [data-action="target:reload"]');
+      await waitFor(function () { return document.querySelector('#view #map-pick-broad_equity'); }, 8000, '宽基权益候选下拉');
+      var pick = document.querySelector('#view #map-pick-broad_equity');
+      var pickIds = Array.prototype.map.call(pick.options, function (o) { return o.value; });
+      equal(pickIds.length, 2, '宽基权益应有两个已确认候选');
+      assert(pickIds.indexOf('w-ins-thm') < 0, '分类未确认的标的不得成为认可候选');
+      assert(!document.querySelector('#view #map-pick-theme_equity'), '主题权益没有已确认标的时不给出候选入口');
+
+      // 加入 → 顺序调整：顺序是用户判断，服务端按提交顺序落 position
+      pick.value = 'w-ins-voo';
+      clickAction('#view [data-action="map:add"][data-cls="broad_equity"]');
+      await waitFor(async function () {
+        var v = await Store.listApprovedInstruments();
+        return v.rows.length === 1 && v.rows[0].instrumentId === 'w-ins-voo';
+      }, 8000, '第一条认可标的落库');
+      // 重渲染完成后，已认可的标的从候选下拉里消失，剩下的唯一候选就是 VGT
+      await waitFor(function () {
+        var sel = document.querySelector('#view #map-pick-broad_equity');
+        var opts = sel ? Array.prototype.map.call(sel.options, function (o) { return o.value; }) : [];
+        return opts.length === 1 && opts[0] === 'w-ins-vgt';
+      }, 8000, '候选下拉随映射更新（只剩宽基二号）');
+      pick = document.querySelector('#view #map-pick-broad_equity');
+      pick.value = 'w-ins-vgt';
+      clickAction('#view [data-action="map:add"][data-cls="broad_equity"]');
+      await waitFor(async function () {
+        var v = await Store.listApprovedInstruments();
+        return v.rows.length === 2;
+      }, 8000, '第二条认可标的落库');
+      var v2 = await Store.listApprovedInstruments();
+      equal(v2.rows.map(function (r) { return r.instrumentId; }).join(','), 'w-ins-voo,w-ins-vgt', '按加入顺序排列');
+      equal(v2.rows[0].position, 0);
+      equal(v2.byClass.broad_equity[1].status, 'ok');
+      // 第二个候选已被加入后不再出现在下拉里
+      pick = document.querySelector('#view #map-pick-broad_equity');
+      assert(!pick || Array.prototype.map.call(pick.options, function (o) { return o.value; }).indexOf('w-ins-vgt') < 0,
+        '已认可的标的不得重复出现在候选下拉');
+      var firstId = v2.rows[0].id;
+      clickAction('#view [data-action="map:down"][data-cls="broad_equity"][data-id="' + firstId + '"]');
+      await waitFor(async function () {
+        var v = await Store.listApprovedInstruments();
+        return v.rows[0].instrumentId === 'w-ins-vgt';
+      }, 8000, '顺序调整后写回事实源');
+      var v3 = await Store.listApprovedInstruments();
+      equal(v3.rows.map(function (r) { return r.instrumentId; }).join(','), 'w-ins-vgt,w-ins-voo', '上移/下移只改顺序，不新增行');
+      equal(v3.rows.length, 2, '调整顺序不得产生额外映射记录');
+
+      // 反例：引用未确认标的被服务端拒绝，既有映射保持原样
+      var badMap = await fetch('/api/v1/approved-instruments', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+        body: JSON.stringify({ assetClass: 'theme_equity', instrumentIds: ['w-ins-thm'] })
+      });
+      equal(badMap.status, 422, '引用未确认标的应被拒绝');
+      var badMapBody = await badMap.json();
+      equal(badMapBody.error.code, 'classification_unconfirmed', '应给出稳定的引用失效码');
+      var v4 = await Store.listApprovedInstruments();
+      equal(v4.rows.length, 2, '被拒绝的写入不得改动映射');
+
+      // 缺映射随映射更新而收窄；生成目标不因缺映射被阻止（§6.3）
+      var cur2 = await Store.allocationCurrent();
+      assert(cur2.missingClasses.indexOf('broad_equity') < 0, '已有可用候选的类别不再缺映射');
+      assert(cur2.missingClasses.indexOf('theme_equity') >= 0, '仍无可用候选的类别继续报缺映射');
+      assert(cur2.missingClasses.slice().sort().join(',') !== missingBefore, '缺映射清单随用户维护而更新');
+
+      // 记账式全量保存（页面 save() 只带五键 + assets）经 Store 门面后不得抹掉三份追加式事实。
+      // 注意：直接 PUT /api/v1/state 的「缺键清空」是 5B 已冻结的服务端语义，不在本条断言范围内。
+      var st5 = await apiState();
+      await Store.saveAll({ accounts: [], categories: [], txns: [], settings: st5.settings, assets: st5.assets });
+      var after2 = await Store.allocationCurrent();
+      equal(after2.status, 'current', '门面补回后目标版本仍然存在');
+      equal(after2.target.id, cur.target.id, '且仍是同一版本（未被覆盖或重生成）');
+      var hist = await Store.listAllocationTargets();
+      equal(hist.items.length, 1, '目标历史保持追加式单版本');
+      equal(hist.invalidCount, 0, '历史列表复核不得把合法目标判为异常');
+      equal((await Store.listApprovedInstruments()).rows.length, 2, '全量保存后用户映射逐条保持');
+      equal((await Store.listRiskAssessments()).items.length, 1, '全量保存后评估仍然可读');
+      // 反向：显式给出空集合时才清空（旧备份恢复语义），三条集合一起受控
+      await Store.saveAll({
+        accounts: [], categories: [], txns: [], settings: st5.settings, assets: st5.assets,
+        allocationTargets: [], approvedInstruments: []
+      });
+      var wiped = await Store.allocationCurrent();
+      equal(wiped.status, 'no_target', '显式提交空集合才是清空指令');
+      equal((await Store.listApprovedInstruments()).rows.length, 0);
+      equal((await Store.listRiskAssessments()).items.length, 1, '未提到的评估集合保持原样');
+    });
+
+    // C7.11 Phase 5D：新增资金优先再平衡与正式建议门禁
+    await check('新增资金建议：页面生成正式建议 → 金额守恒且只引用认可标的 → 门禁不过时只给估算', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      var today = Domain.localTodayISO();
+      // 结账核对以「当月月末」为截止日，而建议门禁按服务端今天判定新鲜度：
+      // 两个日期的行情 / 汇率都要可见，否则月末结账与今天的建议无法同时是正式口径。
+      var ty = Number(today.slice(0, 4)), tm = Number(today.slice(5, 7));
+      var monthEnd = today.slice(0, 8) + String(new Date(Date.UTC(ty, tm, 0)).getUTCDate()).padStart(2, '0');
+      var quoteDates = Array.from(new Set([today, monthEnd]));
+      function quoteRows(ins, price, currency) {
+        return quoteDates.map(function (d) {
+          return { instrumentId: ins, priceMinor: price, currency: currency, priceDate: d, provider: 'manual', status: 'ok' };
+        });
+      }
+      var CAP = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'capacity'; });
+      var WIL = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'willingness'; });
+
+      async function putState(state) {
+        return fetch('/api/v1/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify({ state: state })
+        });
+      }
+      function apiPost(path, body) {
+        return fetch('/api/v1/' + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify(body)
+        }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); });
+      }
+      // 一份「现金高配 + 宽基权益 / 主题低配」的干净事实（全部当天数据 → 估值可以是正式口径）
+      function adviceAssets() {
+        var a = Domain.emptyAssets();
+        a.assetAccounts = [
+          { id: 'd5-acc-cash', name: '投资现金户', kind: 'deposit', pool: 'investable', institution: 'D5' },
+          { id: 'd5-acc-broker', name: '券商户', kind: 'broker', pool: 'investable', institution: 'D5' },
+          { id: 'd5-acc-safe', name: '应急金', kind: 'deposit', pool: 'safety', institution: 'D5' }
+        ];
+        a.assetUnits = [
+          { id: 'd5-u-cny', accountId: 'd5-acc-cash', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' },
+          { id: 'd5-u-safe', accountId: 'd5-acc-safe', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' }
+        ];
+        a.instruments = [
+          { id: 'd5-ins-bond', symbol: 'D5BND', exchange: 'NASDAQ', currency: 'USD', name: '债基', instrumentType: 'etf', assetClass: 'fixed_income', exposureMarket: 'US', classificationStatus: 'confirmed' },
+          { id: 'd5-ins-voo', symbol: 'D5VOO', exchange: 'SSE', currency: 'CNY', name: '宽基A', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' },
+          { id: 'd5-ins-vgt', symbol: 'D5VGT', exchange: 'SSE', currency: 'CNY', name: '宽基B', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' },
+          { id: 'd5-ins-thm', symbol: 'D5THM', exchange: 'SSE', currency: 'CNY', name: '主题', instrumentType: 'fund', assetClass: 'theme_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' }
+        ];
+        a.holdings = [
+          { id: 'd5-h-bond', accountId: 'd5-acc-broker', instrumentId: 'd5-ins-bond', quantity: '5000', costMinor: 5000000, asOf: today },
+          { id: 'd5-h-voo', accountId: 'd5-acc-broker', instrumentId: 'd5-ins-voo', quantity: '50000', costMinor: 5000000, asOf: today },
+          { id: 'd5-h-thm', accountId: 'd5-acc-broker', instrumentId: 'd5-ins-thm', quantity: '70000', costMinor: 7000000, asOf: today }
+        ];
+        a.quotes = quoteRows('d5-ins-bond', 1000, 'USD')
+          .concat(quoteRows('d5-ins-voo', 100, 'CNY'))
+          .concat(quoteRows('d5-ins-thm', 100, 'CNY'));
+        a.fxRates = quoteDates.map(function (d) {
+          return { base: 'USD', quote: 'CNY', rateDecimal: '7.0000', rateDate: d, provider: 'manual', status: 'ok' };
+        });
+        return a;
+      }
+
+      // 事实链：整份状态（含清空四集合）→ 正式月结 → 评估 → 目标 → 认可标的
+      var base = await apiState();
+      var seeded = Object.assign({}, base, {
+        accounts: [], categories: [], txns: [], settings: {}, assets: adviceAssets(),
+        riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: []
+      });
+      equal((await putState(seeded)).status, 200, '5D 前置状态写入');
+      var closed = await apiPost('monthly-closes', { month: today.slice(0, 7) });
+      equal(closed.json.close.status, 'formal', '前置：当天数据必须能正式结账');
+      var answers = [];
+      CAP.forEach(function (q, i) { answers.push({ questionId: q.id, optionId: q.options.filter(function (o) { return o.score === [1, 1, 1, 2, 2][i]; })[0].id }); });
+      WIL.forEach(function (q, i) { answers.push({ questionId: q.id, optionId: q.options.filter(function (o) { return o.score === [2, 2, 1, 1][i]; })[0].id }); });
+      var assessed = await apiPost('risk-assessments', { answers: answers, assessedAt: today, reason: 'initial' });
+      equal(assessed.status, 201, '前置：评估必须落库');
+      equal((await apiPost('targets', {})).status, 201, '前置：目标版本必须生成');
+      var mapped = await apiPost('approved-instruments', {
+        assetClass: 'broad_equity', instrumentIds: ['d5-ins-voo', 'd5-ins-vgt']
+      });
+      equal(mapped.status, 200, '前置：宽基权益必须有认可标的');
+
+      // 页面路径：目标配置页输入金额 → 生成分配建议
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:targets"]'); }, 8000, '5D 决策台目标配置入口');
+      clickAction('[data-action="nav:targets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="target:reload"]'); }, 8000, '目标配置重新读取入口');
+      clickAction('#view [data-action="target:reload"]');
+      await waitFor(function () { return document.querySelector('#view').textContent.indexOf('D5VOO') >= 0; }, 8000, '5D 前置事实同步到页面');
+      await waitFor(function () { return document.querySelector('#view [data-action="advice:run"]'); }, 8000, '新增资金建议入口');
+      var amount = document.querySelector('#view [data-input="advice:amount"]');
+      amount.value = '2000';
+      amount.dispatchEvent(new Event('input', { bubbles: true }));
+      clickAction('#view [data-action="advice:run"]');
+      await waitFor(function () {
+        return /追溯：快照/.test(document.querySelector('#view').textContent);
+      }, 8000, '建议结果卡（含追溯信息）');
+      var viewText = document.querySelector('#view').textContent;
+      assert(/正式建议/.test(viewText), '门禁全过时页面应显示正式建议');
+      assert(!/估算建议（未达正式门槛）/.test(viewText), '全过时不得同时显示估算口径');
+
+      var listed = await Store.listRecommendations();
+      equal(listed.total, 1, '建议产物只落一行');
+      equal(listed.invalidCount, 0, '读取复核必须通过');
+      var item = listed.items[0];
+      equal(item.status, 'formal');
+      equal(item.requestedNewFundsMinor, 200000, '金额按「元 → 最小货币单位」原样绑定');
+      var res = item.result;
+      equal(res.versions.snapshotPayloadHash.length, 64, '必须绑定封存快照哈希');
+      equal(res.dataCutoff, item.dataCutoff);
+      var alloc = {};
+      res.categoryAllocations.forEach(function (c) { alloc[c.assetClass] = c; });
+      equal(alloc.broad_equity.allocatedMinor, 200000, 'S5.2：宽基低配时 2,000 元全部优先补宽基');
+      equal(Object.keys(alloc).length, 6, '六类必须逐类给出，顺序固定');
+      equal(res.categoryAllocations.map(function (c) { return c.assetClass; }).join(','),
+        Domain.RISK_CLASSES.join(','), '类别顺序不得随对象或数据库行序变化');
+      var sum = Domain.RISK_CLASSES.reduce(function (acc, k) { return acc + alloc[k].allocatedMinor; }, 0);
+      equal(sum, res.roundingNote.allocatedTotalMinor, 'Σ类别 == 实际分配金额');
+      equal(res.roundingNote.allocatedTotalMinor + res.roundingNote.unallocatedMinor,
+        res.roundingNote.allocatableNewFundsMinor, '守恒');
+      Domain.RISK_CLASSES.forEach(function (k) {
+        assert(alloc[k].allocatedMinor >= 0, k + ' 绝不得出现负金额');
+        if (alloc[k].basis === 'above_max') equal(alloc[k].allocatedMinor, 0, '高配类别不加仓');
+        (alloc[k].instruments || []).forEach(function (i) { assert(i.allocatedMinor >= 0); });
+        var instSum = (alloc[k].instruments || []).reduce(function (acc, i) { return acc + i.allocatedMinor; }, 0);
+        if ((alloc[k].instruments || []).length) equal(instSum, alloc[k].allocatedMinor, '标的级之和等于类别级');
+      });
+      // 只引用用户事先认可的标的
+      var ids = alloc.broad_equity.instruments.map(function (i) { return i.instrumentId; }).sort().join(',');
+      if (alloc.broad_equity.allocatedMinor) equal(ids, 'd5-ins-vgt,d5-ins-voo', '落到证券时只能用认可标的');
+      else equal(alloc.broad_equity.instruments.length, 0);
+      assert(viewText.indexOf(Core.fmtMoney(res.roundingNote.allocatedTotalMinor)) >= 0,
+        '页面显示的分配合计必须来自服务端产物');
+      assert(!Array.from(document.querySelectorAll('#view button, #view a')).some(function (el) {
+        return /接受|已执行|暂缓/.test(el.textContent);
+      }), '5D 页面不得出现 Phase 6 的决策动作');
+
+      // 5E-3 建议解释：只搬运服务端 explainCodes / roundingNote / categoryAllocations / todos
+      var advEl = document.querySelector('#view [data-advice-result]');
+      assert(advEl, '建议结果块应有 data-advice-result');
+      equal(advEl.getAttribute('data-advice-status'), 'formal', '门禁全过时状态角标应为 formal');
+      equal(advEl.getAttribute('data-advice-adjustment'), res.roundingNote.adjustment,
+        '排序/调整结论应与 API roundingNote.adjustment 相同');
+      equal(Number(advEl.getAttribute('data-advice-requested')), res.roundingNote.requestedNewFundsMinor,
+        '请求金额 data 应与 API 相同');
+      equal(Number(advEl.getAttribute('data-advice-allocatable')), res.roundingNote.allocatableNewFundsMinor,
+        '可分配 data 应与 API 相同');
+      equal(Number(advEl.getAttribute('data-advice-allocated')), res.roundingNote.allocatedTotalMinor,
+        '实际分配 data 应与 API 相同');
+      equal(Number(advEl.getAttribute('data-advice-unallocated')), res.roundingNote.unallocatedMinor,
+        '未分配 data 应与 API 相同');
+      equal(Number(advEl.getAttribute('data-advice-allocated')) +
+        Number(advEl.getAttribute('data-advice-unallocated')),
+        Number(advEl.getAttribute('data-advice-allocatable')),
+        '页面 data 层同样守恒：分配 + 未分配 = 可分配');
+      assert(viewText.indexOf('守恒：实际分配') >= 0, '页面应显式给出守恒公式');
+      var explainAttr = advEl.getAttribute('data-advice-explain') || '';
+      equal(explainAttr, (res.explainCodes || []).join(','), 'explainCodes 列表应与 API 相同');
+      (res.explainCodes || []).forEach(function (code) {
+        assert(advEl.querySelector('[data-explain-code="' + code + '"]'),
+          '应渲染解释码 ' + code + ' 的固定文案');
+      });
+      var orderEl = advEl.querySelector('[data-advice-order]');
+      assert(orderEl && /排序依据/.test(orderEl.textContent), '应有类别排序依据说明');
+      assert(knowLink(orderEl, 'card-new-funds-first'), '排序依据应给出新增资金优先知识卡入口');
+      if (explainAttr.indexOf('new_funds_below_min_first') >= 0) {
+        assert(/先补低于区间下限/.test(orderEl.textContent), '存在低配时排序依据须写清先补下限');
+      }
+      var cashEl = advEl.querySelector('[data-advice-cash-floor]');
+      assert(cashEl && /现金保底/.test(cashEl.textContent), '应有现金保底说明');
+      assert(/保留现金配置下限/.test(cashEl.textContent), '现金保底须说明保留配置下限');
+      if (res.roundingNote.unallocatedMinor > 0) {
+        assert(cashEl.textContent.indexOf(Core.fmtMoney(res.roundingNote.unallocatedMinor)) >= 0,
+          '有未分配时现金保底段应显示未分配金额');
+      }
+      var nosellEl = advEl.querySelector('[data-advice-nosell]');
+      assert(nosellEl && /默认不卖出/.test(nosellEl.textContent), '应有默认不卖出的具体原因');
+      assert(knowLink(nosellEl, 'card-no-sell'), '默认不卖出处应给出知识卡入口');
+      assert(assertKnowLinksResolve(advEl, '建议结果') >= 2, '建议结果应给出新增资金与不卖出两个知识卡入口');
+      var CLASS_TEXT = {
+        cash: '现金', fixed_income: '固收', broad_equity: '宽基权益',
+        theme_equity: '主题权益', stock: '个股', other: '其他'
+      };
+      var aboveMaxOnPage = res.categoryAllocations.filter(function (c) { return c.basis === 'above_max'; });
+      assert(aboveMaxOnPage.length > 0, '当前 fixture 应包含高配类别，才能验证高配为零的可见解释');
+      if (aboveMaxOnPage.length) {
+        assert(/高配/.test(nosellEl.textContent) && /不生成卖出指令|只提示风险/.test(nosellEl.textContent),
+          '存在高配时须说明高配只提示风险、不卖出');
+        assert(nosellEl.textContent.indexOf(CLASS_TEXT[aboveMaxOnPage[0].assetClass] || aboveMaxOnPage[0].assetClass) >= 0,
+          '不卖出原因应点名具体高配类别');
+      }
+      var roundingEl = advEl.querySelector('[data-advice-rounding]');
+      assert(roundingEl, '应有尾差说明块');
+      equal(Number(roundingEl.getAttribute('data-leftover')), res.roundingNote.leftoverMinor,
+        '尾差 data 应与 API 相同');
+      equal(roundingEl.getAttribute('data-receivers'), (res.roundingNote.receivers || []).join(','),
+        '尾差承接类别 data 应与 API 相同');
+      assert(roundingEl.textContent.indexOf(res.roundingNote.rule) >= 0, '尾差须展示冻结排序规则原文');
+      Domain.RISK_CLASSES.forEach(function (k) {
+        var row = advEl.querySelector('[data-advice-cls="' + k + '"]');
+        assert(row, '页面应有类别行 ' + k);
+        equal(row.getAttribute('data-allocated'), String(alloc[k].allocatedMinor),
+          k + ' 页面分配应与 API 相同');
+        equal(row.querySelector('[data-advice-visible-amount]').textContent,
+          Core.fmtMoney(alloc[k].allocatedMinor), k + ' 可见金额应与 API 相同，明确显示计算出的零');
+        equal(row.getAttribute('data-basis'), alloc[k].basis, k + ' 页面 basis 应与 API 相同');
+        equal(Number(row.getAttribute('data-instrument-count')), (alloc[k].instruments || []).length,
+          k + ' 标的数应与 API 相同');
+      });
+      var mappedRow = advEl.querySelector('[data-advice-cls="broad_equity"]');
+      assert(mappedRow && mappedRow.getAttribute('data-instrument-count') !== '0',
+        '已映射且有金额的类别应列出认可标的');
+      assert(mappedRow.textContent.indexOf('D5VOO') >= 0 && mappedRow.textContent.indexOf('D5VGT') >= 0,
+        '认可标的符号应来自服务端 instruments');
+
+      // 5E-5 审计追溯（封存分支）：月结基准 / 计算日输入 / 版本与记录 / 解释版本 四组只搬运服务端字段
+      var trace = advEl.querySelector('[data-advice-trace]');
+      assert(trace, '建议详情应有审计追溯区 data-advice-trace');
+      var baseline = trace.querySelector('[data-advice-trace-baseline]');
+      assert(baseline, '追溯区必须有月结基准组');
+      equal(baseline.getAttribute('data-close-id'), item.closeId, '追溯区应显示记录绑定的月结 id');
+      equal(baseline.getAttribute('data-snapshot-id'), item.snapshotId, '追溯区应显示记录绑定的快照 id');
+      equal(baseline.getAttribute('data-snapshot-hash'), item.snapshotPayloadHash, '快照哈希必须是记录绑定的哈希');
+      equal(baseline.getAttribute('data-cutoff'), item.dataCutoff, '月结数据截止与记录一致');
+      assert(baseline.textContent.indexOf('月结快照是基准，不等同于计算输入') >= 0,
+        '必须显式区分月结基准与计算输入，不得混称同一时点');
+      var traceInput = trace.querySelector('[data-advice-trace-input]');
+      assert(traceInput, '追溯区必须有计算日输入组');
+      equal(traceInput.getAttribute('data-as-of'), item.asOf, '计算判定日与记录一致');
+      equal(traceInput.getAttribute('data-input-hash'), item.inputHash, '计算输入必须是记录的完整 inputHash');
+      equal(traceInput.getAttribute('data-algorithm'), 'cash-reallocation-v1', '算法版本应为 5D 冻结的 cash-reallocation-v1');
+      var traceVer = trace.querySelector('[data-advice-trace-versions]');
+      assert(traceVer, '追溯区必须有版本与记录组');
+      equal(traceVer.getAttribute('data-rec-id'), item.id, '建议 id 与库一致');
+      equal(traceVer.getAttribute('data-payload-hash'), item.payloadHash, '建议 payloadHash 与读取视图一致');
+      equal(traceVer.getAttribute('data-rule-version'), Domain.RISK_RULE_VERSION, '规则版本来自服务端');
+      equal(traceVer.getAttribute('data-target-version'), item.targetVersion, '目标版本与记录一致');
+      equal(traceVer.getAttribute('data-assessment-id'), item.assessmentId, '评估 id 与记录一致');
+      equal(traceVer.getAttribute('data-target-id'), item.targetId, '目标 id 与记录一致');
+      assert(trace.textContent.indexOf('评估 ' + item.assessmentId) >= 0, '追溯文本写明评估引用');
+      // 解释版本：新建议已封存，页面显示必须与库里的记录和当前知识卡目录一致
+      equal(item.gate.explanationVersion, window.Knowledge.EXPLANATION_VERSION, '库里的建议应封存生成时解释版本');
+      var seal = trace.querySelector('[data-advice-explain-seal]');
+      assert(seal, '追溯区必须有解释版本组');
+      equal(seal.getAttribute('data-sealed'), '1', '新建议应标为已封存解释版本');
+      equal(seal.getAttribute('data-sealed-version'), window.Knowledge.EXPLANATION_VERSION, '封存版本号与库一致');
+      equal(seal.getAttribute('data-current-version'), window.Knowledge.EXPLANATION_VERSION, '当前知识卡版本与目录一致');
+      assert(seal.textContent.indexOf('本条建议生成时封存') >= 0, '已封存必须写明生成时封存');
+      assert(seal.textContent.indexOf('非生成时封存版本') === -1, '已封存建议不得出现未封存标注');
+
+      // 反例 1：客户端提交自己的映射 → 服务端拒绝，不落库
+      var forged = await apiPost('recommendations', {
+        snapshotRef: { closeId: closed.json.close.id, snapshotId: closed.json.snapshot.id, payloadHash: closed.json.snapshot.payloadHash },
+        assessmentRef: { id: assessed.json.item.id, ruleVersion: assessed.json.item.ruleVersion },
+        targetVersion: Domain.RISK_TARGET_VERSION, ruleVersion: Domain.RISK_RULE_VERSION,
+        newFundsMinor: 200000, approvedInstruments: { theme_equity: ['d5-ins-thm'] }
+      });
+      equal(forged.status, 400, '映射只由服务端读取，不接受请求体');
+      equal(forged.json.error.code, 'invalid_approved_instruments');
+      equal((await Store.listRecommendations()).total, 1, '被拒绝的请求不得留下建议');
+
+      // 反例 2：引用的快照哈希与封存原文不符 → 只给估算，正式建议为空
+      var tampered = await apiPost('recommendations', {
+        snapshotRef: { closeId: closed.json.close.id, snapshotId: closed.json.snapshot.id, payloadHash: 'f'.repeat(64) },
+        assessmentRef: { id: assessed.json.item.id, ruleVersion: assessed.json.item.ruleVersion },
+        targetVersion: Domain.RISK_TARGET_VERSION, ruleVersion: Domain.RISK_RULE_VERSION,
+        newFundsMinor: 100000
+      });
+      equal(tampered.status === 200 || tampered.status === 201, true, '门禁不过不是 HTTP 错误');
+      equal(tampered.json.status, 'estimate');
+      equal(tampered.json.formalRecommendation, null, '哈希异常时正式建议必须为空');
+      assert(tampered.json.estimate.blockers.some(function (b) { return b.code === 'snapshot_hash_mismatch'; }),
+        '要显式说明是哪条门禁挡下的');
+
+      // 5E-3：门禁失败的估算产物也要能解释 —— 页面只展示估算，blocker 来自 5D 产物
+      var origCreate = Store.createRecommendation;
+      Store.createRecommendation = function () { return Promise.resolve(tampered.json); };
+      try {
+        var amountEst = document.querySelector('#view [data-input="advice:amount"]');
+        amountEst.value = '1000';
+        amountEst.dispatchEvent(new Event('input', { bubbles: true }));
+        clickAction('#view [data-action="advice:run"]');
+        await waitFor(function () {
+          var el = document.querySelector('#view [data-advice-result]');
+          return el && el.getAttribute('data-advice-status') === 'estimate';
+        }, 8000, '估算建议解释块');
+      } finally {
+        Store.createRecommendation = origCreate;
+      }
+      var estEl = document.querySelector('#view [data-advice-result]');
+      equal(estEl.getAttribute('data-advice-status'), 'estimate', '门禁失败时页面状态应为 estimate');
+      assert(estEl.querySelector('[data-blocker="snapshot_hash_mismatch"]'),
+        '估算态应直接展示 5D 产物中的 blocker 码');
+      assert(/估算建议（未达正式门槛）/.test(estEl.textContent), '门禁失败只展示估算标签');
+      assert(!/<b>正式建议<\/b>/.test(estEl.innerHTML),
+        '不得同时冒充正式建议');
+      var estRes = tampered.json.estimate;
+      equal(Number(estEl.getAttribute('data-advice-allocated')), estRes.roundingNote.allocatedTotalMinor,
+        '估算解释块的分配金额应与 API estimate 相同');
+      assert(estEl.querySelector('[data-advice-order]') && estEl.querySelector('[data-advice-nosell]'),
+        '估算态同样要有排序依据与不卖出原因');
+
+      // 同一请求重放：仍是同一行，不追加第二份
+      var replay = await apiPost('recommendations', {
+        snapshotRef: { closeId: closed.json.close.id, snapshotId: closed.json.snapshot.id, payloadHash: closed.json.snapshot.payloadHash },
+        assessmentRef: { id: assessed.json.item.id, ruleVersion: assessed.json.item.ruleVersion },
+        targetVersion: Domain.RISK_TARGET_VERSION, ruleVersion: Domain.RISK_RULE_VERSION,
+        newFundsMinor: 200000
+      });
+      equal(replay.status, 200, '真实时钟下重复请求仍返回原建议');
+      equal(replay.json.id, item.id, '同一输入重复请求回到同一条建议产物');
+      equal((await Store.listRecommendations()).total, 2, '只多了一条哈希异常的估算产物');
+
+      // 5E-3 反例 3：清空认可标的 → 金额保留为待办，不转投陌生标的
+      var unmap = await apiPost('approved-instruments', {
+        assetClass: 'broad_equity', instrumentIds: []
+      });
+      equal(unmap.status, 200, '清空类别映射应成功');
+      var amount2 = document.querySelector('#view [data-input="advice:amount"]');
+      amount2.value = '2000';
+      amount2.dispatchEvent(new Event('input', { bubbles: true }));
+      clickAction('#view [data-action="advice:run"]');
+      await waitFor(function () {
+        var el = document.querySelector('#view [data-advice-result]');
+        return el && el.querySelector('[data-todo="missing_approved_instrument"]');
+      }, 8000, '无映射待办解释');
+      var todoEl = document.querySelector('#view [data-todo="missing_approved_instrument"][data-todo-class="broad_equity"]');
+      assert(todoEl, '宽基无映射时应出现 missing_approved_instrument 待办');
+      equal(Number(todoEl.getAttribute('data-retained')), 200000,
+        '待办保留金额应等于本次分配额（原样保留，不转投）');
+      assert(/不转投陌生标的/.test(todoEl.textContent), '待办文案须明确不转投陌生标的');
+      var noMapRow = document.querySelector('#view [data-advice-cls="broad_equity"]');
+      equal(noMapRow.getAttribute('data-allocated'), '200000', '无映射时类别级金额仍照常展示');
+      equal(noMapRow.getAttribute('data-instrument-count'), '0', '无映射时标的级必须为空');
+      assert(!/D5VGT|D5VOO/.test(noMapRow.textContent), '无映射不得回落到陌生标的符号');
+      // 恢复映射，避免影响后续断言
+      var remap = await apiPost('approved-instruments', {
+        assetClass: 'broad_equity', instrumentIds: ['d5-ins-voo', 'd5-ins-vgt']
+      });
+      equal(remap.status, 200, '恢复认可标的映射应成功');
+
+      // 记账式全量保存（五键）不得抹掉建议产物；显式空集合才是清空指令
+      var st6 = await apiState();
+      await Store.saveAll({ accounts: [], categories: [], txns: [], settings: st6.settings, assets: st6.assets });
+      var kept = await Store.listRecommendations();
+      equal(kept.total, 3, '页面保存后建议产物逐条保持（正式 + 哈希估算 + 无映射正式）');
+      equal(kept.invalidCount, 0, '页面保存后引用链仍有效');
+      equal((await Store.listMonthlyCloses()).items.length, st6.monthlyCloses.length, '页面保存不删除月结');
+      var saved = await apiState();
+      equal(JSON.stringify(saved.closeSnapshots), JSON.stringify(st6.closeSnapshots), '封存快照原文保存后不变');
+      await Store.saveAll({
+        accounts: [], categories: [], txns: [], settings: st6.settings, assets: st6.assets,
+        riskAssessments: st6.riskAssessments, allocationTargets: st6.allocationTargets,
+        approvedInstruments: st6.approvedInstruments, recommendations: []
+      });
+      equal((await Store.listRecommendations()).total, 0, '显式提交空集合才是清空指令');
+      equal((await Store.listAllocationTargets()).items.length, 1, '未提交空的集合保持原样');
+    });
+
+    // 5E-5：旧建议未封存解释版本时页面必须显式标注；同一输入重复生成永远回到原行，绝不倒填（D-052）
+    await check('5E-5 审计追溯：未封存旧建议显式标注，重复生成不倒填解释版本', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      // 前置：C7.11 收尾显式清空了建议集合，页面仍在目标页
+      var startList = await Store.listRecommendations();
+      equal(startList.total, 0, '前置：建议集合已被清空');
+
+      // 生成一条带封存的新建议（认可标的已恢复、金额仍为 2,000 元）
+      clickAction('#view [data-action="advice:run"]');
+      await waitFor(async function () {
+        return (await Store.listRecommendations()).total === 1;
+      }, 8000, '新建议落库');
+      var sealedList = await Store.listRecommendations();
+      equal(sealedList.invalidCount, 0, '读取复核必须通过');
+      var sealedRec = sealedList.items[0];
+      equal(sealedRec.gate.explanationVersion, window.Knowledge.EXPLANATION_VERSION, '新建议在库里带封存解释版本');
+      await waitFor(function () {
+        var el = document.querySelector('#view [data-advice-result]');
+        var ver = el && el.querySelector('[data-advice-trace-versions]');
+        return ver && ver.getAttribute('data-rec-id') === sealedRec.id;
+      }, 8000, '建议详情渲染新记录');
+      var sealEl = document.querySelector('[data-advice-explain-seal]');
+      equal(sealEl.getAttribute('data-sealed'), '1', '新建议页面标为已封存');
+
+      // 模拟升级前的旧建议：全量状态里剥掉解释版本再写回（计算输入一个字节都不改）
+      var st = await apiState();
+      equal(st.recommendations.length, 1, '全量状态应带同一行建议');
+      delete st.recommendations[0].gate.explanationVersion;
+      var putRes = await fetch('/api/v1/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+        body: JSON.stringify({ state: st })
+      });
+      equal(putRes.status, 200, '全量恢复未封存记录应成功，实际 ' + putRes.status);
+      var legacyList = await Store.listRecommendations();
+      equal(legacyList.total, 1, '旧记录照常在列');
+      equal(legacyList.invalidCount, 0, '未封存不是缺陷：旧记录必须仍可验证');
+      assert(!('explanationVersion' in legacyList.items[0].gate), '库里的旧记录不应有解释版本');
+
+      // 同一输入再次生成：服务端应回到原行（非新建），页面标「非生成时封存版本」
+      var origCreate = Store.createRecommendation;
+      var responses = [];
+      Store.createRecommendation = function () {
+        var p = origCreate.apply(Store, arguments);
+        p.then(function (r) { responses.push({ ok: true, r: r }); },
+          function (e) { responses.push({ ok: false, e: e }); });
+        return p;
+      };
+      try {
+        clickAction('#view [data-action="advice:run"]');
+        await waitFor(function () { return responses.length === 1; }, 8000, '重复生成返回');
+        assert(responses[0].ok, '重复生成不应报错：' + (responses[0].e && responses[0].e.message));
+        equal(responses[0].r.created, false, '同一输入必须幂等回到原行，不得新建');
+        equal(responses[0].r.id, legacyList.items[0].id, '回到同一行建议产物');
+        await waitFor(function () {
+          var el = document.querySelector('#view [data-advice-result]');
+          var s = el && el.querySelector('[data-advice-explain-seal]');
+          return s && s.getAttribute('data-sealed') === '0';
+        }, 8000, '未封存建议的显式标注');
+        var viewText = document.querySelector('#view').textContent;
+        assert(viewText.indexOf('当前卡片解释，非生成时封存版本') >= 0, '未封存建议必须给出约定标注');
+        var sealNow = document.querySelector('[data-advice-explain-seal]');
+        equal(sealNow.getAttribute('data-sealed-version'), '', '未封存时不得显示封存版本号');
+        equal(sealNow.getAttribute('data-current-version'), window.Knowledge.EXPLANATION_VERSION, '当前知识卡版本照常显示');
+        var midList = await Store.listRecommendations();
+        equal(midList.total, 1, '同一输入不得产生第二条建议');
+        equal(midList.invalidCount, 0, '重复生成后读取复核仍通过');
+
+        // 再生成一次：响应仍是原行，历史记录永不倒填解释版本
+        clickAction('#view [data-action="advice:run"]');
+        await waitFor(function () { return responses.length === 2; }, 8000, '第三次生成返回');
+        assert(responses[1].ok, '第三次生成不应报错：' + (responses[1].e && responses[1].e.message));
+        equal(responses[1].r.created, false, '第三次仍是同一行');
+        assert(!('explanationVersion' in responses[1].r.recommendation.gate),
+          '服务端返回的仍是未封存原行，不得倒填解释版本');
+        var finalList = await Store.listRecommendations();
+        equal(finalList.total, 1, '建议仍只有一条');
+        equal(finalList.invalidCount, 0, '最终读取复核仍通过');
+        assert(!('explanationVersion' in finalList.items[0].gate), '历史记录永不回填解释版本');
+        var traceStill = document.querySelector('[data-advice-trace-baseline]');
+        assert(traceStill, '未封存建议的追溯分区照常渲染');
+        equal(traceStill.getAttribute('data-close-id'), finalList.items[0].closeId, '追溯字段与库一致');
+        var inputStill = document.querySelector('[data-advice-trace-input]');
+        equal(inputStill.getAttribute('data-input-hash'), finalList.items[0].inputHash, '计算输入哈希与库一致');
+      } finally {
+        Store.createRecommendation = origCreate;
+      }
+    });
+
     // C8 收尾：清空必须走通（历史上 DELETE 因缺少 Content-Type 被服务端判为非法写请求）
     await check('清空账本经本地服务生效', async function () {
       await Store.clearAll();
@@ -1253,6 +2075,573 @@
       var backups = await Store.listBackups();
       assert((backups.items || []).some(function (b) { return /-pre-clear\.db$/.test(b.name); }),
         '清空前应留一份 pre-clear 备份');
+    });
+
+    // C9 Phase 5E-1（S5.1 决策台层）：首页风险摘要卡只格式化服务端的当前评估判定。
+    // 覆盖无评估 / 已过期 / 即将到期 / 有效四态，逐字段与 /risk-assessments/current 和
+    // 风险页核对；过期与读取失败都不得显示为「当前有效」，缺判定也不得显示 L0 或 0 分。
+    await check('决策台风险摘要：四态与 API、风险页同源，过期不冒充当前有效', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      var TODAY = Core.todayStr();
+      var HIGH = {}, CAPPED = {};
+      Domain.RISK_QUESTIONS.forEach(function (q) {
+        HIGH[q.id] = q.options[0].id;
+        CAPPED[q.id] = q.options[0].id;
+      });
+      CAPPED.q_emergency_fund = 'o_cover_under_3m'; // 冻结规则里的硬封顶项（压到 L2）
+
+      function card() { return document.querySelector('#view [data-risk-summary]'); }
+      function chipOf(c) {
+        var el = c.querySelector('[data-risk-chip]');
+        return el ? el.textContent : null;
+      }
+      function goHome() { clickAction('[data-action="nav:home"]'); }
+      async function showCard(view, label) {
+        goHome();
+        await waitFor(function () {
+          var c = card();
+          return c && c.dataset.riskSummary === view && c.dataset.riskStatus &&
+            !c.querySelector('[data-risk-pending]');
+        }, 8000, label || ('决策台风险摘要 ' + view));
+        return card();
+      }
+      async function apiCurrent() {
+        var res = await fetch('/api/v1/risk-assessments/current', { headers: { Accept: 'application/json' } });
+        assert(res.ok, 'GET /risk-assessments/current 应返回 200，实际 ' + res.status);
+        return res.json();
+      }
+      async function postAssessment(assessedAt, picks, reason) {
+        var answers = Domain.RISK_QUESTIONS.map(function (q) {
+          return { questionId: q.id, optionId: picks[q.id] };
+        });
+        var res = await fetch('/api/v1/risk-assessments', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H,
+            'Idempotency-Key': Core.newId('ra')
+          },
+          body: JSON.stringify({ answers: answers, assessedAt: assessedAt, reason: reason })
+        });
+        var body = await res.json();
+        assert(res.ok, '按 ' + assessedAt + ' 追加评估应成功，实际 ' + res.status + '：' +
+          JSON.stringify(body.error || body));
+        return body.item;
+      }
+      // 逐字段核对：页面只搬运服务端判定，不得改数值、补默认值或另算到期状态
+      function assertCardEqualsApi(c, cur, label) {
+        equal(c.dataset.riskStatus, cur.status, label + '：摘要状态应等于服务端判定状态');
+        if (cur.status !== 'current') {
+          assert(!c.hasAttribute('data-risk-ceiling'), label + '：无可用判定时不得显示风险上限');
+          assert(!c.hasAttribute('data-risk-capacity'), label + '：无可用判定时不得显示能力得分');
+          assert(c.textContent.indexOf('当前有效') < 0, label + '：非 current 状态不得出现「当前有效」');
+          return;
+        }
+        var rec = cur.current.assessment, val = cur.current.validity;
+        equal(c.dataset.riskValidity, val.status, label + '：有效期状态应同源');
+        equal(c.dataset.riskCeiling, String(rec.ceiling), label + '：最终上限应同源');
+        equal(c.dataset.riskCapacity, rec.capacityScore + '/' + rec.capacityLevel, label + '：能力分/级应同源');
+        equal(c.dataset.riskWillingness, rec.willingnessScore + '/' + rec.willingnessLevel, label + '：意愿分/级应同源');
+        equal(c.dataset.riskCeilingSource, rec.ceilingSource, label + '：上限来源应同源');
+        equal(c.dataset.riskHardCaps, rec.hardCaps.map(function (h) { return h.code; }).join(','),
+          label + '：硬封顶命中应同源');
+        equal(c.dataset.riskAssessedAt, rec.assessedAt, label + '：评估日应同源');
+        equal(c.dataset.riskExpiry, rec.expiry, label + '：到期日应同源');
+        equal(c.dataset.riskRemainingDays, String(val.remainingDays), label + '：剩余天数应同源');
+        equal(c.dataset.riskReason, rec.reason, label + '：触发原因应同源');
+        assert(c.textContent.indexOf('L' + rec.ceiling) >= 0, label + '：正文应显示服务端给出的上限');
+      }
+
+      // 1) 无评估：清空账本后评估表为空，摘要不得继续沿用上一次读到的判定
+      equal(((await apiState()).riskAssessments || []).length, 0, '清空账本后应没有评估记录');
+      var c0 = await showCard('none', '清空账本后决策台显示无评估');
+      equal(c0.dataset.riskStatus, 'no_assessment', '无评估状态应来自服务端判定');
+      assert(c0.querySelector('[data-action="risk:reassess"][data-reason="initial"]'),
+        '无评估时应给出开始评估问卷入口');
+      assert(c0.textContent.indexOf('L0') < 0 && c0.textContent.indexOf('0 分') < 0,
+        '无评估时不得显示 L0 或 0 分');
+      assertCardEqualsApi(c0, await apiCurrent(), '无评估');
+
+      // 2) 已过期：唯一一份评估的到期日已过
+      var expiredAt = Domain.addCalendarDays(TODAY, -(Domain.ASSESSMENT_VALID_DAYS + 40));
+      await postAssessment(expiredAt, HIGH, 'initial');
+      var c1 = await showCard('expired', '决策台显示已过期');
+      equal(c1.dataset.riskStatus, 'all_expired', '全部过期时服务端判定为 all_expired');
+      equal(chipOf(c1), '已过期', '状态角标应为「已过期」');
+      assert(c1.querySelector('[data-action="risk:reassess"][data-reason="annual_expired"]'),
+        '过期应给出年度到期复评入口');
+      assertCardEqualsApi(c1, await apiCurrent(), '已过期');
+      // 与风险页同源：同一事实的到期日两侧一致
+      clickAction('#view [data-risk-summary] [data-action="nav:risk"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-action="risk:start"][data-reason="annual_expired"]');
+      }, 8000, '风险页的复评入口');
+      assert(document.querySelector('#view').textContent.indexOf(c1.dataset.riskExpiry) >= 0,
+        '风险页与决策台必须给出同一个到期日');
+
+      // 3) 即将到期 + 硬封顶：未过期记录里最新的一份即当前评估
+      var soonAt = Domain.addCalendarDays(TODAY, -(Domain.ASSESSMENT_VALID_DAYS - 15));
+      var soon = await postAssessment(soonAt, CAPPED, 'annual_expired');
+      var c2 = await showCard('expiring', '决策台显示即将到期');
+      equal(chipOf(c2), '即将到期', '剩余天数进入窗口时应标为「即将到期」');
+      assert(Domain.ASSESSMENT_EXPIRING_DAYS >= 15, 'fixture 应落在冻结的即将到期窗口内');
+      var api2 = await apiCurrent();
+      equal(api2.current.assessment.id, soon.id, '服务端应把未过期里最新的一份判为当前评估');
+      assertCardEqualsApi(c2, api2, '即将到期');
+      equal(c2.dataset.riskHardCaps, 'hard_cap_emergency_fund', '摘要应带出硬封顶命中码');
+      assert(document.querySelector('#view').textContent.indexOf('应急金不足 3 个月') >= 0,
+        '摘要应用风险页词表说明硬封顶原因');
+      assert(knowLink(c2, 'card-emergency-fund'), '硬封顶行应给出应急金上限知识卡入口');
+      assert(knowLink(c2, 'card-capacity-vs-willingness'), '上限取较低一侧处应给出能力与意愿知识卡入口');
+      assert(assertKnowLinksResolve(c2, '风险摘要（硬封顶）') >= 2, '风险摘要应至少两个知识卡入口');
+      equal(c2.querySelector('[data-action="risk:reassess"]').dataset.reason, 'manual',
+        '存在有效评估时入口应为复评');
+
+      // 4) 有效且无硬封顶：数值逐项与 API、风险页一致
+      var fresh = await postAssessment(TODAY, HIGH, 'manual');
+      var api3 = await apiCurrent();
+      equal(api3.current.assessment.id, fresh.id, '刚追加的评估应为当前评估');
+      var c3 = await showCard('valid', '决策台显示有效');
+      equal(chipOf(c3), '有效', '状态角标应为「有效」');
+      assertCardEqualsApi(c3, api3, '有效');
+      assert(c3.textContent.indexOf('硬封顶命中') < 0, '无命中时不得展示硬封顶命中提示');
+      clickAction('#view [data-risk-summary] [data-action="nav:risk"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-action="risk:start"][data-reason="manual"]');
+      }, 8000, '风险页的当前评估卡');
+      var riskText = document.querySelector('#view').textContent;
+      var rec3 = api3.current.assessment;
+      assert(riskText.indexOf('承受能力：' + rec3.capacityScore + ' 分') >= 0,
+        '风险页与决策台必须用同一份服务端得分');
+      assert(riskText.indexOf('风险上限 L' + rec3.ceiling) >= 0, '风险页上限应与摘要同源');
+      assert(riskText.indexOf(api3.current.validity.expiry) >= 0, '风险页到期日应与摘要同源');
+      // 只降不升：摘要显示的上限来自服务端，而不是页面按硬封顶自行推断
+      equal(c3.dataset.riskCeiling, String(rec3.ceiling), '上限只来自服务端');
+      // 过期只使评估失效，不删除历史（追加式事实）
+      equal(((await apiState()).riskAssessments || []).length, 3, '三份评估应全部保留为历史');
+
+      // 5) 首页复核未完成时，缓存的有效评估只能标为上次结果；响应只替换摘要卡，
+      // 不能重画收益归因等其它区块，也不能让较旧请求覆盖较新判定。
+      var origPendingCurrent = Store.riskAssessmentCurrent;
+      var finishPending;
+      try {
+        Store.riskAssessmentCurrent = function () {
+          return new Promise(function (resolve) { finishPending = resolve; });
+        };
+        goHome();
+        await waitFor(function () { return card() && card().querySelector('[data-risk-pending]'); },
+          8000, '等待服务复核时显式标记旧判定');
+        equal(card().dataset.riskSummary, 'refreshing', '复核中不得标为当前有效');
+        equal(chipOf(card()), '核对中', '复核中的角标不得写有效');
+        var otherCard = document.querySelector('#view [data-attribution]');
+        assert(otherCard, '决策台应保留归因区域供局部更新验证');
+        finishPending(api3);
+        await waitFor(function () { return card() && card().dataset.riskSummary === 'valid'; },
+          8000, '复核完成后恢复有效判定');
+        equal(document.querySelector('#view [data-attribution]'), otherCard,
+          '只更新风险摘要，不重建收益归因交互');
+      } finally {
+        Store.riskAssessmentCurrent = origPendingCurrent;
+      }
+
+      // 6) 决策台的复评入口：进入风险页问卷并预置原因，草稿不预填历史答案
+      goHome();
+      await waitFor(function () {
+        return card() && card().dataset.riskSummary === 'valid' && !card().querySelector('[data-risk-pending]');
+      }, 8000, '回到决策台摘要');
+      clickAction('#view [data-risk-summary] [data-action="risk:reassess"]');
+      await waitFor(function () { return document.querySelector('#view #risk-reason'); }, 8000, '摘要入口进入问卷');
+      equal(document.querySelector('#view #risk-reason').value, 'manual', '复评入口应预置 manual 原因');
+      equal(document.querySelectorAll('#view input[data-action="risk:answer"]:checked').length, 0,
+        '复评入口应是空白草稿');
+      clickAction('#view [data-action="risk:cancel"]');
+
+      // 7) 判定读取失败：保留上次结果但显式标注为可能过期，并给出重新读取入口
+      var origCurrent = Store.riskAssessmentCurrent;
+      try {
+        Store.riskAssessmentCurrent = function () {
+          var e = new Error('模拟判定读取中断');
+          e.code = 'unreachable';
+          return Promise.reject(e);
+        };
+        goHome();
+        await waitFor(function () { return card() && card().querySelector('[data-risk-stale]'); },
+          8000, '读取失败的显式标注');
+        var c4 = card();
+        equal(c4.dataset.riskSummary, 'stale', '读取失败时仍保留上一次判定，但不得标为当前有效');
+        equal(chipOf(c4), '未复核', '读取失败时角标必须明确并非当前有效');
+        assert(c4.querySelector('[data-action="risk:retry"]'), '读取失败应给出重新读取入口');
+      } finally {
+        Store.riskAssessmentCurrent = origCurrent;
+      }
+      clickAction('#view [data-risk-summary] [data-action="risk:retry"]');
+      await waitFor(function () {
+        var c = card();
+        return c && !c.querySelector('[data-risk-stale]') && c.dataset.riskSummary === 'valid';
+      }, 8000, '重试后恢复判定');
+      assertCardEqualsApi(card(), await apiCurrent(), '重试后');
+    });
+
+    // C9.5 Phase 5E-2（S5.1 决策台层）：首页配置对照只搬运服务端 /targets/current。
+    // 覆盖有目标六类同源、无目标、无估值、分类未确认估算态；缺数据不得出现 0% 或正式口径；
+    // 响应只替换对照卡，不重建归因等其它区块。
+    await check('决策台配置对照：六类与 /targets/current 同源，缺数据不冒充', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      var TODAY = Core.todayStr();
+
+      function allocCard() { return document.querySelector('#view [data-alloc-compare]'); }
+      function chipOf(c) {
+        var el = c.querySelector('[data-alloc-chip]');
+        return el ? el.textContent : null;
+      }
+      function goHome() { clickAction('[data-action="nav:home"]'); }
+      async function showCard(pred, label) {
+        goHome();
+        await waitFor(function () {
+          var c = allocCard();
+          return c && pred(c) && !c.querySelector('[data-alloc-pending]');
+        }, 8000, label || '配置对照卡');
+        return allocCard();
+      }
+      async function apiAlloc() {
+        var res = await fetch('/api/v1/targets/current', { headers: { Accept: 'application/json' } });
+        assert(res.ok, 'GET /targets/current 应返回 200，实际 ' + res.status);
+        return res.json();
+      }
+      async function putState(mutate) {
+        var st = await apiState();
+        mutate(st);
+        var res = await fetch('/api/v1/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify({ state: st })
+        });
+        if (res.status !== 200) {
+          var body = await res.json().catch(function () { return {}; });
+          throw new Error('PUT /state 应 200，实际 ' + res.status + '：' +
+            JSON.stringify(body.error || body));
+        }
+        return res;
+      }
+      function topAnswers() {
+        return Domain.RISK_QUESTIONS.map(function (q) {
+          return { questionId: q.id, optionId: q.options[0].id };
+        });
+      }
+      // 投资池：CNY 现金 30,000 + 宽基持仓（USD 报价按手动汇率折算，与 5C fixture 同源）
+      function investableAssets(opts) {
+        var onlyConfirmed = opts && opts.onlyConfirmed;
+        var inv = {
+          assetAccounts: [
+            { id: 'e2-cash-acc', name: '投资现金户', kind: 'deposit', pool: 'investable', institution: '虚构机构' },
+            { id: 'e2-brk-acc', name: '券商户', kind: 'broker', pool: 'investable', institution: '虚构机构' }
+          ],
+          assetUnits: [{ id: 'e2-cash', accountId: 'e2-cash-acc', currency: 'CNY', balanceMinor: 3000000, asOf: TODAY, sourceType: 'manual' }],
+          liabilities: [], entitlements: [],           assetTransfers: [], securityEvents: [],
+          fxRates: [{ base: 'USD', quote: 'CNY', rateDecimal: '7.2000', rateDate: TODAY, provider: 'manual', status: 'ok' }],
+          instruments: [
+            { id: 'e2-voo', symbol: 'VOO2', exchange: 'NYSE2', currency: 'USD', name: '宽基对照', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'US', classificationStatus: 'confirmed' },
+            { id: 'e2-thm', symbol: 'THM2', exchange: 'SSE2', currency: 'CNY', name: '主题未确认', instrumentType: 'fund', assetClass: 'theme_equity', exposureMarket: 'CN', classificationStatus: 'suggested' }
+          ],
+          holdings: [
+            { id: 'e2-h-voo', accountId: 'e2-brk-acc', instrumentId: 'e2-voo', quantity: '100', costMinor: 1000000, asOf: TODAY },
+            { id: 'e2-h-thm', accountId: 'e2-brk-acc', instrumentId: 'e2-thm', quantity: '1000', costMinor: 500000, asOf: TODAY }
+          ],
+          quotes: [
+            { instrumentId: 'e2-voo', priceMinor: 40000, currency: 'USD', priceDate: TODAY, provider: 'manual', status: 'ok' },
+            { instrumentId: 'e2-thm', priceMinor: 1000, currency: 'CNY', priceDate: TODAY, provider: 'manual', status: 'ok' }
+          ]
+        };
+        if (onlyConfirmed) {
+          inv.instruments = inv.instruments.filter(function (i) { return i.classificationStatus === 'confirmed'; });
+          inv.holdings = inv.holdings.filter(function (h) { return h.instrumentId === 'e2-voo'; });
+          inv.quotes = inv.quotes.filter(function (q) { return q.instrumentId === 'e2-voo'; });
+        }
+        return inv;
+      }
+      // 全部清空后的投资池（无估值）
+      function emptyInvestableAssets() {
+        return {
+          assetAccounts: [], assetUnits: [], liabilities: [], entitlements: [],
+          assetTransfers: [], securityEvents: [], fxRates: [], instruments: [], holdings: [], quotes: []
+        };
+      }
+      function assertSixClassesEqualApi(c, cur, label) {
+        equal(c.dataset.allocStatus, cur.status, label + '：状态应等于服务端判定');
+        equal(c.dataset.allocAsof, cur.allocation.asOf, label + '：数据日应同源');
+        equal(c.dataset.allocLevel, String(cur.target.level), label + '：目标等级应同源');
+        equal(c.dataset.allocInvestable, String(cur.allocation.investableTotalMinor), label + '：投资池应同源');
+        equal(c.dataset.allocCanadvise, cur.allocation.canAdvise ? '1' : '0', label + '：canAdvise 应同源');
+        equal(c.dataset.allocValuation, cur.allocation.valuationStatus || '', label + '：估值状态应同源');
+        var rows = c.querySelectorAll('[data-alloc-cls]');
+        equal(rows.length, Domain.RISK_CLASSES.length, label + '：六类各一行');
+        Domain.RISK_CLASSES.forEach(function (k) {
+          var row = c.querySelector('[data-alloc-cls="' + k + '"]');
+          assert(row, label + '：应存在类别行 ' + k);
+          var fromApi = cur.allocation.classes.filter(function (x) { return x.assetClass === k; })[0];
+          equal(row.getAttribute('data-value-minor'), String(fromApi.valueMinor), label + '：' + k + ' 金额应同源');
+          equal(row.getAttribute('data-pct-bps'), fromApi.pctBps == null ? '' : String(fromApi.pctBps),
+            label + '：' + k + ' 比例 bps 应同源');
+          equal(row.getAttribute('data-min-bps'), String(fromApi.minBps), label + '：' + k + ' min 应同源');
+          equal(row.getAttribute('data-target-bps'), String(fromApi.targetBps), label + '：' + k + ' target 应同源');
+          equal(row.getAttribute('data-max-bps'), String(fromApi.maxBps), label + '：' + k + ' max 应同源');
+          equal(row.getAttribute('data-band'), fromApi.band == null ? '' : String(fromApi.band),
+            label + '：' + k + ' 容忍带应同源');
+          equal(row.getAttribute('data-deviation-bps'), fromApi.deviationBps == null ? '' : String(fromApi.deviationBps),
+            label + '：' + k + ' 偏离 bps 应同源');
+        });
+        // 比例之和只能来自服务端；页面不得显示成 0% 假对照
+        assert(c.textContent.indexOf('正式口径') < 0 || cur.allocation.canAdvise === true,
+          label + '：canAdvise=false 时不得出现「正式口径」');
+      }
+
+      // 前置：清空 → 可估值资产 + 有效评估（暂无目标）
+      await Store.clearAll();
+      async function putSeed(mutate) {
+        var st = await apiState();
+        mutate(st);
+        var res = await fetch('/api/v1/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify({ state: st })
+        });
+        if (res.status !== 200) {
+          var body = await res.json().catch(function () { return {}; });
+          throw new Error('铺设定虚构资产应成功：预期 200，实际 ' + res.status +
+            '：' + JSON.stringify(body.error || body));
+        }
+        return res;
+      }
+      var seeded = await putSeed(function (st) {
+        st.assets = investableAssets();
+        st.riskAssessments = [];
+        st.allocationTargets = [];
+        st.approvedInstruments = [];
+      });
+      equal(seeded.status, 200, '铺设定虚构资产应成功');
+      await Store.createRiskAssessment(
+        { answers: topAnswers(), assessedAt: TODAY, reason: 'initial' },
+        { idempotencyKey: Core.newId('ra') });
+
+      // 1) 尚无目标：给原因与目标页入口，不显示比例对照
+      var c1 = await showCard(function (c) { return c.dataset.allocStatus === 'no_target'; },
+        '无目标时对照卡');
+      equal(chipOf(c1), '尚无目标', '无目标角标');
+      assert(c1.textContent.indexOf('还没有生成目标版本') >= 0, '无目标应说明原因');
+      assert(c1.querySelector('[data-action="nav:targets"]'), '无目标应给出目标页入口');
+      assert(c1.querySelectorAll('[data-alloc-cls]').length === 0, '无目标时不得展示六类比例行');
+      equal((await apiAlloc()).status, 'no_target', '服务端应判定 no_target');
+
+      // 2) 生成目标后：六类逐字段与 API 相同
+      var gen = await fetch('/api/v1/targets', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H,
+          'Idempotency-Key': Core.newId('at')
+        },
+        body: JSON.stringify({})
+      });
+      assert(gen.status === 200 || gen.status === 201, '生成目标应成功，实际 ' + gen.status);
+      var cur1 = await apiAlloc();
+      equal(cur1.status, 'current', '服务端应判定 current');
+      var c2 = await showCard(function (c) { return c.dataset.allocStatus === 'current'; },
+        '有目标时对照卡');
+      assertSixClassesEqualApi(c2, cur1, '有目标');
+      // 分类未确认的持仓存在 → 应为估算口径，并列出 blocker
+      equal(c2.dataset.allocCanadvise, '0', '分类未确认时服务端 canAdvise 应为 false');
+      equal(chipOf(c2), '估算口径', '估算口径角标');
+      assert(c2.textContent.indexOf('正式口径对照') < 0, '估算态不得标为正式口径');
+      assert(c2.querySelector('[data-alloc-blocker="classification_unconfirmed"]') ||
+        /分类未确认/.test(c2.textContent), '应展示分类未确认原因');
+      assert(c2.querySelectorAll('[data-alloc-cls]').length === Domain.RISK_CLASSES.length,
+        '估算态仍展示六类，但角标为估算');
+
+      // 3) 正式口径：去掉未确认标的后 canAdvise 应翻转，卡片同步
+      await putState(function (st) {
+        st.assets = investableAssets({ onlyConfirmed: true });
+      });
+      var cur2 = await apiAlloc();
+      equal(cur2.allocation.canAdvise, true, '去掉未确认标的后应正式口径');
+      var c3 = await showCard(function (c) { return c.dataset.allocCanadvise === '1'; },
+        '正式口径对照卡');
+      assertSixClassesEqualApi(c3, cur2, '正式口径');
+      equal(chipOf(c3), '正式口径对照', '正式口径角标');
+      assert(knowLink(c3, 'card-tolerance-band'), '容忍带端点说明处应给出容忍带知识卡入口');
+      assert(assertKnowLinksResolve(c3, '配置对照（正式口径）') >= 1, '配置对照应给出知识卡入口');
+
+      // 4) 无估值（投资池为 0）：不得出现 0% 比例行
+      await putState(function (st) { st.assets = emptyInvestableAssets(); });
+      var cur3 = await apiAlloc();
+      equal(cur3.allocation.status, 'no_investable', '服务端应判定 no_investable');
+      var c4 = await showCard(function (c) { return c.dataset.allocCompare === 'no_investable'; },
+        '无估值对照卡');
+      equal(chipOf(c4), '无可估值投资池', '无估值角标');
+      assert(c4.textContent.indexOf('不显示类别比例') >= 0, '无估值应说明不显示比例');
+      var pctTexts = Array.prototype.map.call(c4.querySelectorAll('[data-alloc-cls]'),
+        function (el) { return el.getAttribute('data-pct-bps'); });
+      equal(pctTexts.length, Domain.RISK_CLASSES.length, '无估值时仍应保留六类目标行');
+      assert(pctTexts.every(function (v) { return v === ''; }),
+        '无估值时六类 pct-bps 必须为空，不得出现 0');
+      Array.prototype.forEach.call(c4.querySelectorAll('[data-alloc-cls] .r-pct'), function (el) {
+        assert(/^目标 .+ · 比例不可用$/.test(el.textContent),
+          '无估值时只可显示目标区间，当前比例必须写「比例不可用」');
+      });
+      assert(c4.textContent.indexOf('正式口径') < 0, '无估值卡不得标为正式口径');
+      assert(c4.querySelector('[data-action="nav:targets"]'), '无估值仍保留目标页入口');
+      assertSixClassesEqualApi(c4, cur3, '无估值');
+
+      // 5) 恢复有估值资产：正式对照 + 只替换对照卡、归因区 DOM 不重建
+      await putState(function (st) {
+        st.assets = investableAssets({ onlyConfirmed: true });
+      });
+      var c5 = await showCard(function (c) { return c.dataset.allocCompare === 'ok'; },
+        '恢复正式口径');
+      var cur4 = await apiAlloc();
+      assertSixClassesEqualApi(c5, cur4, '恢复后');
+      // 模拟读取变慢：先标核对中，完成后只换对照卡
+      var origAlloc = Store.allocationCurrent;
+      var finishAlloc;
+      try {
+        Store.allocationCurrent = function () {
+          return new Promise(function (resolve) { finishAlloc = resolve; });
+        };
+        goHome();
+        await waitFor(function () {
+          var c = allocCard();
+          return c && c.querySelector('[data-alloc-pending]');
+        }, 8000, '对照卡核对中');
+        equal(allocCard().dataset.allocCompare, 'refreshing', '复核中不得丢掉已有对照');
+        equal(chipOf(allocCard()), '核对中', '复核中角标为核对中');
+        var attrDuring = document.querySelector('#view [data-attribution]');
+        assert(attrDuring, '决策台应保留归因区域供局部更新验证');
+        finishAlloc(cur4);
+        await waitFor(function () {
+          var c = allocCard();
+          return c && c.dataset.allocCompare === 'ok' && !c.querySelector('[data-alloc-pending]');
+        }, 8000, '对照复核完成');
+        equal(document.querySelector('#view [data-attribution]'), attrDuring,
+          '只更新配置对照卡，不重建收益归因交互');
+        assertSixClassesEqualApi(allocCard(), cur4, '复核完成后');
+      } finally {
+        Store.allocationCurrent = origAlloc;
+      }
+
+      // 6) 读取失败：显式标注未复核并给重试入口，不冒充没有对照
+      var origFail = Store.allocationCurrent;
+      try {
+        Store.allocationCurrent = function () {
+          var e = new Error('模拟配置对照读取中断');
+          e.code = 'unreachable';
+          return Promise.reject(e);
+        };
+        goHome();
+        await waitFor(function () {
+          var c = allocCard();
+          return c && c.querySelector('[data-alloc-stale]');
+        }, 8000, '对照读取失败标注');
+        var c6 = allocCard();
+        equal(c6.dataset.allocCompare, 'stale', '读取失败时保留上次结果但标为未复核');
+        equal(chipOf(c6), '未复核', '失败角标不得写核对完成');
+        assert(c6.querySelector('[data-action="alloc:retry"]'), '失败应给出重新读取入口');
+      } finally {
+        Store.allocationCurrent = origFail;
+      }
+      clickAction('#view [data-alloc-compare] [data-action="alloc:retry"]');
+      await waitFor(function () {
+        var c = allocCard();
+        return c && !c.querySelector('[data-alloc-stale]') && c.dataset.allocCompare === 'ok';
+      }, 8000, '对照重试后恢复');
+      assertSixClassesEqualApi(allocCard(), await apiAlloc(), '重试后');
+
+      // 7) 新评估使旧目标失效：服务端与首页均须提示目标待更新，不得继续沿用旧比例。
+      await Store.createRiskAssessment(
+        { answers: topAnswers(), assessedAt: TODAY, reason: 'manual' },
+        { idempotencyKey: Core.newId('ra') });
+      equal((await apiAlloc()).status, 'stale_assessment', '新评估后旧目标应由服务端判为待更新');
+      var staleCard = await showCard(function (c) { return c.dataset.allocStatus === 'stale_assessment'; },
+        '旧目标待更新');
+      equal(staleCard.dataset.allocCompare, 'stale', '旧目标不得继续显示比例对照');
+      equal(chipOf(staleCard), '目标待更新', '应明确引导更新目标');
+      equal(staleCard.querySelectorAll('[data-alloc-cls]').length, 0, '旧目标不展示六类比例');
+
+      // 8) 评估与目标均为空：普通写入不能保留引用已删除评估的目标（服务端会拒绝）。
+      await putState(function (st) { st.riskAssessments = []; st.allocationTargets = []; });
+      equal((await apiAlloc()).status, 'no_assessment', '无有效评估应由服务端判定');
+      var noAssessmentCard = await showCard(function (c) { return c.dataset.allocStatus === 'no_assessment'; },
+        '无评估的配置对照');
+      equal(chipOf(noAssessmentCard), '尚未评估', '无评估提示应独立于无目标');
+      equal(noAssessmentCard.querySelectorAll('[data-alloc-cls]').length, 0, '无评估不展示比例');
+
+      // 9) 无法通过服务端复核的目标记录：服务端测试负责构造损坏记录，
+      // 此处验证 UI 不泄露比例或正式口径，并显式保留异常记录数。
+      var origInvalid = Store.allocationCurrent;
+      try {
+        Store.allocationCurrent = function () {
+          return Promise.resolve({ status: 'invalid_records', invalidCount: 1, total: 1 });
+        };
+        var invalidCard = await showCard(function (c) { return c.dataset.allocStatus === 'invalid_records'; },
+          '不可复核目标记录');
+        equal(invalidCard.dataset.allocCompare, 'invalid', '不可复核记录必须 fail closed');
+        equal(invalidCard.dataset.allocInvalid, '1/1', '异常记录数应明确保留');
+        equal(invalidCard.querySelectorAll('[data-alloc-cls]').length, 0, '不可复核记录不展示比例');
+        assert(invalidCard.textContent.indexOf('正式口径') < 0, '不可复核记录不得标正式口径');
+      } finally {
+        Store.allocationCurrent = origInvalid;
+      }
+    });
+
+    // 5E-4 Phase 5E-4：本地知识卡。目录静态离线、按已知 id 打开、未知 id 显式降级；
+    // 卡片只解释概念与规则来源，不含账户事实、不构成建议、无收益承诺。
+    await check('本地知识卡：已知 id 打开、未知 id 显式降级、离线无建议边界', async function () {
+      assert(window.Knowledge, '页面应加载 js/knowledge.js（Knowledge 全局）');
+      var ver = window.Knowledge.EXPLANATION_VERSION;
+      equal(typeof ver, 'string', '应有 EXPLANATION_VERSION');
+      assert(ver.length > 0, 'EXPLANATION_VERSION 不得为空');
+      var required = ['card-capacity-vs-willingness', 'card-emergency-fund', 'card-tolerance-band',
+        'card-new-funds-first', 'card-fx-risk', 'card-no-sell'];
+      required.forEach(function (id) {
+        assert(window.Knowledge.getCard(id), '缺必过知识卡 ' + id);
+      });
+      assert(window.Knowledge.cardIds.length >= 6, '目录至少包含 5E-4 点名的六张卡');
+
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-risk-summary]'); }, 8000, '决策台');
+      assertKnowLinksResolve(document, '当前页面'); // 页面上已渲染的入口必须全部指向已知卡
+
+      function openByCardId(id) {
+        var btn = document.createElement('button');
+        btn.setAttribute('data-action', 'know:open');
+        btn.setAttribute('data-card-id', id);
+        document.getElementById('view').appendChild(btn);
+        btn.click();
+        return btn;
+      }
+
+      // 1) 已知 id：打开卡片正文，页脚带解释版本与「不构成建议」边界，且是离线文本
+      var btnKnown = openByCardId('card-capacity-vs-willingness');
+      await waitFor(function () {
+        return document.querySelector('#sheet [data-know-card="card-capacity-vs-willingness"]');
+      }, 5000, '已知知识卡弹层');
+      var sheet = document.querySelector('#sheet');
+      var sheetText = sheet.textContent;
+      assert(sheetText.indexOf(window.Knowledge.getCard('card-capacity-vs-willingness').title) >= 0,
+        '弹层应显示该卡标题');
+      assert(sheetText.indexOf('解释版本 ' + ver) >= 0, '弹层应显示 EXPLANATION_VERSION');
+      assert(/不构成投资建议/.test(sheetText), '卡片必须显式声明不构成投资建议');
+      assert(/http/i.test(sheetText) === false, '卡片为本地静态文本，不得出现外部链接');
+      assert(/保本|稳赚|包赚|保证收益|预期收益/.test(sheetText) === false, '卡片不得出现收益承诺');
+      clickAction('#sheet [data-action="sheet:close"]');
+      await waitFor(function () { return document.querySelector('#sheet-mask.hidden'); }, 5000, '关闭知识卡');
+
+      // 2) 未知 id：显式降级，点名缺失 id，且不渲染任何卡片正文
+      var btnUnknown = openByCardId('card-does-not-exist');
+      await waitFor(function () { return document.querySelector('#sheet [data-know-missing]'); }, 5000, '未知卡降级提示');
+      var missing = document.querySelector('#sheet [data-know-missing]');
+      assert(missing.textContent.indexOf('card-does-not-exist') >= 0, '降级提示应点名未知 id');
+      assert(!document.querySelector('#sheet [data-know-card]'), '未知 id 不得渲染任何卡片正文');
+      clickAction('#sheet [data-action="sheet:close"]');
+      await waitFor(function () { return document.querySelector('#sheet-mask.hidden'); }, 5000, '关闭降级提示');
+      btnKnown.remove();
+      btnUnknown.remove();
     });
 
     // C10 S2 保存失败回滚与只读降级：模拟本地服务中途停止后记账。
@@ -1297,6 +2686,589 @@
       // 恢复网络后重新探测：应回到 api 模式（刷新页面即可恢复记账）
       var mode = await Store.detect(true);
       equal(mode, 'api', '服务恢复后应重新探测为 api 模式');
+    });
+
+    // ================= 5E-6 整体验收（十态中的四个未覆盖态 + 三层复核 + 一分钟演练） =================
+    // fixture 与断言先用隔离临时库离线预演过（能力 L2 < 意愿 L5、0 元守恒、分类/行情估算、
+    // 领域重算与 API 字节一致），本处只验证「页面把领域与服务端的结论一步读到」。
+    var MATRIX = {};
+    var TOKEN_5E6 = Store.readSessionToken();
+
+    async function mPutState(state, label) {
+      var res = await fetch('/api/v1/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_5E6 },
+        body: JSON.stringify({ state: state })
+      });
+      if (res.status !== 200) {
+        var body = await res.json().catch(function () { return {}; });
+        throw new Error((label || 'PUT /state') + ' 应 200，实际 ' + res.status + '：' +
+          JSON.stringify(body.error || body));
+      }
+      return res;
+    }
+    function mApiPost(path, body) {
+      return fetch('/api/v1/' + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_5E6 },
+        body: JSON.stringify(body)
+      }).then(function (r) {
+        return r.json().then(function (j) { return { status: r.status, json: j }; });
+      });
+    }
+    // 与 5D 建议 fixture 同一份数字，只换 id/符号前缀（D5→E6），让两次播种能在目标页 DOM 上区分
+    function mAdviceAssets(today, monthEnd, tag, low) {
+      var quoteDates = Array.from(new Set([today, monthEnd]));
+      function rows(ins, price, currency) {
+        return quoteDates.map(function (d) {
+          return { instrumentId: ins, priceMinor: price, currency: currency, priceDate: d, provider: 'manual', status: 'ok' };
+        });
+      }
+      var a = Domain.emptyAssets();
+      a.assetAccounts = [
+        { id: low + '-acc-cash', name: '投资现金户', kind: 'deposit', pool: 'investable', institution: tag },
+        { id: low + '-acc-broker', name: '券商户', kind: 'broker', pool: 'investable', institution: tag },
+        { id: low + '-acc-safe', name: '应急金', kind: 'deposit', pool: 'safety', institution: tag }
+      ];
+      a.assetUnits = [
+        { id: low + '-u-cny', accountId: low + '-acc-cash', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' },
+        { id: low + '-u-safe', accountId: low + '-acc-safe', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' }
+      ];
+      a.instruments = [
+        { id: low + '-ins-bond', symbol: tag + 'BND', exchange: 'NASDAQ', currency: 'USD', name: '债基', instrumentType: 'etf', assetClass: 'fixed_income', exposureMarket: 'US', classificationStatus: 'confirmed' },
+        { id: low + '-ins-voo', symbol: tag + 'VOO', exchange: 'SSE', currency: 'CNY', name: '宽基A', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' },
+        { id: low + '-ins-vgt', symbol: tag + 'VGT', exchange: 'SSE', currency: 'CNY', name: '宽基B', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' },
+        { id: low + '-ins-thm', symbol: tag + 'THM', exchange: 'SSE', currency: 'CNY', name: '主题', instrumentType: 'fund', assetClass: 'theme_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' }
+      ];
+      a.holdings = [
+        { id: low + '-h-bond', accountId: low + '-acc-broker', instrumentId: low + '-ins-bond', quantity: '5000', costMinor: 5000000, asOf: today },
+        { id: low + '-h-voo', accountId: low + '-acc-broker', instrumentId: low + '-ins-voo', quantity: '50000', costMinor: 5000000, asOf: today },
+        { id: low + '-h-thm', accountId: low + '-acc-broker', instrumentId: low + '-ins-thm', quantity: '70000', costMinor: 7000000, asOf: today }
+      ];
+      a.quotes = rows(low + '-ins-bond', 1000, 'USD')
+        .concat(rows(low + '-ins-voo', 100, 'CNY'))
+        .concat(rows(low + '-ins-thm', 100, 'CNY'));
+      a.fxRates = quoteDates.map(function (d) {
+        return { base: 'USD', quote: 'CNY', rateDecimal: '7.0000', rateDate: d, provider: 'manual', status: 'ok' };
+      });
+      return a;
+    }
+    // S5.1 前提：能力题全取 1 分档（避开 score<=0 的硬封顶触发）→ L2；意愿题取满分 → L5，
+    // 上限来源必须由服务端判为 capacity（取较低一侧），硬封顶不命中。
+    function mCapWilAnswers() {
+      var answers = [];
+      Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'capacity'; }).forEach(function (q) {
+        var opts = q.options.filter(function (o) { return o.score >= 1; })
+          .sort(function (a, b) { return a.score - b.score; });
+        assert(opts.length > 0, '能力题 ' + q.id + ' 应有 1 分及以上档');
+        answers.push({ questionId: q.id, optionId: opts[0].id });
+      });
+      Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'willingness'; }).forEach(function (q) {
+        var opts = q.options.slice().sort(function (a, b) { return b.score - a.score; });
+        answers.push({ questionId: q.id, optionId: opts[0].id });
+      });
+      return answers;
+    }
+    async function mSeedFixture(today, monthEnd, tag, keepClose) {
+      var low = tag.toLowerCase();
+      var assets = mAdviceAssets(today, monthEnd, tag, low);
+      var base = await apiState();
+      var seeded = Object.assign({}, base, {
+        accounts: [], categories: [], txns: [], settings: {}, assets: assets,
+        riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: []
+      });
+      // keepClose=true（第二段播种）：保留已有正式月结——建议门禁引用它；
+      // 否则（首段播种）清空月结与快照，制造「无正式月结」前置。
+      if (!keepClose) {
+        seeded.monthlyCloses = [];
+        seeded.closeSnapshots = [];
+      }
+      await mPutState(seeded, '5E-6 播种状态');
+      var answers = mCapWilAnswers();
+      var assessed = await mApiPost('risk-assessments', { answers: answers, assessedAt: today, reason: 'initial' });
+      equal(assessed.status, 201, '5E-6 播种评估落库，实际 ' + assessed.status);
+      var target = await mApiPost('targets', {});
+      equal(target.status, 201, '5E-6 播种目标生成，实际 ' + target.status);
+      var mapped = await mApiPost('approved-instruments', {
+        assetClass: 'broad_equity', instrumentIds: [low + '-ins-voo', low + '-ins-vgt']
+      });
+      equal(mapped.status, 200, '5E-6 播种认可标的映射，实际 ' + mapped.status);
+      return { today: today, monthEnd: monthEnd, assets: assets, answers: answers, assessed: assessed, target: target, mapped: mapped };
+    }
+    function mSetAmount(value) {
+      var amount = document.querySelector('#view [data-input="advice:amount"]');
+      assert(amount, '5E-6 应有建议金额输入框');
+      amount.value = value;
+      amount.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    function mRunAdvice() { clickAction('#view [data-action="advice:run"]'); }
+    function mAdviceEl() { return document.querySelector('#view [data-advice-result]'); }
+
+    // ---- 状态矩阵：无正式月结（客户端拒绝）→ 0 元正式 → 分类未确认估算 → 行情过期估算 + 决策台阻塞 ----
+    await check('5E-6 状态矩阵：无正式月结 / 0 元 / 分类未确认 / 行情过期的建议与决策台页面态', async function () {
+      var today = Domain.localTodayISO();
+      var ty = Number(today.slice(0, 4)), tm = Number(today.slice(5, 7));
+      var monthEnd = today.slice(0, 8) +
+        String(new Date(Date.UTC(ty, tm, 0)).getUTCDate()).padStart(2, '0');
+
+      var seeded = await mSeedFixture(today, monthEnd, 'D5');
+      MATRIX.today = today;
+      MATRIX.monthEnd = monthEnd;
+      MATRIX.assets = seeded.assets;
+      MATRIX.answers = seeded.answers;
+      MATRIX.assessment = seeded.assessed.json.item;
+
+      // 目标页同步到本 fixture（此前是 2287 的 VOO2 视图，D5VOO 出现即刷新完成）。
+      // tabbar 只有 资产/明细/记一笔/统计/我的，没有目标配置入口；先回决策台走 dash-entry。
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:targets"]'); },
+        8000, '5E-6 决策台目标配置入口');
+      clickAction('#view [data-action="nav:targets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="target:reload"]'); },
+        8000, '5E-6 目标配置入口');
+      clickAction('#view [data-action="target:reload"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('D5VOO') >= 0 &&
+          document.querySelector('#view [data-action="advice:run"]');
+      }, 8000, '5E-6 fixture 同步到目标页');
+
+      // 1) 没有正式月结：客户端直接拒绝，不产生任何建议行
+      mSetAmount('2000');
+      mRunAdvice();
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('未能生成建议') >= 0;
+      }, 8000, '无正式月结错误提示');
+      var errText = document.querySelector('#view').textContent;
+      assert(errText.indexOf('本机还没有可引用的正式月结，请先完成月度结账') >= 0,
+        '错误文案应说明缺正式月结并引导先完成月度结账');
+      assert(!mAdviceEl(), '客户端拒绝时不得出现建议结果卡');
+      equal((await Store.listRecommendations()).total, 0, '客户端拒绝不得产生建议行');
+
+      // 2) 建立正式月结 → 0 元仍是正式建议，可分配与实际分配都为 0
+      var closed = await mApiPost('monthly-closes', { month: today.slice(0, 7) });
+      equal(closed.json.close.status, 'formal', '前置：当天数据必须能正式结账');
+      MATRIX.close = closed.json;
+      mSetAmount('0');
+      mRunAdvice();
+      await waitFor(function () {
+        var el = mAdviceEl();
+        return el && el.getAttribute('data-advice-status') === 'formal';
+      }, 8000, '0 元正式建议');
+      var zeroEl = mAdviceEl();
+      assert(zeroEl.innerHTML.indexOf('<b>正式建议</b>') >= 0, '0 元应显示正式建议标题');
+      equal(zeroEl.getAttribute('data-advice-requested'), '0', '0 元请求金额 data');
+      equal(zeroEl.getAttribute('data-advice-allocatable'), '0', '0 元可分配 data');
+      equal(zeroEl.getAttribute('data-advice-allocated'), '0', '0 元实际分配 data');
+      var zeroSum = 0;
+      Domain.RISK_CLASSES.forEach(function (k) {
+        var row = zeroEl.querySelector('[data-advice-cls="' + k + '"]');
+        assert(row, '0 元建议仍应有类别行 ' + k);
+        zeroSum += Number(row.getAttribute('data-allocated'));
+      });
+      equal(zeroSum, 0, '0 元六类分配之和为 0');
+      var recs0 = await Store.listRecommendations();
+      var zeroRows = recs0.items.filter(function (r) {
+        return r.status === 'formal' && r.requestedNewFundsMinor === 0;
+      });
+      equal(zeroRows.length, 1, '0 元正式建议唯一');
+      equal(zeroRows[0].allocatedTotalMinor, 0, 'API：0 元实际分配为 0');
+      equal(zeroRows[0].allocatableNewFundsMinor, 0, 'API：0 元可分配为 0');
+      equal(zeroRows[0].allocatedTotalMinor + zeroRows[0].result.roundingNote.unallocatedMinor,
+        zeroRows[0].allocatableNewFundsMinor, 'API：0 元守恒');
+      equal(zeroRows[0].result.status, 'formal', 'API：0 元产物状态 formal');
+
+      // 3) 分类未确认 → 估算。注意：只翻转未映射但有持仓的 thm；映射引用的 voo/vgt 必须保持
+      //    confirmed，否则整份状态 PUT 会被 422 classification_unconfirmed 拒绝（认可标的引用校验）。
+      var stCls = await apiState();
+      var clsAssets = JSON.parse(JSON.stringify(MATRIX.assets));
+      clsAssets.instruments.filter(function (i) { return i.assetClass === 'theme_equity'; })
+        .forEach(function (i) { i.classificationStatus = 'suggested'; });
+      await mPutState(Object.assign({}, stCls, { assets: clsAssets }), '5E-6 写入分类未确认状态');
+      mSetAmount('2000');
+      mRunAdvice();
+      await waitFor(function () {
+        var el = mAdviceEl();
+        return el && el.getAttribute('data-advice-status') === 'estimate';
+      }, 8000, '分类未确认估算建议');
+      var clsEl = mAdviceEl();
+      assert(clsEl.querySelector('[data-blocker="classification_unconfirmed"]'),
+        '估算态应展示 classification_unconfirmed blocker');
+      assert(/估算建议（未达正式门槛）/.test(clsEl.textContent), '分类未确认应显示估算标签');
+      assert(/formalRecommendation 为空/.test(clsEl.textContent),
+        '估算态应说明 formalRecommendation 为空');
+      assert(clsEl.innerHTML.indexOf('<b>正式建议</b>') < 0, '估算不得冒充正式建议');
+
+      // 4) 行情 / 汇率过期（>5 个自然日）→ 估算；每标的只留一条过期报价，避免重复键
+      var stStale = await apiState();
+      var staleAssets = JSON.parse(JSON.stringify(MATRIX.assets));
+      var staleDay = Domain.addCalendarDays(today, -7);
+      staleAssets.quotes = staleAssets.quotes.filter(function (q, i, arr) {
+        return arr.findIndex(function (x) { return x.instrumentId === q.instrumentId; }) === i;
+      });
+      staleAssets.quotes.forEach(function (q) { q.priceDate = staleDay; });
+      staleAssets.fxRates = [{ base: 'USD', quote: 'CNY', rateDecimal: '7.0000', rateDate: staleDay, provider: 'manual', status: 'ok' }];
+      await mPutState(Object.assign({}, stStale, { assets: staleAssets }), '5E-6 写入行情过期状态');
+      mSetAmount('2000');
+      mRunAdvice();
+      await waitFor(function () {
+        return document.querySelector('#view [data-blocker="quote_stale"]') &&
+          !document.querySelector('#view [data-blocker="classification_unconfirmed"]');
+      }, 8000, '行情过期估算建议');
+      var staleEl = mAdviceEl();
+      equal(staleEl.getAttribute('data-advice-status'), 'estimate', '行情过期仍为估算');
+      assert(staleEl.querySelector('[data-blocker="quote_stale"]'), '应展示 quote_stale blocker');
+      assert(staleEl.querySelector('[data-blocker="fx_stale"]'), '应展示 fx_stale blocker');
+      assert(/估算建议（未达正式门槛）/.test(staleEl.textContent), '行情过期显示估算标签');
+
+      // 5) 决策台：估算口径 blocker 与「本月可新增投资资金」估算角标。
+      //    决策台读的是页面内存里的 assets（写库的 PUT 不会自动同步页面），先让目标页
+      //    重读事实源（过期状态出现在目标页估算阻塞列表即同步完成），再回决策台核对。
+      clickAction('#view [data-action="target:reload"]');
+      await waitFor(function () {
+        // 目标页的估算阻塞卡只在页面重读事实源后出现（建议结果卡里的行情已过期文案更早就有，不能当信号）
+        var t = document.querySelector('#view').textContent;
+        return t.indexOf('当前为估算口径') >= 0 && t.indexOf('行情已过期') >= 0;
+      }, 8000, '5E-6 目标页同步过期事实源');
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () {
+        var b = document.querySelector('#view .dash-blockers');
+        return b && b.textContent.indexOf('行情已过期') >= 0;
+      }, 8000, '决策台估算口径 blocker');
+      var dashText = document.querySelector('#view').textContent;
+      assert(dashText.indexOf('以下数据问题使结果为估算口径') >= 0, '决策台应说明估算口径');
+      assert(dashText.indexOf('汇率已过期') >= 0, '决策台应点名汇率已过期');
+      assert(document.querySelector('#view .dash-hero'), '行情过期不影响资产数据展示：净资产卡仍在');
+      var nfCard = Array.prototype.filter.call(
+        document.querySelectorAll('#view .card'),
+        function (c) { return c.textContent.indexOf('本月可新增投资资金') >= 0; })[0];
+      assert(nfCard, '本月可新增投资资金卡应存在');
+      assert(nfCard.textContent.indexOf('估算') >= 0, 'canAdvise=false 时新增资金卡标注估算');
+      assert(nfCard.textContent.indexOf('正式口径') < 0, 'canAdvise=false 时不得出现正式口径');
+
+      // 6) 行总账：3 行产物全部可读可复核，估算行各自带稳定 blocker 码
+      var recs = await Store.listRecommendations();
+      equal(recs.total, 3, '状态矩阵共 3 行建议产物（0 元正式 + 两条估算）');
+      equal(recs.invalidCount, 0, '读取复核必须通过');
+      equal(recs.items.filter(function (r) { return r.status === 'formal'; }).length, 1, '仅 0 元一条正式');
+      var ests = recs.items.filter(function (r) { return r.status === 'estimate'; });
+      equal(ests.length, 2, '分类未确认与行情过期各一条估算');
+      ests.forEach(function (r) { equal(r.result.status, 'estimate', '估算行产物状态应为 estimate'); });
+      assert(ests.some(function (r) {
+        return (r.result.blockers || []).some(function (b) { return b.code === 'classification_unconfirmed'; });
+      }), '分类未确认估算行应带稳定 blocker 码');
+      assert(ests.some(function (r) {
+        return (r.result.blockers || []).some(function (b) { return b.code === 'quote_stale'; });
+      }), '行情过期估算行应带稳定 blocker 码');
+    });
+
+    // ---- 三层复核：固定输入下 领域 = API = 页面（S5.1 上限取较低一侧 / S5.2 分配与解释码 / S5.3 可追溯） ----
+    await check('5E-6 三层复核：领域 = API = 页面（S5.1 能力约束意愿 + S5.2 分配与解释码 + S5.3 追溯）', async function () {
+      assert(MATRIX.today && MATRIX.assessment, '应复用状态矩阵的同一 fixture 与同一时钟');
+      var today = MATRIX.today;
+      var monthEnd = MATRIX.monthEnd;
+
+      // 重新播种（E6 前缀，目标页可与上一段的 D5 视图区分）；保留 A 段建立的正式月结，
+      // 只动 assets/评估/目标/映射/建议行；页面随后通过 target:reload 重新同步 view。
+      var MB = await mSeedFixture(today, monthEnd, 'E6', true);
+      var recB = MB.assessed.json.item;
+
+      // S5.1 第一层：领域独立复算 == API 记录
+      var domScore = Domain.scoreRiskAnswers(MB.answers);
+      assert(domScore.ok, 'Domain 应能复算本 fixture 答案');
+      equal(domScore.ceilingSource, 'capacity', '前提：能力侧更低，上限来源为 capacity');
+      assert(domScore.capacityLevel < domScore.willingnessLevel, '能力级必须低于意愿级');
+      equal(domScore.hardCaps.length, 0, '本 fixture 不应命中硬封顶');
+      ['ceiling', 'ceilingSource', 'capacityScore', 'capacityLevel', 'willingnessScore', 'willingnessLevel']
+        .forEach(function (key) {
+          equal(recB[key], domScore[key], 'S5.1 领域==API：' + key);
+        });
+      equal(recB.ruleVersion, domScore.ruleVersion, 'S5.1 领域==API：ruleVersion');
+
+      // 页面生成正式建议 2,000 元（目标页 reload 后 view 引用 E6 的评估与目标）。
+      // 上一段结束时页面可能在明细页或决策台，且目标页视图还是 D5：一律先回决策台，
+      // 再进目标页并强制重读（route 的惰性加载在 targetsLoaded 时不会重新拉取）。
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:targets"]'); },
+        8000, '5E-6 决策台目标配置入口');
+      clickAction('#view [data-action="nav:targets"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-action="target:reload"]') ||
+          document.querySelector('#view [data-action="advice:run"]');
+      }, 8000, '5E-6 目标页入口');
+      clickAction('#view [data-action="target:reload"]');
+      await waitFor(function () {
+        return document.querySelector('#view').textContent.indexOf('E6VOO') >= 0 &&
+          document.querySelector('#view [data-action="advice:run"]');
+      }, 8000, '5E-6 E6 fixture 同步到目标页');
+      mSetAmount('2000');
+      mRunAdvice();
+      await waitFor(function () {
+        var el = mAdviceEl();
+        return el && el.getAttribute('data-advice-status') === 'formal';
+      }, 8000, '三层复核用正式建议');
+
+      var listed = await Store.listRecommendations();
+      equal(listed.total, 1, '重新播种后仅本步一条建议产物');
+      equal(listed.invalidCount, 0, '读取复核必须通过');
+      var item = listed.items[0];
+      equal(item.status, 'formal', '本步产物为正式建议');
+      equal(item.requestedNewFundsMinor, 200000, '金额按「元 → 最小货币单位」绑定');
+      equal(item.assessmentId, recB.id, '建议应绑定本步评估');
+      // S5.3 第一层：七条门禁全过，码集合与冻结词表一致
+      equal(item.gate.checks.map(function (c) { return c.code; }).slice().sort().join(','),
+        Domain.RECOMMENDATION_GATE_CHECKS.slice().sort().join(','), '门禁码集合与冻结词表一致');
+      item.gate.checks.forEach(function (c) {
+        assert(c.passed === true, '门禁 ' + c.code + ' 必须通过');
+      });
+      var res = item.result;
+
+      // 页面层（建议结果卡）：类别分配 / 解释码 / 守恒 data 逐项等于 API 产物
+      var advEl = mAdviceEl();
+      equal(advEl.getAttribute('data-advice-status'), 'formal', '页面状态角标 formal');
+      equal(advEl.getAttribute('data-advice-requested'), String(res.roundingNote.requestedNewFundsMinor),
+        '页面请求金额 == API');
+      equal(advEl.getAttribute('data-advice-allocatable'), String(res.roundingNote.allocatableNewFundsMinor),
+        '页面可分配 == API');
+      equal(advEl.getAttribute('data-advice-allocated'), String(res.roundingNote.allocatedTotalMinor),
+        '页面实际分配 == API');
+      equal(advEl.getAttribute('data-advice-unallocated'), String(res.roundingNote.unallocatedMinor),
+        '页面未分配 == API');
+      assert(document.querySelector('#view').textContent.indexOf('守恒：实际分配') >= 0, '页面给出守恒公式');
+      equal(advEl.getAttribute('data-advice-explain'), res.explainCodes.join(','),
+        '页面解释码列表 == API');
+      res.explainCodes.forEach(function (code) {
+        assert(advEl.querySelector('[data-explain-code="' + code + '"]'), '应渲染解释码 ' + code);
+      });
+      var apiByCls = {};
+      res.categoryAllocations.forEach(function (c) { apiByCls[c.assetClass] = c; });
+      Domain.RISK_CLASSES.forEach(function (k) {
+        var row = advEl.querySelector('[data-advice-cls="' + k + '"]');
+        assert(row, '页面应有类别行 ' + k);
+        equal(row.getAttribute('data-allocated'), String(apiByCls[k].allocatedMinor), k + ' 页面==API 分配');
+        equal(row.getAttribute('data-basis'), apiByCls[k].basis, k + ' 页面==API 依据');
+        equal(row.getAttribute('data-goal-bps'),
+          apiByCls[k].goalBps == null ? '' : String(apiByCls[k].goalBps), k + ' 页面==API 锚点');
+        equal(row.getAttribute('data-min-need'),
+          apiByCls[k].minNeedMinor == null ? '' : String(apiByCls[k].minNeedMinor), k + ' 页面==API 下限需求');
+        equal(row.getAttribute('data-target-need'),
+          apiByCls[k].targetNeedMinor == null ? '' : String(apiByCls[k].targetNeedMinor), k + ' 页面==API 目标需求');
+        equal(row.getAttribute('data-instrument-count'),
+          String((apiByCls[k].instruments || []).length), k + ' 页面==API 标的数');
+      });
+      // S5.3 页面层：版本与知识卡可追溯（只搬运服务端字段）
+      var traceVer = advEl.querySelector('[data-advice-trace-versions]');
+      assert(traceVer, '建议详情应有版本与记录组');
+      equal(traceVer.getAttribute('data-rule-version'), Domain.RISK_RULE_VERSION, '规则版本可追溯');
+      equal(traceVer.getAttribute('data-assessment-id'), recB.id, '评估引用可追溯');
+      equal(traceVer.getAttribute('data-target-id'), item.targetId, '目标配置可追溯');
+      equal(traceVer.getAttribute('data-target-version'), item.targetVersion, '目标版本可追溯');
+      var baseline = advEl.querySelector('[data-advice-trace-baseline]');
+      assert(baseline, '建议详情应有月结基准组');
+      equal(baseline.getAttribute('data-close-id'), item.closeId, '月结引用可追溯');
+      equal(baseline.getAttribute('data-snapshot-id'), item.snapshotId, '快照引用可追溯');
+      equal(baseline.getAttribute('data-snapshot-hash'), item.snapshotPayloadHash, '快照哈希可追溯');
+      var seal = advEl.querySelector('[data-advice-explain-seal]');
+      assert(seal, '建议详情应有解释版本组');
+      equal(seal.getAttribute('data-sealed'), '1', '新建议应封存解释版本');
+      equal(seal.getAttribute('data-sealed-version'), window.Knowledge.EXPLANATION_VERSION, '封存版本号');
+      assert(knowLink(advEl, 'card-new-funds-first'), '新增资金优先知识卡入口');
+      assert(knowLink(advEl, 'card-no-sell'), '默认不卖出知识卡入口');
+      assert(assertKnowLinksResolve(advEl, '5E-6 建议结果') >= 2, '建议结果知识卡入口全部指向已知卡');
+
+      // S5.2 第一层：照抄服务端 calculate 的纯函数链，领域重算必须与 API 字节一致
+      var cap = item.gate.capture;
+      var selA = Domain.selectCurrentAssessment(cap.riskAssessments, cap.asOf);
+      assert(selA.ok && selA.status === 'current', '复算：评估应为 current');
+      equal(selA.current.record.id, recB.id, '复算选中的评估就是 API 当前评估');
+      var tsel = Domain.selectCurrentTarget(cap.allocationTargets, selA.current.record, cap.asOf);
+      assert(tsel.status === 'current', '复算：目标应为 current');
+      equal(tsel.current.target.id, item.targetId, '复算选中的目标就是建议绑定的目标');
+      var ovR = Domain.computeOverview(cap.assets, { now: cap.asOf, settings: cap.settings });
+      equal(ovR.canAdvise, true, '复算：估值应为正式口径');
+      var devR = Domain.computeAllocationDeviation(tsel.current.target, ovR);
+      assert(devR.ok, '复算：偏离计算成功');
+      var allocR = Domain.computeNewFundsAllocation({
+        target: tsel.current.target, deviation: devR,
+        requestedNewFundsMinor: item.requestedNewFundsMinor,
+        newFundsAvailableMinor: ovR.newFundsAvailableMinor
+      }).allocation;
+      var mapR = Domain.mapAllocationToApprovedInstruments(
+        allocR, Domain.checkApprovedMapping(cap.approvedInstruments, cap.assets.instruments));
+      var rebuilt = Domain.buildRecommendationResult({
+        status: 'formal', blockers: res.blockers, dataCutoff: item.dataCutoff,
+        versions: res.versions, deviation: devR, allocation: allocR, mapping: mapR
+      });
+      assert(rebuilt.ok, '领域复算组装成功：' + JSON.stringify(rebuilt.error || {}));
+      equal(JSON.stringify(rebuilt.result.categoryAllocations), JSON.stringify(res.categoryAllocations),
+        'S5.2 领域==API：类别分配');
+      equal(JSON.stringify(rebuilt.result.explainCodes), JSON.stringify(res.explainCodes),
+        'S5.2 领域==API：解释码');
+      equal(JSON.stringify(rebuilt.result.roundingNote), JSON.stringify(res.roundingNote),
+        'S5.2 领域==API：尾差与守恒');
+      equal(JSON.stringify(rebuilt.result.deviations), JSON.stringify(res.deviations),
+        'S5.2 领域==API：区间与偏离');
+      // 页面 == 领域（三层数值闭环：上面已证 页面==API、API==领域）
+      Domain.RISK_CLASSES.forEach(function (k) {
+        var rebuiltRow = rebuilt.result.categoryAllocations.filter(function (c) { return c.assetClass === k; })[0];
+        var pageRow = advEl.querySelector('[data-advice-cls="' + k + '"]');
+        equal(pageRow.getAttribute('data-allocated'), String(rebuiltRow.allocatedMinor),
+          'S5.2 页面==领域：' + k + ' 分配额');
+      });
+
+      // S5.1 页面层：决策台风险摘要卡与 API / 领域同源，明确「取较低的一侧」
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () {
+        var c = document.querySelector('#view [data-risk-summary]');
+        return c && c.dataset.riskCeiling === String(domScore.ceiling) &&
+          c.dataset.riskCeilingSource === 'capacity' && !c.querySelector('[data-risk-pending]');
+      }, 8000, '5E-6 决策台风险摘要同步');
+      var rc = document.querySelector('#view [data-risk-summary]');
+      equal(rc.dataset.riskCapacity, domScore.capacityScore + '/' + domScore.capacityLevel,
+        'S5.1 页面==领域：能力分/级');
+      equal(rc.dataset.riskWillingness, domScore.willingnessScore + '/' + domScore.willingnessLevel,
+        'S5.1 页面==领域：意愿分/级');
+      equal(rc.dataset.riskCeiling, String(domScore.ceiling), 'S5.1 页面==领域：最终上限');
+      var ceilLine = rc.querySelector('[data-risk-ceiling-line]');
+      assert(ceilLine && ceilLine.textContent.indexOf('取较低的一侧') >= 0, '上限行写明取较低的一侧');
+      assert(rc.textContent.indexOf('高意愿不能覆盖低能力') >= 0, '解释高意愿不能覆盖低能力');
+      assert(rc.textContent.indexOf('承受能力 ' + domScore.capacityScore + ' 分') >= 0,
+        '风险摘要显示能力总分');
+      assert(rc.textContent.indexOf('风险意愿 ' + domScore.willingnessScore + ' 分') >= 0,
+        '风险摘要显示意愿总分');
+      assert(knowLink(rc, 'card-capacity-vs-willingness'), '风险摘要给出能力与意愿知识卡入口');
+
+      // S5.3 页面层：配置对照卡（目标区间与偏离）逐项 == /targets/current，且偏离与建议记录同源
+      await waitFor(function () {
+        var c = document.querySelector('#view [data-alloc-compare]');
+        return c && c.dataset.allocStatus === 'current' && !c.querySelector('[data-alloc-pending]');
+      }, 8000, '5E-6 配置对照卡同步');
+      var cc = document.querySelector('#view [data-alloc-compare]');
+      equal(cc.dataset.allocCanadvise, '1', '正式口径下对照卡 canAdvise=1');
+      var curRes = await fetch('/api/v1/targets/current', { headers: { Accept: 'application/json' } });
+      assert(curRes.ok, 'GET /targets/current 应 200');
+      var cur = await curRes.json();
+      equal(cur.status, 'current', '服务端目标状态 current');
+      Domain.RISK_CLASSES.forEach(function (k) {
+        var row = cc.querySelector('[data-alloc-cls="' + k + '"]');
+        assert(row, '对照卡应有类别行 ' + k);
+        var fromApi = cur.allocation.classes.filter(function (x) { return x.assetClass === k; })[0];
+        var recDev = res.deviations.filter(function (d) { return d.assetClass === k; })[0];
+        equal(row.getAttribute('data-value-minor'), String(fromApi.valueMinor), k + ' 对照卡==API 金额');
+        equal(row.getAttribute('data-pct-bps'),
+          fromApi.pctBps == null ? '' : String(fromApi.pctBps), k + ' 对照卡==API 比例');
+        equal(row.getAttribute('data-min-bps'), String(fromApi.minBps), k + ' 对照卡==API 下限');
+        equal(row.getAttribute('data-target-bps'), String(fromApi.targetBps), k + ' 对照卡==API 目标');
+        equal(row.getAttribute('data-max-bps'), String(fromApi.maxBps), k + ' 对照卡==API 上限');
+        equal(row.getAttribute('data-band'),
+          fromApi.band == null ? '' : String(fromApi.band), k + ' 对照卡==API 容忍带');
+        equal(row.getAttribute('data-deviation-bps'),
+          fromApi.deviationBps == null ? '' : String(fromApi.deviationBps), k + ' 对照卡==API 偏离');
+        equal(row.getAttribute('data-deviation-bps'), String(recDev.deviationBps),
+          k + ' 对照卡偏离与建议记录偏离同源（同一天同一事实的同一领域输出）');
+      });
+    });
+
+    // ---- 一分钟理解演练：四个常见问题在决策台各一步可读，且与 API / 领域同源 ----
+    await check('5E-6 一分钟理解演练：净资产 / 可投资 / 主要风险暴露 / 新增资金方向 与 API 同源', async function () {
+      var today = Domain.localTodayISO();
+      var RISK_CLASS_TEXT = {
+        cash: '现金', fixed_income: '固收', broad_equity: '宽基权益',
+        theme_equity: '主题权益', stock: '个股', other: '其他'
+      };
+
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view .dash-hero'); }, 8000, '决策台净资产卡');
+      var ovRes = await fetch('/api/v1/overview', { headers: { Accept: 'application/json' } });
+      assert(ovRes.ok, 'GET /overview 应 200');
+      var ovApi = await ovRes.json();
+      var st0 = await apiState();
+      var ovDom = Domain.computeOverview(st0.assets, { now: today, settings: st0.settings || {} });
+      equal(JSON.stringify(ovApi), JSON.stringify(ovDom), 'S5 领域==API：总览整对象一致');
+      equal(ovApi.canAdvise, true, '演练前置：正式口径');
+
+      // ① 净资产
+      var heroCard = document.querySelector('#view .dash-hero');
+      var netText = Core.fmtMoney(ovApi.netWorthMinor);
+      assert(heroCard.querySelector('.dash-net').textContent.indexOf(netText) === 0,
+        '页面净资产应显示 ' + netText);
+      assert(heroCard.textContent.indexOf('总资产 ' + Core.fmtMoney(ovApi.totalAssetsMinor)) >= 0,
+        '页面总资产与 API 同源');
+      assert(heroCard.textContent.indexOf('总负债 ' + Core.fmtMoney(ovApi.totalLiabilitiesMinor)) >= 0,
+        '页面总负债与 API 同源');
+
+      // ② 可投资资金
+      var invCard = Array.prototype.filter.call(
+        document.querySelectorAll('#view .dash-pools .pool-card'),
+        function (c) { return c.querySelector('.p-name').textContent === '可投资'; })[0];
+      assert(invCard, '可投资资金池卡应存在');
+      equal(invCard.querySelector('.p-val').textContent, Core.fmtMoney(ovApi.pools.investableMinor),
+        '页面可投资 == API');
+
+      // ③ 主要风险暴露（风险资产类别配比卡，逐行与 overview.riskClasses 同源）
+      var riskCard = null;
+      Array.prototype.forEach.call(document.querySelectorAll('#view .card'), function (c) {
+        if (c.textContent.indexOf('风险资产类别配比') >= 0) riskCard = c;
+      });
+      assert(riskCard, '风险资产类别配比卡应存在');
+      var nonzero = ovApi.riskClasses.filter(function (r) { return r.valueMinor > 0; });
+      assert(nonzero.length > 0, '应有非零风险类别');
+      nonzero.forEach(function (r) {
+        var row = Array.prototype.filter.call(riskCard.querySelectorAll('.risk-row'), function (el) {
+          return el.querySelector('.r-name').textContent === RISK_CLASS_TEXT[r.assetClass];
+        })[0];
+        assert(row, '配比卡应有类别行 ' + RISK_CLASS_TEXT[r.assetClass]);
+        equal(row.querySelector('.r-val').textContent, Core.fmtMoney(r.valueMinor),
+          RISK_CLASS_TEXT[r.assetClass] + ' 页面金额 == API');
+        if (r.pct != null) {
+          equal(row.querySelector('.r-pct').textContent, r.pct + '%',
+            RISK_CLASS_TEXT[r.assetClass] + ' 页面占比 == API');
+        }
+      });
+      var top = nonzero.slice().sort(function (a, b) { return b.valueMinor - a.valueMinor; })[0];
+
+      // ④ 新增资金方向：对照卡偏离（页面 = API = 领域）+ 正式建议已把请求金额补进低配类别
+      await waitFor(function () {
+        var c = document.querySelector('#view [data-alloc-compare]');
+        return c && c.dataset.allocStatus === 'current' && !c.querySelector('[data-alloc-pending]');
+      }, 8000, '5E-6 演练用配置对照卡');
+      var curRes = await fetch('/api/v1/targets/current', { headers: { Accept: 'application/json' } });
+      assert(curRes.ok, 'GET /targets/current 应 200');
+      var cur = await curRes.json();
+      var devDom = Domain.computeAllocationDeviation(cur.target, ovDom);
+      assert(devDom.ok, '领域偏离复算成功');
+      var broadApi = cur.allocation.classes.filter(function (x) { return x.assetClass === 'broad_equity'; })[0];
+      var broadDom = devDom.classes.filter(function (x) { return x.assetClass === 'broad_equity'; })[0];
+      var broadRow = document.querySelector('#view [data-alloc-cls="broad_equity"]');
+      assert(broadRow, '对照卡应有宽基权益行');
+      equal(broadRow.getAttribute('data-deviation-bps'), String(broadApi.deviationBps),
+        '页面偏离 == API 偏离');
+      equal(String(broadApi.deviationBps), String(broadDom.deviationBps), 'API 偏离 == 领域偏离');
+      assert(broadApi.deviationBps < 0, 'fixture 下宽基权益低于目标区间，方向应为补宽基');
+      var recs = await Store.listRecommendations();
+      var formals = recs.items.filter(function (r) {
+        return r.status === 'formal' && r.requestedNewFundsMinor === 200000;
+      });
+      equal(formals.length, 1, '演练应引用三层复核生成的正式建议');
+      var byCls = {};
+      formals[0].result.categoryAllocations.forEach(function (c) { byCls[c.assetClass] = c; });
+      equal(byCls.broad_equity.allocatedMinor, 200000,
+        '建议方向已落地：请求的 2,000 元全部补给低配的宽基权益');
+
+      // 演练观察值（写入运行日志作为一分钟演练的证据）
+      var dirBps = broadApi.deviationBps;
+      console.log('DRILL: ① 净资产 ' + Core.fmtMoney(ovApi.netWorthMinor) +
+        '；② 可投资 ' + Core.fmtMoney(ovApi.pools.investableMinor) +
+        '；③ 主要风险暴露 ' + RISK_CLASS_TEXT[top.assetClass] + ' ' + Core.fmtMoney(top.valueMinor) +
+        (top.pct != null ? '（占可投资 ' + top.pct + '%）' : '') +
+        '；④ 新增资金方向 宽基权益偏离 ' + dirBps + 'bps 低于目标区间 → 本月可新增 ' +
+        Core.fmtMoney(ovApi.newFundsAvailableMinor) + ' 中请求的 2,000 元已全部补宽基');
+      console.log('DRILL: 数据同源核对 overview=' + JSON.stringify({
+        netWorthMinor: ovApi.netWorthMinor,
+        investableMinor: ovApi.pools.investableMinor,
+        newFundsAvailableMinor: ovApi.newFundsAvailableMinor,
+        broadEquityDeviationBps: broadApi.deviationBps,
+        adviceAllocatedBroadMinor: byCls.broad_equity.allocatedMinor
+      }));
     });
 
     render();

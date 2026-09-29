@@ -1,0 +1,4 @@
+{"probe":"same input one second later","first":201,"second":200}
+{"probe":"mapping order changed same day","status":201}
+{"probe":"balance changed after close without resealing","write":201,"status":201,"adviceStatus":"formal","currentCash":{"assetClass":"cash","valueMinor":60000000,"pctBps":5608},"sealedCash":{"assetClass":"cash","valueMinor":50000000,"pct":51.5},"sameSnapshot":true}
+{"probe":"ordinary five-key save loses close history","write":200,"closeCount":1,"recommendationCount":3,"validRecommendationCount":3,"invalidCount":0,"subsequentAdvice":201}

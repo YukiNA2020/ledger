@@ -1,0 +1,62 @@
+ M ACCEPTANCE.md
+ M AGENTS.md
+ M ARCHITECTURE.md
+ M CHANGELOG.md
+ M DECISIONS.md
+ M NEXT_AGENT.md
+ M PHASE1_5A_REVIEW.md
+ M PHASE5_BREAKDOWN.md
+ M PRODUCT.md
+ M README.md
+ M ROADMAP.md
+ M TEST.md
+ M index.html
+ M js/app.js
+ M js/core.js
+ M js/domain.js
+ M js/store.js
+ M server/api.js
+ M server/backup.js
+ M server/migrations.js
+ M server/repository.js
+ M sw.js
+ M tests/app-wiring.html
+ M tests/app-wiring.js
+ M tests/backup.test.js
+ M tests/domain-phase5a.test.js
+ M tests/server-api.test.js
+ M tests/server-migration.test.js
+ M tests/server-phase3.test.js
+ M tests/store-headers.test.js
+?? PHASE0_5D_REVIEW.md
+?? PHASE5B_ACCEPTANCE_GAPS.md
+?? PHASE5C_ACCEPTANCE_GAPS.md
+?? PHASE5D_ACCEPTANCE_GAPS.md
+?? PHASE5E_BREAKDOWN.md
+?? docs/evidence/phase5-review-20260927/
+?? docs/evidence/phase5d-fix-regression.txt
+?? docs/evidence/phase5d-fixed-money.txt
+?? docs/evidence/phase5d-fixed-probes.txt
+?? docs/evidence/phase5d-fixed-wiring.txt
+?? docs/evidence/phase5d-review-money.cjs
+?? docs/evidence/phase5d-review-money.txt
+?? docs/evidence/phase5d-review-probes.cjs
+?? docs/evidence/phase5d-review-probes.txt
+?? docs/evidence/phase5d-review-regression.txt
+?? docs/evidence/phase5d-wiring-server.cjs
+?? docs/evidence/phase5e3-wiring-runA.json
+?? docs/evidence/phase5e3-wiring-runB.json
+?? docs/evidence/phase5e3-wiring.txt
+?? docs/evidence/phase5e4-offline.txt
+?? docs/evidence/phase5e5-wiring.txt
+?? docs/evidence/phase5e6-wiring.txt
+?? js/knowledge.js
+?? server/recommendations.js
+?? tests/domain-phase5b.test.js
+?? tests/domain-phase5c.test.js
+?? tests/domain-phase5d.test.js
+?? tests/knowledge.test.js
+?? tests/server-phase5b.test.js
+?? tests/server-phase5c.test.js
+?? tests/server-phase5d.test.js
+?? tests/server-phase5e5.test.js

@@ -16,7 +16,7 @@
 
 `Ledger_Plan.md`、`Ledger_PRD.md`、`Ledger_Implementation_Roadmap.md`、`STATUS.md` 和 `docs/stages/` 是 v1/v2 历史资料。内容冲突时，以本文件及上述 v3 文档为准。
 
-当前代码仍是 v2；不要把文档中的目标能力误判为已实现。开始任务前先在 `ROADMAP.md` 找到唯一当前阶段，只实现该阶段明确列出的交付物。
+当前代码实现至 v3 Phase 5（`2.4.23-ui-polish` / schema v10），桌面天空蓝与细节优化已获用户认可。Phase 5 排除 G5-R4 的限定范围复验通过，原完整验收仍待真人计时。**Phase 6 拆解完成，业务开发未开始；下一位 agent 只领取 6A。G5-R4 安排到 6E-3，不阻塞前半程，但必须在 6F 最终验收前通过。** 详见 `PHASE6_BREAKDOWN.md`、`PHASE5_REVIEW.md` §9～§10 与 `NEXT_AGENT.md`。开始任务前在 `ROADMAP.md` 找到唯一当前阶段，只实现该子阶段交付物，不把规划误写成已实现。
 
 ## 产品范围
 

@@ -1,0 +1,16 @@
+2026-09-23 / APP_VERSION=2.4.11-phase5d / SQLite schema v10
+Provider: fixture.getFxRates; no real market-data provider.
+Run A: http://127.0.0.1:18551/tests/app-wiring.html
+Temporary database: ledger-fix5d-browser-yxFTIj
+Final full rerun observed through CUA DOM: 完成：27 项通过，0 项失败
+Run B: http://127.0.0.1:18552/tests/app-wiring.html
+Temporary database: ledger-fix5d-browser-xcKhxZ (fresh database and independent origin)
+Observed through CUA DOM: 完成：27 项通过，0 项失败
+No test filtering/skipping. Both runs include:
+- original import, restore, data entry, reconciliation, quotes, attribution
+- risk questionnaire, allocation targets, approved instrument maintenance
+- 5D formal generation: CNY 2,000 allocated to broad_equity; exact amount conservation
+- client mapping forgery rejected; mismatching snapshot hash -> estimate, formalRecommendation=null
+- same input replay -> 200; ordinary save retains closes, raw snapshots and valid recommendations
+- explicit clearing and service interruption rollback
+For full five failure gates and immutable-input replay see server-phase5d.test.js and phase5d-fix-regression.txt.

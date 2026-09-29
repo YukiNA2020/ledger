@@ -1,0 +1,14 @@
+2026-09-22 当前工作区，node --test，沙箱外运行
+✔ aggregate 全量数据下二级汇总与一级统计一致 (0.165333ms)
+ℹ tests 614
+ℹ suites 0
+ℹ pass 614
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 5894.964083
+
+浏览器：127.0.0.1:18549/tests/app-wiring.html
+完成：26 项通过，1 项失败
+失败：新增资金建议：页面生成正式建议 → 金额守恒且只引用认可标的 → 门禁不过时只给估算 — Cannot read properties of undefined (reading 'id')

@@ -207,13 +207,36 @@
       return Promise.reject(new Error('locked'));
     }
     return legacy.encryptTxns(state.txns).then(function (blob) {
-      return {
+      var out = {
         accounts: state.accounts,
         categories: state.categories,
         txns: blob,
         settings: state.settings,
         assets: state.assets
       };
+      // 加密改写载荷时不能顺手丢掉追加式事实集合（否则锁开启时的保存会抹掉评估/目标/映射）
+      COMPANION_KEYS.forEach(function (k) {
+        if (Object.prototype.hasOwnProperty.call(state, k)) out[k] = state[k];
+      });
+      return out;
+    });
+  }
+
+  /* 追加式事实集合（5B 风险评估 / 5C 目标配置与认可标的）。
+   *
+   * PUT /state 的「缺键即清空」是 5B 已冻结的语义（旧备份恢复要能清掉这些集合），
+   * 但页面整体保存只表达「这五个旧键变了」，绝不表达「删掉用户的评估/目标/映射」。
+   * 普通保存因此在同一个 PUT 上请求服务端于 writeState 事务内保留未显式给出的集合。
+   * 不能在客户端先 GET 再补回：两次请求之间若刚好追加评估/目标或修改映射，旧快照会
+   * 把并发写入覆盖掉。调用方显式给出的集合仍按原样覆盖（空数组仍是清空指令）。 */
+  /* 5D 的建议产物同样登记在这里：它是可供 Phase 6 接管的**不可变计算结果**，
+   * 页面上记一笔账绝不该把「当时给过什么建议」及其月结、快照引用一起抹掉。 */
+  var COMPANION_KEYS = ['riskAssessments', 'allocationTargets', 'approvedInstruments', 'recommendations', 'monthlyCloses', 'closeSnapshots'];
+
+  function hasMissingCompanionCollections(payload) {
+    var next = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+    return COMPANION_KEYS.some(function (k) {
+      return !Object.prototype.hasOwnProperty.call(next, k);
     });
   }
 
@@ -225,15 +248,20 @@
         err.code = 'readonly';
         throw err;
       }
-      return encryptIfLocked(state).then(function (payload) {
-        return apiFetch('/state', {
-          method: 'PUT',
-          // forceBackup：高风险覆盖写入（如 JSON 恢复）时为 true，
-          // 服务端会先强制留一份恢复前备份再覆盖，不受写后备份节流影响（S3 修复）
-          body: { state: payload, forceBackup: opts.forceBackup === true },
-          idempotencyKey: opts.idempotencyKey
+      return encryptIfLocked(state)
+        .then(function (payload) {
+          return apiFetch('/state', {
+            method: 'PUT',
+            // forceBackup：高风险覆盖写入（如 JSON 恢复）时为 true，
+            // 服务端会先强制留一份恢复前备份再覆盖，不受写后备份节流影响（S3 修复）
+            body: {
+              state: payload,
+              forceBackup: opts.forceBackup === true,
+              preserveCompanionCollections: hasMissingCompanionCollections(payload)
+            },
+            idempotencyKey: opts.idempotencyKey
+          });
         });
-      });
     });
   }
 
@@ -426,6 +454,128 @@
     });
   }
 
+  /* ------------------------- Phase 5B：风险评估与复评 ------------------------- */
+
+  // 评估历史（只读）。无本地服务时返回显式空列表 —— 问卷作答需要服务在线，
+  // 页面据此降级，不把内存草稿冒充已保存的评估（§5.3 门禁）。
+  function listRiskAssessments() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { items: [] };
+      return apiFetch('/risk-assessments', { token: false });
+    });
+  }
+
+  // 当前有效评估判定（只读，由服务端领域规则确定性选出）。opts.asOf 仅供页面预览某日判定。
+  function riskAssessmentCurrent(opts) {
+    var q = opts && opts.asOf ? '?asOf=' + encodeURIComponent(opts.asOf) : '';
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        var err = new Error('本地服务未运行，无法判定当前评估');
+        err.code = 'unreachable';
+        throw err;
+      }
+      return apiFetch('/risk-assessments/current' + q, { token: false });
+    });
+  }
+
+  // 提交一次评估：载荷只含 answers / assessedAt / reason —— 派生值一律由服务端重算。
+  function createRiskAssessment(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/risk-assessments', {
+        method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
+  // 导出 JSON 备份用：追加式事实集合只存在服务端，页面内存里没有副本。
+  // 只读降级（无本地服务）时返回空集合 —— IndexedDB 旧存储从未承载这些事实，不虚构。
+  function companionCollections() {
+    return detect().then(function (current) {
+      var empty = {};
+      COMPANION_KEYS.forEach(function (k) { empty[k] = []; });
+      if (current === MODE_LOCAL) return empty;
+      return apiFetch('/state', { token: false }).then(function (state) {
+        var out = {};
+        COMPANION_KEYS.forEach(function (k) {
+          out[k] = state && Array.isArray(state[k]) ? state[k] : [];
+        });
+        return out;
+      });
+    });
+  }
+
+  /* ------------------------- Phase 5C：目标配置与认可标的映射 ------------------------- */
+
+  // 目标历史与当前生效目标（只读）。判定一律取服务端：页面不复制映射与偏离计算（不变量 3）。
+  function listAllocationTargets() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { items: [] };
+      return apiFetch('/targets', { token: false });
+    });
+  }
+
+  // 当前生效目标 + 类别偏离 + 认可标的一并给出（同一遍 Phase 4 估值的结果）。
+  // 服务不可达时显式抛错：目标页不能把「读不到」显示成「还没有目标配置」。
+  function allocationCurrent(opts) {
+    var q = opts && opts.asOf ? '?asOf=' + encodeURIComponent(opts.asOf) : '';
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        var err = new Error('本地服务未运行，无法读取目标配置');
+        err.code = 'unreachable';
+        throw err;
+      }
+      return apiFetch('/targets/current' + q, { token: false });
+    });
+  }
+
+  // 从当前有效评估生成新版本的目标：载荷只有可选的生效日期，等级与比例一律由服务端派生。
+  function createAllocationTarget(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/targets', {
+        method: 'POST', body: payload || {}, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
+  function listApprovedInstruments() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { rows: [] };
+      return apiFetch('/approved-instruments', { token: false });
+    });
+  }
+
+  // 整类替换用户认可标的（顺序即用户判断）；provider 刷新不走这条路径。
+  function setApprovedInstruments(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/approved-instruments', {
+        method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
+  /* ------------------------- Phase 5D：新增资金建议与正式建议门禁 ------------------------- */
+
+  // 建议一律由服务端重读事实后计算：页面只提交引用绑定与金额（D-049）。
+  function createRecommendation(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/recommendations', {
+        method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
+  // 建议历史（只读）：复核不过或封存哈希被改动的行由服务端计入 invalidCount。
+  function listRecommendations() {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) return { items: [], invalidCount: 0, total: 0 };
+      return apiFetch('/recommendations', { token: false });
+    });
+  }
+
   return {
     MODE_UNKNOWN: MODE_UNKNOWN,
     MODE_API: MODE_API,
@@ -452,6 +602,18 @@
     listHoldings: listHoldings,
     listSecurityEvents: listSecurityEvents,
     saveQuote: saveQuote,
-    refreshMarketData: refreshMarketData
+    refreshMarketData: refreshMarketData,
+    listRiskAssessments: listRiskAssessments,
+    riskAssessmentCurrent: riskAssessmentCurrent,
+    createRiskAssessment: createRiskAssessment,
+    companionCollections: companionCollections,
+    listAllocationTargets: listAllocationTargets,
+    allocationCurrent: allocationCurrent,
+    createAllocationTarget: createAllocationTarget,
+    listApprovedInstruments: listApprovedInstruments,
+    setApprovedInstruments: setApprovedInstruments,
+    createRecommendation: createRecommendation,
+    listRecommendations: listRecommendations,
+    COMPANION_KEYS: COMPANION_KEYS
   };
 });

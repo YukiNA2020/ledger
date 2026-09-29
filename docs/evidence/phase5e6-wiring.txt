@@ -1,0 +1,89 @@
+2026-09-27 / APP_VERSION=2.4.20-phase5e6 / SQLite schema v10
+5E-6 整体验收 · 浏览器 wiring 与门禁证据
+
+Run A: http://127.0.0.1:18673/tests/app-wiring.html?v=5e6
+Temporary database: isolated phase5d-wiring-server.cjs temp dir (ledger-fix5d-browser-dnVivc)
+Result: 完成：34 项通过，0 项失败 (body[data-result]=pass)
+
+Run B: http://127.0.0.1:18674/tests/app-wiring.html?v=5e6
+Temporary database: isolated phase5d-wiring-server.cjs temp dir (ledger-fix5d-browser-To8hBp)
+Result: 完成：34 项通过，0 项失败 (body[data-result]=pass)
+
+Both runs (verbatim console output, identical across A/B):
+DRILL: ① 净资产 1,470,000.00；② 可投资 970,000.00；③ 主要风险暴露 现金 500,000.00（占可投资 51.5%）；④ 新增资金方向 宽基权益偏离 -985bps 低于目标区间 → 本月可新增 500,000.00 中请求的 2,000 元已全部补宽基
+DRILL: 数据同源核对 overview={"netWorthMinor":147000000,"investableMinor":97000000,"newFundsAvailableMinor":50000000,"broadEquityDeviationBps":-985,"adviceAllocatedBroadMinor":200000}
+
+Harness: run_wiring_5e6.py (Playwright headless Chromium, fresh context per run,
+server SIGTERM after each run, server temp dir self-cleaned; logs include pageerror
+and console.error listeners plus DRILL console capture).
+
+Expected console noise (same pattern as phase5e5-wiring.txt): 8 msgs = /tests/sw.js 404
+(app.js registers relative sw.js from /tests/ scope) + intentional negative-path probes
+2x401 (missing session token), 415 (backup upload), 2x400 (forged advice/invalid payload),
+422 (classification_unconfirmed state write), 400 (invalid asOf/negative probe).
+
+Ten-state coverage (3 checks appended in 5E-6 + existing checks; no assertions changed):
+- 空资产            -> existing C4/empty checks (147, 188)
+- 首次评估          -> existing C6 risk assessment check (1271)
+- 待复评/四态       -> existing risk validity checks (2083)
+- 无目标            -> existing C9.5 no-target checks (2287)
+- 无认可标的        -> existing C7.11 no-mapping counterexample + 5E-6 fixture (missing 3 classes)
+- 正常建议          -> existing C7.11 formal advice (1619) + 5E-6 check B formal 2,000
+- 无正式月结        -> 5E-6 check A step1: client refuses, error text, zero advice rows
+- 0 元              -> 5E-6 check A step2: formal status, all-zero conservation (API + DOM)
+- 分类未确认        -> 5E-6 check A step3: estimate + classification_unconfirmed blocker (thm flip)
+- 行情过期          -> 5E-6 check A steps4-5: quote_stale+fx_stale estimate + dashboard blockers
+                      (quotes reduced to one row per instrument, staleDay = today-7 > MAX_STALE_DAYS=5)
+
+5E-6 new checks (3, app-wiring.js):
+1. 5E-6 状态矩阵：无正式月结 / 0 元 / 分类未确认 / 行情过期的建议与决策台页面态
+2. 5E-6 三层复核：领域 = API = 页面（S5.1 能力约束意愿 + S5.2 分配与解释码 + S5.3 追溯）
+3. 5E-6 一分钟理解演练：净资产 / 可投资 / 主要风险暴露 / 新增资金方向 与 API 同源
+
+Three-layer recompute (check B, offline-prevalidated by sim5e6.cjs against the real
+isolated server before the browser run):
+- S5.1: Domain.scoreRiskAnswers(answers) == GET /risk-assessments/current record
+  field-by-field (ceiling 2 / ceilingSource=capacity / capacity 5->L2 / willingness 12->L5 /
+  hardCaps [] / ruleVersion); page [data-risk-summary] matches domain
+  (取较低的一侧 + 高意愿不能覆盖低能力 + know:open card-capacity-vs-willingness).
+- S5.2: JSON-identical recompute from raw state via
+  selectCurrentAssessment -> selectCurrentTarget -> computeOverview ->
+  computeAllocationDeviation -> computeNewFundsAllocation ->
+  checkApprovedMapping/mapAllocationToApprovedInstruments -> buildRecommendationResult
+  equals stored result: categoryAllocations / explainCodes / roundingNote / deviations;
+  page advice DOM allocated == rebuilt allocation; broad_equity deviation -985bps
+  (page == API == domain); formal advice allocates requested 2,000 CNY fully to broad_equity;
+  all 7 gate checks == Domain.RECOMMENDATION_GATE_CHECKS, all passed.
+- S5.3: trace groups on page match stored record (ruleVersion / assessmentId / targetId /
+  targetVersion / closeId / snapshotId / snapshot hash / sealed explanation version).
+- Overview identity: JSON.stringify(GET /overview) == Domain.computeOverview(state.assets)
+  byte-equal; drilldown/pool/risk-class rows on dashboard == API values.
+
+Exit gates (all measured on final code after APP_VERSION bump):
+- node --test full: 631/631 (fail 0)
+- Directed subset (server-phase5c/5d/5e): 28/28
+- Ledger/import regression (parsers/csv/dedup/money/backup/server-api): 79/79
+- node --check js/app.js sw.js server/api.js tests/app-wiring.js: OK
+- git diff --check: OK
+- Wiring: 34/34 x 2 on two fresh isolated temp DBs / loopback origins (18673, 18674)
+
+Product fix shipped with this phase (server/api.js only; no allocation/target/mapping change):
+- GET /api/v1/overview judgment date now honors injectable ctx.today like every other
+  endpoint (was localDateStr() only). Server-process runs keep the real local date
+  (main.js does not set ctx.today), so production behavior is unchanged; under the test
+  clock the blocker set of /overview now equals /targets/current deterministically.
+  Regression net: tests/server-phase5c.test.js:334 (blocker-set equality) fails if the
+  fix is reverted once fixture dates drift >5 days from the wall clock — it was the
+  failing gate that surfaced this (2026-09-27).
+
+Stability observation item (4D auto-fx toggle / 4E attribution / 5C mapping dropdown
+single-run flaky cases from 5E-1/5E-2): recorded, assertions untouched; across all
+5E-6 wiring rounds (18663, 18664, 18665, 18671, 18672 evidence-dev + 18673, 18674
+final = 7 rounds) the three cases passed every round — not reproduced, item closed
+by observation only.
+
+Scope: tests/app-wiring.js + tests/app-wiring.html (?v=5e6) + server/api.js clock fix +
+version bump (js/app.js APP_VERSION, sw.js CACHE) + docs/evidence + handoff docs.
+No allocation algorithm, recommendation-write algorithm, 5A frozen rules, target API
+or mapping changes; schema stays v10; zero real-network requests (fixture providers only).
+No test filtering/skipping; no assertions removed to obtain green.

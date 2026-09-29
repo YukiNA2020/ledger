@@ -8,7 +8,9 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.4.6-phase5a';
+  var APP_VERSION = '2.4.23-ui-polish';
+  // 追加式事实集合的键名只有一份定义（Store 导出），页面不另列一套（D-025）。
+  var COMPANION_KEYS = Store.COMPANION_KEYS;
 
   /* ================= 状态 ================= */
   var state = {
@@ -32,6 +34,30 @@
     attrSnap: { closeId: null, status: 'idle', payload: null, hashValid: null },
     // Phase 4B：标的目录（检索结果只存在内存里，不写事实源；事实源只有 instruments 表）
     instQuery: '', instResult: null, instBusy: false, instError: '',
+    // Phase 5B：风险评估（问卷草稿只活在内存；已保存的评估只有 SQLite risk_assessments 一份）
+    riskItems: [], riskCurrent: null, riskLoaded: false, riskLoading: false, riskError: '',
+    // Phase 5E-1：决策台摘要复用同一份服务端判定（riskCurrent），另记读取状态，
+    // 使「读不到 / 读取中」不会冒充「没有评估」。
+    riskCurrentLoading: false, riskCurrentError: '', riskCurrentRequest: 0,
+    riskView: 'list', // 'list' | 'form'
+    riskDraft: { answers: {}, reason: 'initial' },
+    // Phase 5C：目标配置与认可标的（视图数据全部来自服务端，页面不重算）
+    targetsView: null, targetsItems: [], targetsLoaded: false, targetsLoading: false, targetsError: '',
+    targetsLoadPromise: null,
+    // Phase 5E-2：决策台配置对照独立持有服务端 /targets/current 的只读快照，
+    // 与目标页的 targetsView 分开，避免首页复核打断目标页交互。
+    // allocCompareHtml 缓存最近一次生成的卡片 HTML，内容未变时不替换 DOM。
+    allocCurrent: null, allocCurrentLoading: false, allocCurrentError: '', allocCurrentRequest: 0,
+    allocCompareHtml: '',
+    // Phase 5D：新增资金建议（金额是用户输入，其余全部来自服务端建议产物）
+    advice: null, adviceAmount: '', adviceBusy: false, adviceError: '',
+    // G5-R2：建议是否仍然对应「当前事实」由页面按封存输入做事实比对（不做任何分配重算）。
+    //   assetsSig   —— 目标页最近一次读到的 raw.assets 指纹，用于发现余额 / 持仓 / 行情变化；
+    //   factsEpoch  —— 事实视图的代数；生成建议期间代数变了，说明晚到的响应已过期，必须丢弃。
+    assetsSig: null, factsEpoch: 0,
+    // 追加式事实集合：null = 内存无副本（保存时由门面按服务端现值补回）；
+    // 只有「从备份恢复」会临时给出整份集合作为覆盖写入。
+    riskAssessments: null, allocationTargets: null, approvedInstruments: null,
     wiz: null
   };
 
@@ -63,11 +89,6 @@
   function txnCategory(t) {
     if (t.type === 'transfer') return null;
     return categoryById(t.category);
-  }
-  function txnIcon(t) {
-    if (t.type === 'transfer') return '🔁';
-    var c = txnCategory(t);
-    return c ? c.icon : '❓';
   }
   function txnTitle(t) { return t.merchant || (t.type === 'transfer' ? '转账' : (txnCategory(t) ? txnCategory(t).name : '未分类')); }
   function txnSub(t) {
@@ -105,10 +126,18 @@
       toast('加密密钥不在内存，为防明文泄露已暂停保存，请刷新解锁', 'err');
       return Promise.reject(new Error('locked'));
     }
-    return Store.saveAll({
+    var payload = {
       accounts: state.accounts, categories: state.categories,
       txns: state.txns, settings: state.settings, assets: state.assets
-    }, options).then(function () {
+    };
+    // 追加式事实集合（评估 / 目标 / 认可标的）平时**不**随页面保存提交 —— Store 门面会按服务端
+    // 现值补回，记一笔账不可能抹掉这些事实。只有「从备份恢复」会显式给出整份集合（覆盖语义）。
+    COMPANION_KEYS.forEach(function (k) {
+      if (Array.isArray(state[k])) payload[k] = state[k];
+    });
+    var explicit = COMPANION_KEYS.some(function (k) { return Array.isArray(state[k]); });
+    return Store.saveAll(payload, options).then(function () {
+      if (explicit) COMPANION_KEYS.forEach(function (k) { state[k] = null; }); // 缓存只服务这一次覆盖写入
       return true; // 已确认落盘（S2：调用方据此决定是否提示成功/回滚乐观更新）
     }).catch(function (e) {
       if (e && (e.code === 'readonly' || e.code === 'unreachable')) {
@@ -139,6 +168,1141 @@
     setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 400);
   }
   function todayDateStr() { return Core.todayStr(); }
+
+  /* ================= Phase 5B：风险评估与复评（D-047） =================
+   * 页面只是展示与提交入口：评分、等级、上限、到期与「当前有效评估」全部由
+   * js/domain.js 的冻结规则与服务端计算，这里不写第二套判断（不变量 3）。
+   * 显示文案只是渲染层（持久化只认题目/选项 id，D-046 ①）；逐项知识卡属 5E。
+   */
+  var RISKQ_LABELS = {
+    q_income_stability: '收入稳定性：你的收入来源是否稳定可预期？',
+    q_emergency_fund: '应急金覆盖：安全储备能覆盖几个月必要支出？',
+    q_debt_pressure: '负债压力：当前负债与近期应付款的压力如何？',
+    q_horizon: '投资期限：这笔可投资资金你预计多久不动用？',
+    q_liquidity_need: '近期流动性需求：未来一年是否有较大用款计划？',
+    q_experience: '投资经验：你有多年的投资经历？',
+    q_knowledge: '基础知识：你对资产类别的风险收益特征了解多少？',
+    q_drawdown_tolerance: '回撤承受：账面短期最大下跌多少你会坚持持有？',
+    q_fx_understanding: '汇率与跨境风险：你理解持有外币资产的汇率影响吗？'
+  };
+  var RISKO_LABELS = {
+    o_fixed_stable: '固定工资，稳定可预期', o_variable_predictable: '浮动但大体可预测',
+    o_irregular: '不规则收入', o_no_stable_income: '没有稳定收入',
+    o_cover_12m_plus: '12 个月以上', o_cover_6_12m: '6–12 个月', o_cover_3_6m: '3–6 个月',
+    o_cover_under_3m: '不足 3 个月',
+    o_no_debt: '无负债', o_manageable: '可控', o_heavy: '压力较大',
+    o_current_due_or_overdue: '近期应付款紧迫或已逾期',
+    o_horizon_10y_plus: '10 年以上', o_horizon_5_10y: '5–10 年', o_horizon_3_5y: '3–5 年',
+    o_horizon_under_3y: '不足 3 年',
+    o_no_need: '没有计划中的用款', o_minor_need: '仅有小额需求', o_planned_1_3y: '1–3 年内有明确计划',
+    o_large_within_1y: '一年内有大额用款',
+    o_exp_5y_plus: '5 年以上', o_exp_2_5y: '2–5 年', o_exp_under_2y: '不足 2 年', o_exp_none: '几乎没有',
+    o_know_solid: '理解较扎实', o_know_basic: '基础了解', o_know_limited: '了解有限', o_know_none: '基本不了解',
+    o_dd_over_30: '30% 以上', o_dd_20_30: '20–30%', o_dd_10_20: '10–20%', o_dd_under_10: '不足 10%',
+    o_fx_clear: '清楚会折算与波动', o_fx_partial: '部分理解', o_fx_limited: '了解有限', o_fx_none: '不了解'
+  };
+  var RISKDIM_LABELS = {
+    income_stability: '收入稳定性', emergency_fund: '应急金覆盖', debt_pressure: '负债与近期应付款',
+    horizon: '投资期限', liquidity_need: '近期流动性需求',
+    experience: '投资经验', knowledge: '基础知识', drawdown_tolerance: '最大可接受回撤',
+    fx_understanding: '跨境与汇率风险理解'
+  };
+  var RISKREASON_LABELS = {
+    initial: '首次评估', annual_expired: '年度到期复评', income_change: '收入变化',
+    debt_change: '负债变化', overseas_status_change: '外派/跨境状态变化',
+    major_goal_change: '重大目标变化', liquidity_change: '流动性需求变化', manual: '手动复评'
+  };
+  var RISKSTATUS_LABELS = { valid: '有效', expiring_soon: '即将到期', expired: '已过期' };
+  var RISKCEILSOURCE_LABELS = {
+    capacity: '客观承受能力较低的一侧',
+    willingness: '主观风险意愿较低的一侧',
+    equal: '能力与意愿同为最低',
+    hard_cap: '硬封顶条件压低（关键短板优先于总分）'
+  };
+  var RISKHARDCAP_LABELS = {
+    hard_cap_emergency_fund: '应急金不足 3 个月',
+    hard_cap_income_stability: '没有稳定收入',
+    hard_cap_liquidity_need: '一年内有大额用款计划',
+    hard_cap_debt_pressure: '近期应付款紧迫或已逾期'
+  };
+
+  function riskOptionLabel(optionId) { return RISKO_LABELS[optionId] || optionId; }
+  function riskDimLabel(d) { return RISKDIM_LABELS[d] || d; }
+
+  function riskResultBlock(rec, validity) {
+    var html = '<div class="card"><div class="row"><b>评估结果 · 风险上限 L' + rec.ceiling + '</b>' +
+      '<span class="small muted" style="margin-left:auto">规则 ' + esc(rec.ruleVersion) + '</span></div>' +
+      '<div class="small muted">承受能力：' + rec.capacityScore + ' 分（0–15）→ 第 ' + rec.capacityLevel + ' 级' +
+      ' ｜ 风险意愿：' + rec.willingnessScore + ' 分（0–12）→ 第 ' + rec.willingnessLevel + ' 级</div>' +
+      '<div class="small" style="margin-top:6px">最终上限取<b>较低</b>的一侧：由「' +
+      esc(RISKCEILSOURCE_LABELS[rec.ceilingSource] || rec.ceilingSource) + '」决定；高意愿不能覆盖低能力。</div>';
+    if (rec.hardCaps.length) {
+      html += '<div class="small" style="margin-top:6px"><b>硬封顶命中（只降不升）：</b>' +
+        rec.hardCaps.map(function (c) { return esc(RISKHARDCAP_LABELS[c.code] || c.code) + '（压到 L' + c.maxLevel + '）'; }).join('；') + '</div>';
+    }
+    if (validity) {
+      html += '<div class="small muted" style="margin-top:6px">' +
+        (validity.status === 'expired'
+          ? '本评估已于 ' + esc(validity.expiry) + ' 过期，只作历史回看；请复评。'
+          : '有效期至 ' + esc(validity.expiry) + '（剩 ' + validity.remainingDays + ' 天）' +
+            (validity.status === 'expiring_soon' ? '，即将到期' : '') + '。') +
+        '</div>';
+    }
+    return html + '<div class="small muted" style="margin-top:4px">边界说明：本页面只给出风险上限；目标区间由 5C 的' +
+      '<button class="link" data-action="nav:targets">目标配置</button> 页按上限映射冻结模板得到并维护认可标的，' +
+      '新增资金分配由 5D 在同一页给出（只补低配、不卖出）。本页面不预测收益、不推荐证券、不接收投资金额。</div></div>';
+  }
+
+  function riskHistoryBlock(items, currentId) {
+    return '<div class="sec-head"><b>评估历史（追加版本，永不覆盖）</b></div>' +
+      '<div class="card">' + items.map(function (r) {
+        return '<div class="acc-card"><div class="row"><b>' + esc(r.assessedAt) + ' 评估</b>' +
+          '<span class="small muted" style="margin-left:auto">' +
+          esc(RISKREASON_LABELS[r.reason] || r.reason) + (r.id === currentId ? ' · 当前' : '') + '</span></div>' +
+          '<div class="small muted">上限 L' + r.ceiling + '（' + esc(RISKCEILSOURCE_LABELS[r.ceilingSource] || r.ceilingSource) + '）' +
+          ' · 能力 ' + r.capacityScore + '/意愿 ' + r.willingnessScore + ' · 至 ' + esc(r.expiry) + '</div>' +
+          '<div class="small muted">规则 ' + esc(r.ruleVersion) + ' · 保存于 ' + esc(String(r.createdAt).slice(0, 19).replace('T', ' ')) + '</div>' +
+          '</div>';
+      }).join('') + '</div>';
+  }
+
+  /* 5E-4：本地知识卡入口。页面只按已知 id 生成链接（未知 id 不渲染入口，
+     打开时 know:open 再统一走 Knowledge.getCard）；卡片只解释概念与规则来源，
+     不带账户事实、不构成建议（D-051）。Knowledge 未加载时静默不出入口。 */
+  function knowledgeLinkHtml(cardId, label) {
+    if (typeof window === 'undefined' || !window.Knowledge || !window.Knowledge.getCard(cardId)) return '';
+    return ' <button type="button" class="link" data-action="know:open"' +
+      ' data-card-id="' + esc(cardId) + '">' + esc(label) + '</button>';
+  }
+
+  /* 5E-1：决策台风险摘要卡。数值与判定全部来自服务端的当前评估视图
+     （Store.riskAssessmentCurrent → 领域 selectCurrentAssessment），本页只格式化：
+     不重算评分/等级/上限/到期，也不据此生成建议（D-047 ⑧、不变量 3）。
+     无评估 / 有效 / 即将到期 / 已过期 / 记录不可用 / 读不到 各为独立状态，
+     过期与读取失败都不得显示为「当前有效」，缺数据也不显示 0 分或 L0。 */
+  function riskSummaryCardHtml() {
+    var view = 'none', status = '', chip = '', attrs = '', body = '', reason = 'initial';
+
+    function chipHtml(text, kind) {
+      return '<span class="dash-chip' + (kind ? ' ' + kind : '') + '" data-risk-chip="' + esc(text) + '">' +
+        esc(text) + '</span>';
+    }
+    // 复核不过的记录数必须显式留证据，不能静默消失（D-047 ⑥）。
+    function invalidNote(cur) {
+      return cur.invalidCount > 0
+        ? '<div class="small muted" data-risk-invalid="' + cur.invalidCount + '/' + cur.total + '">' +
+          '另有 ' + cur.invalidCount + '/' + cur.total + ' 条评估记录未通过服务端复核，未计入上面的判定。</div>'
+        : '';
+    }
+
+    if (Store.info().mode !== Store.MODE_API) {
+      view = 'unavailable';
+      chip = chipHtml('未连接服务', 'warn');
+      // G5-R3：知识卡是本地静态内容，不依赖账户事实与 API。服务不可达时这里不能变成死路 ——
+      // 用户仍要能从真实页面入口点开知识卡（断网重载后也要能点）。
+      var offlineKnow = knowledgeLinkHtml('card-capacity-vs-willingness', '能力与意愿说明');
+      body = '<div class="small">风险上限的判定由本地服务按冻结规则给出。运行 start.command' +
+        '（或 node server/main.js）后可在这里查看当前评估。' +
+        (offlineKnow ? '<br>不依赖服务，现在就能读：' + offlineKnow : '') + '</div>';
+    } else {
+      var cur = state.riskCurrent;
+      status = (cur && cur.status) || '';
+      if (!cur) {
+        view = state.riskCurrentError ? 'error' : 'loading';
+        chip = chipHtml(state.riskCurrentError ? '读取失败' : '读取中', state.riskCurrentError ? 'warn' : '');
+        body = '<div class="small' + (state.riskCurrentError ? '' : ' muted') + '">' +
+          (state.riskCurrentError ? '风险评估判定读取失败：' + esc(state.riskCurrentError) : '正在读取当前评估判定…') +
+          '</div>';
+      } else if (status === 'current') {
+        var rec = cur.current.assessment;
+        var val = cur.current.validity;
+        view = val.status === 'expiring_soon' ? 'expiring' : 'valid';
+        chip = chipHtml(RISKSTATUS_LABELS[val.status], val.status === 'expiring_soon' ? 'warn' : 'ok');
+        reason = 'manual';
+        attrs = ' data-risk-validity="' + esc(val.status) + '"' +
+          ' data-risk-ceiling="' + rec.ceiling + '"' +
+          ' data-risk-capacity="' + rec.capacityScore + '/' + rec.capacityLevel + '"' +
+          ' data-risk-willingness="' + rec.willingnessScore + '/' + rec.willingnessLevel + '"' +
+          ' data-risk-ceiling-source="' + esc(rec.ceilingSource) + '"' +
+          ' data-risk-hard-caps="' + esc(rec.hardCaps.map(function (c) { return c.code; }).join(',')) + '"' +
+          ' data-risk-assessed-at="' + esc(rec.assessedAt) + '"' +
+          ' data-risk-expiry="' + esc(rec.expiry) + '"' +
+          ' data-risk-remaining-days="' + val.remainingDays + '"' +
+          ' data-risk-reason="' + esc(rec.reason) + '"';
+        body = '<div class="small" data-risk-ceiling-line>最终风险上限 <b>L' + rec.ceiling + '</b>' +
+          ' · 取<b>较低</b>的一侧：' + esc(RISKCEILSOURCE_LABELS[rec.ceilingSource] || rec.ceilingSource) +
+          '（高意愿不能覆盖低能力）' + knowledgeLinkHtml('card-capacity-vs-willingness', '能力与意愿') + '</div>' +
+          '<div class="small muted">承受能力 ' + rec.capacityScore + ' 分（0–15）→ 第 ' + rec.capacityLevel + ' 级' +
+          ' ｜ 风险意愿 ' + rec.willingnessScore + ' 分（0–12）→ 第 ' + rec.willingnessLevel + ' 级</div>' +
+          (rec.hardCaps.length
+            ? '<div class="small"><b>硬封顶命中（只降不升）：</b>' +
+              rec.hardCaps.map(function (c) {
+                return esc(RISKHARDCAP_LABELS[c.code] || c.code) + '（压到 L' + c.maxLevel + '）' +
+                  knowledgeLinkHtml(c.explainKey, '说明');
+              }).join('；') + '</div>'
+            : '') +
+          '<div class="small muted">评估日期 ' + esc(rec.assessedAt) + ' · 到期日 ' + esc(rec.expiry) +
+          '（剩 ' + val.remainingDays + ' 天）· 触发原因：' + esc(RISKREASON_LABELS[rec.reason] || rec.reason) +
+          ' · 规则 ' + esc(rec.ruleVersion) + '</div>' +
+          (val.status === 'expiring_soon'
+            ? '<div class="small">即将到期：到期日次日判定即失效，正式建议需要一份未过期的评估。</div>'
+            : '');
+      } else if (status === 'all_expired') {
+        view = 'expired';
+        chip = chipHtml(RISKSTATUS_LABELS.expired, 'warn');
+        reason = 'annual_expired';
+        attrs = ' data-risk-validity="expired"' +
+          ' data-risk-assessed-at="' + esc((cur.expiredRef && cur.expiredRef.assessedAt) || '') + '"' +
+          ' data-risk-expiry="' + esc((cur.expiredRef && cur.expiredRef.expiry) || '') + '"';
+        body = '<div class="small">评估已过期：最近一份评估（' +
+          esc((cur.expiredRef && cur.expiredRef.assessedAt) || '—') + '）已于 ' +
+          esc((cur.expiredRef && cur.expiredRef.expiry) || '—') +
+          ' 过期，只作历史回看，不能用于正式建议。</div>' +
+          '<div class="small muted">市场涨跌本身不触发复评，到期或收入 / 负债 / 外派 / 目标 / 流动性变化时才需要复评。</div>';
+      } else if (status === 'no_assessment') {
+        view = 'none';
+        chip = chipHtml('尚未评估', '');
+        body = '<div class="small">还没有有效的风险评估。正式的新增资金建议要求一份未过期的评估；' +
+          '问卷约需 2 分钟。没有评估时这里不显示任何上限或得分。</div>';
+      } else {
+        // invalid_records 以及未来新增的状态：fail closed，只报状态不猜数值。
+        view = 'invalid';
+        status = status || 'unknown';
+        chip = chipHtml('无法判定', 'warn');
+        reason = 'manual';
+        attrs = ' data-risk-invalid="' + ((cur && cur.invalidCount) || 0) + '/' + ((cur && cur.total) || 0) + '"';
+        body = '<div class="small">已保存的评估记录与当前冻结规则校验不一致（' +
+          ((cur && cur.invalidCount) || 0) + '/' + ((cur && cur.total) || 0) + ' 条），' +
+          '按 fail closed 处理：不使用失效记录，也不在这里给出上限。</div>';
+      }
+      if (cur) body += invalidNote(cur);
+      if (cur && state.riskCurrentLoading) {
+        view = 'refreshing';
+        chip = chipHtml('核对中', 'warn');
+        body += '<div class="small" data-risk-pending>正在向本机服务复核。上面是上次读取的结果，' +
+          '在复核完成前不能视为当前有效判定。</div>';
+      }
+      if (cur && state.riskCurrentError) {
+        view = 'stale';
+        chip = chipHtml('未复核', 'warn');
+        body += '<div class="small" data-risk-stale>最近一次复核失败：' + esc(state.riskCurrentError) +
+          '。上面的判定是上一次读取的结果，可能已不是当前状态。</div>';
+      }
+    }
+
+    // 摘要读不到也不收回入口：风险页自己会说明服务与判定状态（5E-1 只加只读卡，不改导航）。
+    var entry = '<div class="row" style="gap:10px;margin-top:10px">' +
+      '<button class="btn small" data-action="nav:risk">评估详情与历史</button>' +
+      '<button class="btn small ghost" data-action="risk:reassess" data-reason="' + esc(reason) + '">' +
+      (reason === 'initial' ? '开始评估问卷' : '复评') + '</button></div>';
+    var retry = state.riskCurrentError
+      ? '<div style="margin-top:8px"><button class="btn small ghost" data-action="risk:retry">重新读取评估判定</button></div>'
+      : '';
+    return '<div class="card" data-risk-summary="' + esc(view) + '"' +
+      ' data-risk-status="' + esc(status) + '"' + attrs + '>' +
+      '<div class="row"><b>风险评估</b><span style="margin-left:auto">' + chip + '</span></div>' +
+      body + entry + retry + '</div>';
+  }
+
+  // 只替换摘要卡，避免服务端响应打断归因基准等决策台上的其它交互。
+  function refreshRiskSummaryCard() {
+    if (state.page !== 'home') return;
+    var card = $('#view [data-risk-summary]');
+    if (card) card.outerHTML = riskSummaryCardHtml();
+  }
+
+  function ensureRiskCurrentLoaded() {
+    if (state.riskCurrentLoading) return;
+    if (Store.info().mode !== Store.MODE_API) return;
+    var request = ++state.riskCurrentRequest;
+    state.riskCurrentLoading = true;
+    state.riskCurrentError = '';
+    refreshRiskSummaryCard();
+    Store.riskAssessmentCurrent().then(function (r) {
+      if (request !== state.riskCurrentRequest) return;
+      state.riskCurrentLoading = false;
+      state.riskCurrent = r || null;
+      state.riskCurrentError = '';
+      refreshRiskSummaryCard();
+    }).catch(function (e) {
+      if (request !== state.riskCurrentRequest) return;
+      state.riskCurrentLoading = false;
+      state.riskCurrentError = (e && e.message) || '风险评估判定读取失败';
+      refreshRiskSummaryCard();
+    });
+  }
+
+  /* 5E-2：决策台六类配置对照。金额、比例、容忍带与偏离全部来自
+     GET /api/v1/targets/current（Store.allocationCurrent），本页只格式化：
+     不重算比例、偏离或 canAdvise（不变量 3 / D-025 / D-050）。
+     无目标 / 无估值 / 分类未确认 / 读不到 各为独立状态，缺数据不得出现 0% 或正式口径。 */
+  function allocationCompareCardHtml() {
+    var view = 'none', status = '', chip = '', attrs = '', body = '';
+
+    function chipHtml(text, kind) {
+      return '<span class="dash-chip' + (kind ? ' ' + kind : '') + '" data-alloc-chip="' + esc(text) + '">' +
+        esc(text) + '</span>';
+    }
+
+    function entryBlock(showGenerate) {
+      return '<div class="row" style="gap:10px;margin-top:10px">' +
+        '<button class="btn small" data-action="nav:targets">' +
+        (showGenerate ? '去目标页生成区间' : '目标配置与维护') + '</button></div>';
+    }
+
+    // 六类行：data 属性逐项等于服务端 classes[]，供 wiring 与 API 同源核对。
+    function classRowsHtml(alloc, missing) {
+      return (alloc.classes || []).map(function (c) {
+        var isMissing = missing.indexOf(c.assetClass) >= 0;
+        var pct = c.pctBps == null ? null : bpsText(c.pctBps);
+        var band = c.band ? (BAND_LABELS[c.band] || c.band) : '';
+        var dev = c.deviationBps == null ? null : signedBpsText(c.deviationBps);
+        var detail;
+        if (pct == null) {
+          detail = '目标 ' + bpsText(c.minBps) + ' / ' + bpsText(c.targetBps) + ' / ' + bpsText(c.maxBps) +
+            ' · 比例不可用';
+        } else {
+          detail = pct + ' / 目标 ' + bpsText(c.minBps) + ' / ' + bpsText(c.targetBps) + ' / ' + bpsText(c.maxBps) +
+            (band ? ' · ' + band : '') + (dev != null ? ' · ' + dev : '');
+        }
+        return '<div class="risk-row" data-alloc-cls="' + esc(c.assetClass) + '"' +
+          ' data-value-minor="' + c.valueMinor + '"' +
+          ' data-pct-bps="' + (c.pctBps == null ? '' : c.pctBps) + '"' +
+          ' data-min-bps="' + c.minBps + '"' +
+          ' data-target-bps="' + c.targetBps + '"' +
+          ' data-max-bps="' + c.maxBps + '"' +
+          ' data-band="' + esc(c.band == null ? '' : c.band) + '"' +
+          ' data-deviation-bps="' + (c.deviationBps == null ? '' : c.deviationBps) + '"' +
+          ' data-missing-map="' + (isMissing ? '1' : '0') + '">' +
+          '<span class="r-name">' + esc((RISK_CLASS_LABELS[c.assetClass] || c.assetClass) +
+            (isMissing ? ' · 缺映射' : '')) + '</span>' +
+          '<span class="r-bar">' + (pct == null ? '' :
+            '<i style="width:' + Math.min((c.pctBps || 0) / 100, 100) + '%"></i>') + '</span>' +
+          '<span class="r-val">' + Core.fmtMoney(c.valueMinor) + '</span>' +
+          '<span class="r-pct">' + esc(detail) + '</span></div>';
+      }).join('');
+    }
+
+    function blockersHtml(alloc) {
+      if (alloc.canAdvise || !(alloc.blockers || []).length) return '';
+      return '<div class="db-list" style="margin-top:6px">' + alloc.blockers.map(function (b) {
+        return '<div class="db-item" data-alloc-blocker="' + esc(b.code) + '">· ' + esc(blockerText(b)) + '</div>';
+      }).join('') + '</div>';
+    }
+
+    if (Store.info().mode !== Store.MODE_API) {
+      view = 'unavailable';
+      chip = chipHtml('未连接服务', 'warn');
+      // G5-R3：与风险摘要同理，配置对照的服务不可达分支也要留本地知识卡入口。
+      var offlineKnow = knowledgeLinkHtml('card-tolerance-band', '容忍带说明');
+      body = '<div class="small">配置对照由本地服务在同一遍估值上给出当前与目标偏离。' +
+        '运行 start.command（或 node server/main.js）后可在这里查看。' +
+        (offlineKnow ? '<br>不依赖服务，现在就能读：' + offlineKnow : '') + '</div>';
+    } else {
+      var cur = state.allocCurrent;
+      status = (cur && cur.status) || '';
+      if (!cur) {
+        view = state.allocCurrentError ? 'error' : 'loading';
+        chip = chipHtml(state.allocCurrentError ? '读取失败' : '读取中', state.allocCurrentError ? 'warn' : '');
+        body = '<div class="small' + (state.allocCurrentError ? '' : ' muted') + '">' +
+          (state.allocCurrentError
+            ? '配置对照读取失败：' + esc(state.allocCurrentError)
+            : '正在读取当前配置对照…') +
+          '</div>';
+      } else if (status === 'current' && cur.allocation && cur.target) {
+        var alloc = cur.allocation;
+        var target = cur.target;
+        var missing = cur.missingClasses || [];
+        attrs = ' data-alloc-asof="' + esc(alloc.asOf) + '"' +
+          ' data-alloc-level="' + target.level + '"' +
+          ' data-alloc-investable="' + alloc.investableTotalMinor + '"' +
+          ' data-alloc-canadvise="' + (alloc.canAdvise ? '1' : '0') + '"' +
+          ' data-alloc-valuation="' + esc(alloc.valuationStatus || '') + '"';
+        if (alloc.status === 'no_investable') {
+          view = 'no_investable';
+          chip = chipHtml('无可估值投资池', 'warn');
+          body = '<div class="small">投资池当前没有可估值的资产（可投资资产为 0 或全部缺行情 / 汇率），' +
+            '因此不显示类别比例。数据日 ' + esc(alloc.asOf) + ' · 投资池 ' +
+            Core.fmtMoney(alloc.investableTotalMinor) + ' · 目标 L' + target.level + '</div>' +
+            classRowsHtml(alloc, missing) +
+            '<div class="small muted" style="margin-top:8px">缺数据时类别比例不可用，也不得显示为「都在区间内」。' +
+            '去目标页可核对目标区间与认可标的。</div>';
+        } else {
+          view = alloc.canAdvise ? 'ok' : 'estimate';
+          chip = chipHtml(alloc.canAdvise ? '正式口径对照' : '估算口径', alloc.canAdvise ? 'ok' : 'warn');
+          body = '<div class="small" data-alloc-meta>数据日 ' + esc(alloc.asOf) +
+            ' · 投资池 ' + Core.fmtMoney(alloc.investableTotalMinor) +
+            ' · 目标 L' + target.level +
+            ' · ' + esc(alloc.valuationStatus === 'formal' ? '正式口径' : '估算口径') + '</div>' +
+            classRowsHtml(alloc, missing) + blockersHtml(alloc) +
+            (missing.length
+              ? '<div class="small muted" style="margin-top:6px">缺认可标的映射：' +
+                missing.map(function (k) { return esc(RISK_CLASS_LABELS[k] || k); }).join('、') +
+                '（比例仍来自服务端估值，只是执行时没有可买标的）。</div>'
+              : '') +
+            '<div class="small muted" style="margin-top:8px">比例为服务端定点整数结果；偏离按 target 计，' +
+            '容忍带端点含入。区间来自 5A 冻结模板，本页不重算。' +
+            knowledgeLinkHtml('card-tolerance-band', '容忍带说明') + '</div>';
+        }
+      } else if (status === 'no_assessment') {
+        view = 'none';
+        chip = chipHtml('尚未评估', '');
+        body = '<div class="small">还没有有效的风险评估，因此没有可映射的目标区间。' +
+          '这里不显示比例、偏离或正式口径；完成风险评估后才能生成目标。</div>';
+      } else if (status === 'no_target') {
+        view = 'no_target';
+        chip = chipHtml('尚无目标', 'warn');
+        body = '<div class="small">已有有效的风险评估，但还没有生成目标版本。' +
+          '目标区间由服务端按风险上限映射冻结模板得到，页面不猜数值，也不显示比例对照。</div>';
+      } else if (status === 'stale_assessment') {
+        view = 'stale';
+        chip = chipHtml('目标待更新', 'warn');
+        body = '<div class="small">当前有效评估已经变化（或已过期），现有目标版本引用的不是这份评估。' +
+          '在重新生成目标前，这里不展示基于旧目标的比例对照。</div>';
+      } else {
+        // invalid_records 及未来新增状态：fail closed，只报状态不猜数值
+        view = 'invalid';
+        status = status || 'unknown';
+        chip = chipHtml('无法判定', 'warn');
+        attrs = ' data-alloc-invalid="' + ((cur && cur.invalidCount) || 0) + '/' + ((cur && cur.total) || 0) + '"';
+        body = '<div class="small">已保存的目标版本与冻结契约复核不一致（' +
+          ((cur && cur.invalidCount) || 0) + '/' + ((cur && cur.total) || 0) + ' 条），' +
+          '按 fail closed 处理：不使用失效记录，也不在这里给出比例对照。</div>';
+      }
+      if (cur && state.allocCurrentLoading) {
+        view = 'refreshing';
+        chip = chipHtml('核对中', 'warn');
+        body += '<div class="small" data-alloc-pending>正在向本机服务复核。上面是上次读取的结果，' +
+          '在复核完成前不能视为当前配置对照。</div>';
+      }
+      if (cur && state.allocCurrentError) {
+        view = 'stale';
+        chip = chipHtml('未复核', 'warn');
+        body += '<div class="small" data-alloc-stale>最近一次复核失败：' + esc(state.allocCurrentError) +
+          '。上面的结果是上一次读取的，可能已不是当前状态。</div>';
+      }
+    }
+
+    // 入口在任何状态下都不收回：无目标时引导去生成，其余状态引导维护与核对。
+    var entry = entryBlock(status === 'no_target' || status === 'no_assessment');
+    var retry = state.allocCurrentError
+      ? '<div style="margin-top:8px"><button class="btn small ghost" data-action="alloc:retry">重新读取配置对照</button></div>'
+      : '';
+    return '<div class="card" data-alloc-compare="' + esc(view) + '"' +
+      ' data-alloc-status="' + esc(status) + '"' + attrs + '>' +
+      '<div class="row"><b>配置对照</b><span style="margin-left:auto">' + chip + '</span></div>' +
+      body + entry + retry + '</div>';
+  }
+
+  // 只替换配置对照卡；生成结果未变化时不动 DOM，避免打断归因基准等既有交互（D-050 ③）。
+  function refreshAllocationCompareCard() {
+    if (state.page !== 'home') return;
+    var card = $('#view [data-alloc-compare]');
+    if (!card) return;
+    var next = allocationCompareCardHtml();
+    if (state.allocCompareHtml === next) return;
+    card.outerHTML = next;
+    state.allocCompareHtml = next;
+  }
+
+  function ensureAllocCurrentLoaded() {
+    if (state.allocCurrentLoading) return;
+    if (Store.info().mode !== Store.MODE_API) return;
+    var request = ++state.allocCurrentRequest;
+    state.allocCurrentLoading = true;
+    state.allocCurrentError = '';
+    refreshAllocationCompareCard();
+    Store.allocationCurrent().then(function (r) {
+      if (request !== state.allocCurrentRequest) return;
+      state.allocCurrentLoading = false;
+      state.allocCurrent = r || null;
+      state.allocCurrentError = '';
+      refreshAllocationCompareCard();
+    }).catch(function (e) {
+      if (request !== state.allocCurrentRequest) return;
+      state.allocCurrentLoading = false;
+      state.allocCurrentError = (e && e.message) || '配置对照读取失败';
+      refreshAllocationCompareCard();
+    });
+  }
+
+  function riskFormHtml() {
+    var answered = state.riskDraft.answers;
+    var count = Object.keys(answered).length;
+    var sections = ['capacity', 'willingness'].map(function (kind) {
+      var qs = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === kind; });
+      return '<div class="card"><div class="sec-head"><b>' +
+        (kind === 'capacity' ? '客观承受能力' : '主观风险意愿') + '</b>' +
+        '<span class="small muted">' + qs.length + ' 题</span></div>' +
+        qs.map(function (q) {
+          return '<fieldset style="margin:12px 0"><legend class="small"><b>' + esc(RISKQ_LABELS[q.id] || q.id) + '</b></legend>' +
+            q.options.map(function (o) {
+              return '<label class="row" style="gap:8px;margin:6px 0">' +
+                '<input type="radio" name="' + esc(q.id) + '" data-action="risk:answer" data-q="' + esc(q.id) + '" data-o="' + esc(o.id) + '"' +
+                (answered[q.id] === o.id ? ' checked' : '') + '>' +
+                '<span class="small">' + esc(riskOptionLabel(o.id)) + '</span></label>';
+            }).join('') + '</fieldset>';
+        }).join('') + '</div>';
+    }).join('');
+    return '<div class="small muted" style="margin:6px 0 10px">缺答会被拒绝，不会猜默认值；草稿只存在于本页面内存，' +
+      '离开页面即丢弃，不算已保存的评估。</div>' +
+      sections +
+      '<div class="card"><div class="row"><span class="small">复评原因</span>' +
+      '<select id="risk-reason" style="margin-left:auto">' +
+      Domain.REASSESS_REASONS.map(function (r) {
+        return '<option value="' + esc(r) + '"' + (r === state.riskDraft.reason ? ' selected' : '') + '>' +
+          esc(RISKREASON_LABELS[r] || r) + '</option>';
+      }).join('') + '</select></div>' +
+      '<div class="row" style="gap:10px;margin-top:10px">' +
+      '<button class="btn primary grow" data-action="risk:submit">提交评估</button>' +
+      '<button class="btn ghost" data-action="risk:cancel">取消</button></div>' +
+      '<div class="small muted" style="margin-top:6px">已答 ' + count + '/' + Domain.RISK_QUESTIONS.length +
+      ' 题 · 评估日期按今天（' + esc(todayDateStr()) + '）记录；所有派生值由服务端按规则 ' + esc(Domain.RISK_RULE_VERSION) + ' 重算。</div>' +
+      '</div>';
+  }
+
+  function tplRisk() {
+    var html = '<div class="dash-head"><div><div class="dash-title">风险评估</div>' +
+      '<div class="small muted">双评分 · 硬封顶 · 年度与重大事件复评 · 本机保存</div></div>' +
+      '<button class="btn ghost" data-action="nav:home">返回决策台</button></div>';
+    if (Store.info().mode === Store.MODE_LOCAL) {
+      return html + '<div class="card"><div class="small">风险评估需要经过本地服务写入 SQLite 事实源。' +
+        '请运行 start.command（或 node server/main.js）后重试。</div></div>';
+    }
+    if (state.riskLoading) return html + '<div class="card"><div class="small muted">评估数据加载中…</div></div>';
+    if (state.riskError && !state.riskItems.length) {
+      return html + '<div class="card"><div class="small">风险评估读取失败：' + esc(state.riskError) + '</div>' +
+        '<button class="btn small" style="margin-top:8px" data-action="nav:risk">重试</button></div>';
+    }
+    if (state.riskView === 'form') return html + riskFormHtml();
+    if (!state.riskItems.length) {
+      return html + '<div class="card"><div class="small">还没有有效的风险评估。' +
+        '正式的新增资金建议要求一份未过期的评估；问卷约需 2 分钟。</div>' +
+        '<button class="btn primary" style="margin-top:10px" data-action="risk:start">开始评估问卷</button></div>';
+    }
+    var cur = state.riskCurrent;
+    if (!cur || cur.status !== 'current') {
+      var why = cur && cur.status === 'all_expired'
+        ? '最近一份评估已于 ' + esc((cur.expiredRef && cur.expiredRef.expiry) || '—') + ' 过期。'
+        : cur && cur.status === 'invalid_records'
+          ? '已保存的评估记录与当前规则校验不一致（fail closed，不使用失效记录）。'
+          : '还没有风险评估。';
+      var reason = (cur && cur.status === 'all_expired') ? 'annual_expired' : 'initial';
+      return html + '<div class="card"><div class="small">' + why + '市场涨跌本身不触发复评，' +
+        '到期或收入 / 负债 / 外派 / 目标 / 流动性变化时才需要复评。</div>' +
+        '<button class="btn primary" style="margin-top:10px" data-action="risk:start" data-reason="' + esc(reason) + '">' +
+        (reason === 'annual_expired' ? '开始复评' : '开始评估问卷') + '</button></div>' +
+        riskHistoryBlock(state.riskItems, null);
+    }
+    var rec = cur.current.assessment;
+    html += riskResultBlock(rec, cur.current.validity);
+    html += '<div class="card"><div class="row"><span class="small">评估日期 ' + esc(rec.assessedAt) +
+      ' · 到期日 ' + esc(rec.expiry) + ' · 触发原因：' + esc(RISKREASON_LABELS[rec.reason] || rec.reason) + '</span>' +
+      '<button class="btn small" style="margin-left:auto" data-action="risk:start" data-reason="manual">复评</button></div>' +
+      '<div class="small muted" style="margin-top:4px">收入、负债、外派状态、重大目标或流动性需求发生' +
+      '变化时可提前复评；复评会追加新版本，历史答案保持原样且按当时规则版本可读。</div></div>';
+    return html + riskHistoryBlock(state.riskItems, rec.id);
+  }
+
+  function ensureRiskLoaded(force) {
+    if (!force && state.riskLoaded && state.riskCurrent) { render(); return; }
+    var request = ++state.riskCurrentRequest;
+    state.riskCurrentLoading = false;
+    state.riskLoading = true;
+    render();
+    Promise.all([Store.listRiskAssessments(), Store.riskAssessmentCurrent()])
+      .then(function (rs) {
+        state.riskItems = (rs[0] && rs[0].items) || [];
+        if (request === state.riskCurrentRequest) {
+          state.riskCurrent = rs[1] || null;
+          state.riskCurrentError = '';
+        }
+        state.riskLoading = false;
+        state.riskLoaded = true;
+        if (state.page === 'risk') render();
+      })
+      .catch(function (e) {
+        state.riskLoading = false;
+        state.riskError = (e && e.message) || '风险评估读取失败';
+        if (state.page === 'risk') render();
+      });
+  }
+
+  function submitRiskAssessment() {
+    var qs = Domain.RISK_QUESTIONS;
+    var missing = qs.filter(function (q) { return !state.riskDraft.answers[q.id]; }).map(function (q) { return RISKQ_LABELS[q.id] || q.id; });
+    if (missing.length) { toast('还有 ' + missing.length + ' 题未回答：' + missing[0], 'err'); return; }
+    var sel = document.querySelector('#risk-reason');
+    if (sel) state.riskDraft.reason = sel.value;
+    var answers = qs.map(function (q) { return { questionId: q.id, optionId: state.riskDraft.answers[q.id] }; });
+    // 载荷只含答案 / 评估日期 / 复评原因 —— 派生值由服务端重算（§5.3）
+    var payload = { answers: answers, assessedAt: todayDateStr(), reason: state.riskDraft.reason };
+    var idemKey = Core.newId('ra');
+    Store.createRiskAssessment(payload, { idempotencyKey: idemKey }).then(function (r) {
+      state.riskView = 'list';
+      state.riskDraft = { answers: {}, reason: 'initial' };
+      toast('评估已保存：风险上限 L' + r.item.ceiling + '（规则 ' + r.item.ruleVersion + '）');
+      ensureRiskLoaded(true);
+    }).catch(function (e) {
+      toast('评估未保存：' + ((e && e.message) || '写入失败'), 'err');
+    });
+  }
+
+
+  /* ================= Phase 5C：目标配置与认可标的映射 =================
+   * 页面只消费服务端给出的目标与偏离（Store.allocationCurrent），不在浏览器重算映射、
+   * 比例或 blocker 判断（不变量 3 / D-025）。5D 的新增资金建议同样只渲染服务端产物：
+   * 页面提交的只有金额与引用绑定，「能不能给正式建议」的判断不在这里发生。 */
+  var BAND_LABELS = { below_min: '低配', within: '区间内', above_max: '高配' };
+  var MAPPING_ISSUE_LABELS = {
+    instrument_missing: '标的不存在（失效引用）',
+    classification_unconfirmed: '分类未确认',
+    class_mismatch: '与标的类别冲突'
+  };
+
+  function bpsText(b) {
+    if (b == null) return '—';
+    var pct = b / 100;
+    return (Math.round(pct * 100) / 100).toFixed(2).replace(/\.?0+$/, '') + '%';
+  }
+
+  function signedBpsText(b) {
+    if (b == null) return '—';
+    return (b > 0 ? '+' : '') + bpsText(b);
+  }
+
+  function targetStatusBlock(view) {
+    var s = view.status;
+    if (s === 'no_assessment' || (s === 'current' && !view.target && view.assessmentStatus === 'no_assessment')) {
+      return '<div class="card"><div class="small">还没有有效的风险评估，因此没有可映射的目标区间。' +
+        '市场涨跌不触发复评；到期或收入 / 负债 / 外派 / 目标 / 流动性变化时才需要复评。</div>' +
+        '<button class="btn primary" style="margin-top:10px" data-action="nav:risk">去做风险评估</button></div>';
+    }
+    if (s === 'invalid_records') {
+      return '<div class="card"><div class="small">已保存的目标版本与冻结契约复核不一致' +
+        '（' + view.invalidCount + ' / ' + view.total + ' 条），fail closed，不使用失效记录。</div>' +
+        '<button class="btn small" style="margin-top:8px" data-action="target:reload">重新读取</button></div>';
+    }
+    if (s === 'stale_assessment') {
+      return '<div class="card"><div class="small">当前有效评估已经变化（或已过期），现有目标版本引用的不是这份评估。' +
+        '历史目标版本保持原样，不会被改写。</div>' +
+        '<button class="btn primary" style="margin-top:10px" data-action="target:generate">按当前评估生成新版本</button></div>';
+    }
+    return '<div class="card"><div class="small">已有有效的风险评估，但还没有生成目标版本。' +
+      '目标区间由服务端按风险上限映射 5A 冻结模板得到，页面不猜数值。</div>' +
+      '<button class="btn primary" style="margin-top:10px" data-action="target:generate">从当前评估生成目标</button></div>';
+  }
+
+  function targetSummaryBlock(t, view) {
+    var a = view.assessment;
+    return '<div class="card"><div class="row"><b>目标资产类别区间</b>' +
+      '<span class="small muted" style="margin-left:auto">上限 L' + t.level + ' · 模板 ' + esc(t.templateVersion) + '</span></div>' +
+      '<div class="small muted" style="margin-top:4px">生效日 ' + esc(t.effectiveFrom) +
+      ' · 来自 ' + esc(a.assessedAt) + ' 的评估（上限 L' + a.ceiling + '，' + esc(a.reason) + '）' +
+      ' · 该评估有效期至 ' + esc(a.expiry) + '</div>' +
+      '<div class="small muted" style="margin-top:4px">规则 ' + esc(t.ruleVersion) +
+      ' · 版本 ' + esc(t.id) + '（追加式，历史版本永不覆盖）</div></div>';
+  }
+
+  function allocationBlock(alloc, missingClasses) {
+    if (alloc.status === 'no_investable') {
+      return '<div class="card"><div class="row"><b>当前配置与偏离</b>' +
+        '<span class="small muted" style="margin-left:auto">数据日 ' + esc(alloc.asOf) + '</span></div>' +
+        '<div class="small muted" style="margin-top:8px">投资池当前没有可估值的资产（可投资资产为 0 或全部缺行情 / 汇率），' +
+        '因此不显示类别比例。缺映射的类别已在下方列出。</div></div>';
+    }
+    var rows = alloc.classes.map(function (c) {
+      return '<div class="risk-row"><span class="r-name">' + esc(RISK_CLASS_LABELS[c.assetClass] || c.assetClass) +
+        (missingClasses.indexOf(c.assetClass) >= 0 ? ' <span class="small">· 缺映射</span>' : '') + '</span>' +
+        '<span class="r-bar"><i style="width:' + Math.min((c.pctBps || 0) / 100, 100) + '%"></i></span>' +
+        '<span class="r-val">' + Core.fmtMoney(c.valueMinor) + '</span>' +
+        '<span class="r-pct">' + bpsText(c.pctBps) + ' / ' + bpsText(c.minBps) + '–' + bpsText(c.maxBps) +
+        ' · ' + esc(BAND_LABELS[c.band] || c.band) + ' · ' + esc(signedBpsText(c.deviationBps)) + '</span></div>';
+    }).join('');
+    return '<div class="card"><div class="row"><b>当前配置与偏离</b>' +
+      '<span class="small muted" style="margin-left:auto">数据日 ' + esc(alloc.asOf) + ' · 投资池 ' +
+      Core.fmtMoney(alloc.investableTotalMinor) + '</span></div>' + rows +
+      '<div class="small muted" style="margin-top:8px">区间为 5A 冻结目标（min–max，端点含入），偏离按 target 计；' +
+      '比例由服务端在<b>与决策台同一遍估值</b>上按定点整数算出，Σ 恒等于 100%。' +
+      '这一屏只回答「目标是什么、能用什么执行」；新增资金怎么分见下方「新增资金优先再平衡」。</div></div>';
+  }
+
+  function mappingBlock(cls, rows, missingClasses) {
+    var list = rows.filter(function (r) { return r.assetClass === cls; });
+    var pool = state.assets.instruments.filter(function (i) {
+      return i && i.id && i.assetClass === cls && i.classificationStatus === 'confirmed' &&
+        !rows.some(function (r) { return r.instrumentId === i.id && r.assetClass !== cls; });
+    });
+    var used = {};
+    rows.forEach(function (r) { used[r.instrumentId] = true; });
+    var candidates = pool.filter(function (i) { return !used[i.id]; });
+    return '<div class="acc-card"><div class="row"><b>' + esc(RISK_CLASS_LABELS[cls] || cls) + '</b>' +
+      '<span class="small muted" style="margin-left:auto">' +
+      (missingClasses.indexOf(cls) >= 0 ? '缺有效认可标的' : (list.length ? list.length + ' 个候选' : '未维护')) +
+      '</span></div>' +
+      (list.length ? list.map(function (r, idx) {
+        return '<div class="row small" style="margin-top:6px"><span>' + (idx + 1) + '. ' +
+          esc(r.symbol || r.instrumentId) + (r.instrumentName ? ' · ' + esc(r.instrumentName) : '') +
+          (r.status === 'invalid' ? ' <span class="warn-text">' + esc((r.issues || []).map(function (k) {
+            return MAPPING_ISSUE_LABELS[k] || k;
+          }).join('、')) + '</span>' : '') + '</span>' +
+          '<span style="margin-left:auto">' +
+          (idx > 0 ? '<button class="link" data-action="map:up" data-cls="' + esc(cls) + '" data-id="' + esc(r.id) + '">上移</button> ' : '') +
+          (idx < list.length - 1 ? '<button class="link" data-action="map:down" data-cls="' + esc(cls) + '" data-id="' + esc(r.id) + '">下移</button> ' : '') +
+          '<button class="link" data-action="map:remove" data-cls="' + esc(cls) + '" data-id="' + esc(r.id) + '">移除</button>' +
+          '</span></div>';
+      }).join('') : '<div class="small muted" style="margin-top:6px">还没有认可标的。类别建议可以成立，但没有映射时不会给出任何具体证券。</div>') +
+      '<div class="row" style="gap:8px;margin-top:8px">' +
+      (candidates.length
+        ? '<select id="map-pick-' + esc(cls) + '" class="grow">' +
+          candidates.map(function (i) {
+            return '<option value="' + esc(i.id) + '">' + esc(i.symbol) + (i.exchange ? '·' + esc(i.exchange) : '') +
+              (i.name ? ' ' + esc(i.name) : '') + '</option>';
+          }).join('') + '</select>' +
+          '<button class="btn small" data-action="map:add" data-cls="' + esc(cls) + '">加入认可</button>'
+        : '<span class="small muted">没有「分类已确认且类别一致」的标的可选。请先到资产页确认分类；' +
+          '行情或目录刷新不会替你加入、删除或改写认可标的。</span>') +
+      '</div></div>';
+  }
+
+  function tplTargets() {
+    var html = '<div class="dash-head"><div><div class="dash-title">目标配置与认可标的</div>' +
+      '<div class="small muted">风险上限 → 类别区间 · 用户认可标的白名单 · 本机保存</div></div>' +
+      '<button class="btn ghost" data-action="nav:home">返回决策台</button></div>';
+    if (Store.info().mode !== Store.MODE_API) {
+      return html + '<div class="card"><div class="small">目标配置与认可标的需要经过本地服务写入 SQLite 事实源。' +
+        '请运行 start.command（或 node server/main.js）后重试。</div></div>';
+    }
+    if (state.targetsLoading && !state.targetsView) {
+      return html + '<div class="card"><div class="small muted">目标配置读取中…</div></div>';
+    }
+    if (state.targetsError && !state.targetsView) {
+      return html + '<div class="card"><div class="small">目标配置读取失败：' + esc(state.targetsError) + '</div>' +
+        '<button class="btn small" style="margin-top:8px" data-action="target:reload">重试</button></div>';
+    }
+    var view = state.targetsView || {};
+    var alloc = view.allocation;
+    var mapping = view.mapping || { rows: [], validCount: 0, issueCount: 0 };
+    var missingClasses = view.missingClasses || [];
+    if (view.status !== 'current') {
+      html += targetStatusBlock(view);
+    } else {
+      html += targetSummaryBlock(view.target, view);
+      if (alloc) {
+        if (!alloc.canAdvise) {
+          html += '<div class="card"><div class="row"><b class="small">当前为估算口径，下列比例仅供核对</b>' +
+            '<span class="small muted" style="margin-left:auto">' + esc(alloc.valuationStatus) + '</span></div>' +
+            '<div class="db-list">' + (alloc.blockers || []).map(function (b) {
+              return '<div class="db-item">· ' + esc(blockerText(b)) + '</div>';
+            }).join('') + '</div>' +
+            '<div class="small muted" style="margin-top:6px">阻塞项沿用决策台同一套口径（不另写第二遍判断）；' +
+            '缺行情 / 汇率或分类未确认时不据此给正式建议。</div></div>';
+        }
+        html += allocationBlock(alloc, missingClasses);
+      }
+    }
+    // 只读刷新入口在任何状态下都要可用（读取失败时的「重试」也指向这里）
+    html += '<div class="row" style="margin-top:10px"><button class="btn small ghost" data-action="target:reload">重新读取</button>' +
+      '<span class="small muted" style="margin-left:auto">判定日 ' + esc(view.now || '') + '</span></div>';
+    html += '<div class="sec-head" style="margin-top:14px"><b>认可标的映射（只有你确认过的标的才是执行候选）</b></div>' +
+      '<div class="card">' + Domain.RISK_CLASSES.map(function (cls) {
+        return mappingBlock(cls, mapping.rows || [], missingClasses);
+      }).join('') +
+      '<div class="small muted" style="margin-top:8px">映射完全由你维护：同一类别可有多个候选，顺序即优先级；' +
+      '一个标的只能属于一个类别。失效引用与分类冲突会保留在此显式提示，不会被自动删除。</div>' +
+      (mapping.issueCount || mapping.invalidCount
+        ? '<div class="small warn-text" style="margin-top:4px">存在 ' + (mapping.issueCount + mapping.invalidCount) +
+          ' 条需要处理的映射记录（失效引用 / 分类冲突 / 记录不合规）。</div>'
+        : '') +
+      '</div>';
+    html += adviceSection(view);
+    if (state.targetsItems.length) {
+      html += '<div class="sec-head" style="margin-top:14px"><b>目标版本历史（追加式）</b></div><div class="card">' +
+        state.targetsItems.map(function (t) {
+          return '<div class="acc-card"><div class="row"><b>' + esc(t.effectiveFrom) + ' 起 · L' + t.level + '</b>' +
+            '<span class="small muted" style="margin-left:auto">' + esc(t.templateVersion) + '</span></div>' +
+            '<div class="small muted">评估 ' + esc(t.assessmentId) + '（' + esc(t.assessedAt) + ' 至 ' + esc(t.assessmentExpiry) + '）' +
+            ' · 规则 ' + esc(t.ruleVersion) + ' · 保存于 ' + esc(String(t.createdAt).slice(0, 19).replace('T', ' ')) + '</div></div>';
+        }).join('') + '</div>';
+    }
+    if (mapping.rows && mapping.rows.length) {
+      html += '<div class="small muted" style="margin-top:10px">合计 ' + mapping.total + ' 条映射 · 有效 ' + mapping.validCount +
+        ' · 异常 ' + (mapping.issueCount + mapping.invalidCount) + '</div>';
+    }
+    return html;
+  }
+
+  function ensureTargetsLoaded(force) {
+    if (!force && state.targetsLoaded && state.targetsView) {
+      render();
+      return state.targetsLoadPromise || Promise.resolve();
+    }
+    state.targetsLoading = true;
+    render();
+    // 候选标的直接读 state.assets，因此这一页必须与事实源同步后再渲染，
+    // 否则外部（另一处录入 / 恢复）刚确认的分类在这页会显示成不可选。
+    var pending = Promise.all([Store.allocationCurrent(), Store.listAllocationTargets(), Store.loadRaw()])
+      .then(function (rs) {
+        var raw = rs[2];
+        if (raw) {
+          state.assets = Domain.normalizeAssets(raw.assets);
+          if (raw.settings != null) state.settings = raw.settings;
+        }
+        // G5-R2：事实视图换代。assetsSig 是「本次读到的资产原文」指纹，供建议过期判定比对；
+        // factsEpoch 让生成建议期间发生的换代能被识别出来，晚到的响应据此丢弃。
+        if (raw && raw.assets) state.assetsSig = Domain.factSignature(raw.assets);
+        state.factsEpoch += 1;
+        state.targetsView = rs[0] || null;
+        state.targetsItems = (rs[1] && rs[1].items) || [];
+        state.targetsLoading = false;
+        state.targetsLoaded = true;
+        state.targetsError = '';
+        if (state.page === 'targets') render();
+      })
+      .catch(function (e) {
+        state.targetsLoading = false;
+        state.targetsError = (e && e.message) || '目标配置读取失败';
+        if (state.page === 'targets') render();
+      });
+    // 在途读取留档：生成建议前要先等它落地，否则「发起时的代数」可能在请求途中才更新，
+    // 正常响应会被误判成晚到而丢弃。
+    state.targetsLoadPromise = pending;
+    return pending;
+  }
+
+  function generateTarget() {
+    Store.createAllocationTarget({}, { idempotencyKey: Core.newId('at') }).then(function (r) {
+      toast(r.created ? '已生成目标版本 L' + r.item.level : '该评估在此生效日已有目标版本');
+      ensureTargetsLoaded(true);
+    }).catch(function (e) {
+      toast('目标未生成：' + ((e && e.message) || '写入失败'), 'err');
+    });
+  }
+
+  function saveMappingClass(cls, instrumentIds) {
+    return Store.setApprovedInstruments({ assetClass: cls, instrumentIds: instrumentIds },
+      { idempotencyKey: Core.newId('aim') }).then(function () {
+      toast('认可标的已更新');
+      return ensureTargetsLoaded(true);
+    }).catch(function (e) {
+      toast('认可标的未保存：' + ((e && e.message) || '写入失败'), 'err');
+      return false;
+    });
+  }
+
+  function mappingIdsFor(cls) {
+    var rows = ((state.targetsView || {}).mapping || {}).rows || [];
+    return rows.filter(function (r) { return r.assetClass === cls; });
+  }
+
+  function mappingAction(cls, fn) {
+    var ids = fn(mappingIdsFor(cls));
+    return saveMappingClass(cls, ids);
+  }
+
+  /* ================= Phase 5D：新增资金优先再平衡与正式建议门禁 =================
+   * 页面只提交「金额 + 引用绑定」；类别分配、门禁结论、标的映射与尾差说明全部来自
+   * 服务端建议产物（不变量 3：不在浏览器重算偏离或「能不能建议」的判断）。
+   * 这里也不提供接受 / 暂缓 / 已执行等按钮：那些属于 Phase 6 的决策状态机。 */
+  var ADVICE_ADJUSTMENT_LABELS = {
+    fill_below_min: '先补低于区间下限的类别',
+    converge_to_target: '向目标权重收敛（不卖出）',
+    within_tolerance: '当前都在容忍带内，无需调整',
+    no_investable: '投资池没有可依赖的比例基准',
+    zero_allocatable: '本轮没有可分配金额'
+  };
+  var ADVICE_BASIS_LABELS = {
+    below_min: '低于下限', below_target: '低于目标权重', above_max: '高配：不加仓也不卖出',
+    at_or_above_target: '已在目标之上', unknown_base: '比例未知'
+  };
+  var ADVICE_TODO_LABELS = {
+    missing_approved_instrument: '该类别还没有可执行的认可标的',
+    invalid_instrument_reference: '该类别的认可标的引用已失效'
+  };
+  // 5E-3：解释码 → 固定文案。只格式化服务端 explainCodes，不在页面重算优先级或缺口。
+  var ADVICE_EXPLAIN_LABELS = {
+    new_funds_below_min_first: '第一步：先补低于区间下限的类别',
+    new_funds_converge_to_target: '第二步：余下资金向目标权重收敛（不卖出）',
+    new_funds_within_tolerance: '当前都在容忍带内，无需调整',
+    new_funds_no_investable: '投资池没有可依赖的比例基准',
+    new_funds_zero_amount: '本轮没有可分配金额',
+    new_funds_capped_by_available: '请求已按可新增投资资金截断',
+    new_funds_rounding_remainder: '存在尾差，按冻结规则分配给排序最前者',
+    new_funds_above_max_no_sell: '高配类别不加仓也不卖出（只提示风险）',
+    new_funds_missing_approved_instrument: '存在未映射认可标的的类别，金额原样保留',
+    formal_gate_blocked: '正式建议门禁未全部通过，只展示估算'
+  };
+
+  /* ================= G5-R2：建议与当前事实的比对 =================
+   * 比对逻辑在 js/domain.js（Domain.adviceStaleness，纯函数、可单测）：把建议 gate.capture 里
+   * 封存的事实与页面刚从服务端读到的事实逐项对齐。本层只负责两件事：取当前视图、把 reason 码
+   * 翻译成人话；不重算偏离、不重跑门禁、不产出任何金额（不变量 3）。 */
+  var ADVICE_STALE_LABELS = {
+    assets_changed: '资产、持仓、行情或汇率已变化',
+    mapping_changed: '认可标的映射已变更',
+    assessment_changed: '风险评估已更换',
+    target_changed: '目标配置已更换',
+    valuation_not_formal: '当前数据已不满足正式口径（见上方估算口径说明）',
+    target_not_current: '当前没有生效的目标版本'
+  };
+
+  // 返回「为什么这份建议已经不能当作当前行动依据」；正式建议才会被判定过期 ——
+  // 估算建议从未声称门禁通过，改判过期只会把「未达门槛」和「已过期」两件事混在一起。
+  function adviceStaleReasons(item) {
+    return Domain.adviceStaleness(item, state.targetsView, state.assetsSig);
+  }
+
+  function adviceSection(view) {
+    var html = '<div class="sec-head" style="margin-top:14px"><b>新增资金优先再平衡（5D）</b></div>' +
+      '<div class="card">';
+    if (view.status !== 'current') {
+      return html + '<div class="small muted">还没有生效的目标版本，因此没有可依据的区间与缺口。' +
+        '请先生成目标配置。</div></div>';
+    }
+    html += '<div class="row" style="gap:8px">' +
+      '<input class="grow" type="text" inputmode="decimal" placeholder="本月可新增投资金额（元）" ' +
+      'value="' + esc(state.adviceAmount) + '" data-input="advice:amount">' +
+      '<button class="btn small primary" data-action="advice:run"' + (state.adviceBusy ? ' disabled' : '') + '>' +
+      (state.adviceBusy ? '计算中…' : '生成分配建议') + '</button></div>' +
+      '<div class="small muted" style="margin-top:6px">金额只提交给本机服务端；实际可分配取「你填的金额」与' +
+      '「可新增投资资金」的较小值。资金来自已有投资现金，转配不增加总资产；保留现金配置下限，未分配余量继续留作现金。</div>';
+    if (state.adviceError) {
+      html += '<div class="small warn-text" style="margin-top:8px">未能生成建议：' + esc(state.adviceError) + '</div>';
+    }
+    html += adviceResultBlock(state.advice);
+    return html + '</div>';
+  }
+
+  function adviceResultBlock(item) {
+    if (!item) {
+      return '<div class="small muted" style="margin-top:8px">还没有本次建议。生成后这里会显示类别金额、' +
+        '认可标的映射、未分配余量与追溯信息。</div>';
+    }
+    var res = item.formalRecommendation || item.estimate;
+    if (!res) return '';
+    var formal = item.status === 'formal';
+    // G5-R2：封存事实与当前事实对不上时，历史计算只能标成历史 —— 「当时通过」不等于「当前可执行」
+    var stale = adviceStaleReasons(item);
+    var isStale = stale.length > 0;
+    var note = res.roundingNote;
+    var rec = item.recommendation || {};
+    var todos = rec.todos || [];
+    var codes = res.explainCodes || [];
+    var classes = res.categoryAllocations || [];
+    var html = '<div style="margin-top:10px" data-advice-result' +
+      ' data-advice-status="' + (isStale ? 'stale' : (formal ? 'formal' : 'estimate')) + '"' +
+      ' data-advice-stale="' + esc(stale.join(',')) + '"' +
+      ' data-advice-adjustment="' + esc(note.adjustment) + '"' +
+      ' data-advice-requested="' + note.requestedNewFundsMinor + '"' +
+      ' data-advice-allocatable="' + note.allocatableNewFundsMinor + '"' +
+      ' data-advice-allocated="' + note.allocatedTotalMinor + '"' +
+      ' data-advice-unallocated="' + note.unallocatedMinor + '"' +
+      ' data-advice-explain="' + esc(codes.join(',')) + '">' +
+      '<div class="row"><b>' +
+      (isStale ? '历史建议（生成时门禁通过）'
+        : formal ? '正式建议' : '估算建议（未达正式门槛）') + '</b>' +
+      '<span class="small ' + (isStale || !formal ? 'warn-text' : 'muted') + '" style="margin-left:auto">' +
+      (isStale ? '当前已失效 · 需要重新计算'
+        : formal ? '全部门禁通过' : 'formalRecommendation 为空：见下方待处理项') + '</span></div>' +
+      (isStale
+        ? '<div class="small warn-text" style="margin-top:6px" data-advice-stale-note>当前事实已变化：' +
+          stale.map(function (k) { return esc(ADVICE_STALE_LABELS[k] || k); }).join('；') +
+          '。下面是生成时封存的历史结果，不能作为当前行动依据；' +
+          '服务端重新计算通过前，这里不再显示「全部门禁通过」。</div>' +
+          '<div class="row" style="margin-top:6px">' +
+          '<button class="btn small primary" data-action="advice:run">重新计算</button></div>'
+        : '') +
+      '<div class="small muted" style="margin-top:4px">请求 ' + Core.fmtMoney(note.requestedNewFundsMinor) +
+      ' · 可分配 ' + Core.fmtMoney(note.allocatableNewFundsMinor) +
+      (note.cappedToAvailable ? '（已按可新增投资资金截断）' : '') +
+      ' · 实际分配 ' + Core.fmtMoney(note.allocatedTotalMinor) +
+      ' · 未分配 ' + Core.fmtMoney(note.unallocatedMinor) +
+      ' · ' + esc(ADVICE_ADJUSTMENT_LABELS[note.adjustment] || note.adjustment) + '</div>' +
+      '<div class="small muted" style="margin-top:4px">守恒：实际分配 ' +
+      Core.fmtMoney(note.allocatedTotalMinor) + ' + 未分配 ' + Core.fmtMoney(note.unallocatedMinor) +
+      ' = 可分配 ' + Core.fmtMoney(note.allocatableNewFundsMinor) + '</div>';
+    if ((res.blockers || []).length) {
+      html += '<div class="db-list" style="margin-top:6px" data-advice-blockers>' +
+        res.blockers.map(function (b) {
+          return '<div class="db-item" data-blocker="' + esc(b.code) + '">· ' + esc(blockerText(b)) + '</div>';
+        }).join('') + '</div>';
+    }
+    // 解释区：排序依据 / 现金保底 / 不卖出原因 —— 全部来自服务端字段，页面不重算。
+    var orderBits = [];
+    if (codes.indexOf('new_funds_below_min_first') >= 0) orderBits.push(ADVICE_EXPLAIN_LABELS.new_funds_below_min_first);
+    if (codes.indexOf('new_funds_converge_to_target') >= 0) orderBits.push(ADVICE_EXPLAIN_LABELS.new_funds_converge_to_target);
+    if (!orderBits.length) orderBits.push(ADVICE_ADJUSTMENT_LABELS[note.adjustment] || note.adjustment);
+    orderBits.push('高配与已在目标之上的类别不参与追加；现金不自买并保留下限');
+    var aboveMax = classes.filter(function (c) { return c.basis === 'above_max'; });
+    var nosellReason = aboveMax.length
+      ? aboveMax.map(function (c) { return RISK_CLASS_LABELS[c.assetClass] || c.assetClass; }).join('、') +
+        ' 为高配：本轮分配为 0，只提示风险，不生成卖出指令'
+      : '本轮无高配类别需要减持；任何情况下都不卖出现有资产，只补充低配';
+    html += '<div class="small" style="margin-top:8px" data-advice-why>' +
+      '<div data-advice-order><b>排序依据：</b>' + orderBits.map(esc).join('；') + '。' +
+      knowledgeLinkHtml('card-new-funds-first', '新增资金优先说明') + '</div>' +
+      '<div data-advice-cash-floor style="margin-top:4px"><b>现金保底：</b>转配只动投资池内现金，' +
+      '保留现金配置下限，不向现金自身分配；' +
+      (note.unallocatedMinor
+        ? '未分配 ' + Core.fmtMoney(note.unallocatedMinor) + ' 继续留作现金。'
+        : '本轮无未分配余量。') + '</div>' +
+      '<div data-advice-nosell style="margin-top:4px"><b>默认不卖出：</b>' + esc(nosellReason) + '。' +
+      knowledgeLinkHtml('card-no-sell', '为何不默认卖出') + '</div>';
+    if (codes.length) {
+      html += '<div class="db-list" style="margin-top:6px" data-advice-codes>' + codes.map(function (code) {
+        return '<div class="db-item" data-explain-code="' + esc(code) + '">· ' +
+          esc(ADVICE_EXPLAIN_LABELS[code] || code) + '</div>';
+      }).join('') + '</div>';
+    }
+    html += '</div>';
+    html += '<div class="db-list" style="margin-top:8px">' + classes.map(function (c) {
+      var instruments = (c.instruments || []).map(function (i) {
+        return esc(i.symbol || i.instrumentId) + ' ' + Core.fmtMoney(i.allocatedMinor);
+      }).join(' · ');
+      return '<div class="db-item" data-advice-cls="' + esc(c.assetClass) + '"' +
+        ' data-basis="' + esc(c.basis) + '"' +
+        ' data-allocated="' + c.allocatedMinor + '"' +
+        ' data-min-need="' + (c.minNeedMinor == null ? '' : c.minNeedMinor) + '"' +
+        ' data-target-need="' + (c.targetNeedMinor == null ? '' : c.targetNeedMinor) + '"' +
+        ' data-goal-bps="' + (c.goalBps == null ? '' : c.goalBps) + '"' +
+        ' data-instrument-count="' + (c.instruments || []).length + '">' +
+        '<div class="row"><b class="small">' +
+        esc(RISK_CLASS_LABELS[c.assetClass] || c.assetClass) + '</b>' +
+        '<span class="small" style="margin-left:auto" data-advice-visible-amount>' +
+        Core.fmtMoney(c.allocatedMinor) + '</span></div>' +
+        '<div class="small muted">' + esc(ADVICE_BASIS_LABELS[c.basis] || c.basis) +
+        (c.goalBps == null ? '' : ' · 锚点 ' + bpsText(c.goalBps)) +
+        (instruments ? ' → ' + instruments : (c.allocatedMinor ? ' · 待维护认可标的' : '')) + '</div></div>';
+    }).join('') + '</div>';
+    if (todos.length) {
+      html += '<div class="small warn-text" style="margin-top:8px" data-advice-todos>' + todos.map(function (t) {
+        return '<span data-todo="' + esc(t.code) + '" data-todo-class="' + esc(t.assetClass) + '"' +
+          ' data-retained="' + t.retainedMinor + '">' +
+          esc(ADVICE_TODO_LABELS[t.code] || t.code) + '：' +
+          esc(RISK_CLASS_LABELS[t.assetClass] || t.assetClass) + ' ' + Core.fmtMoney(t.retainedMinor) +
+          '（保留为类别级待办，不转投陌生标的）</span>';
+      }).join('<br>') + '</div>';
+    }
+    html += '<div class="small muted" style="margin-top:8px" data-advice-rounding' +
+      ' data-leftover="' + note.leftoverMinor + '"' +
+      ' data-receivers="' + esc((note.receivers || []).join(',')) + '">' +
+      '尾差：' + esc(note.rule) +
+      (note.receivers.length ? '；本轮由 ' + note.receivers.map(function (k) {
+        return esc(RISK_CLASS_LABELS[k] || k);
+      }).join('、') + ' 承接 ' + note.leftoverMinor + ' 个最小货币单位' : '') + '。</div>' +
+      '<div class="small muted" style="margin-top:4px">边界：默认不卖出现有资产；高配类别只提示风险。' +
+      '未映射的类别需先确认认可标的。</div>';
+    // 5E-5 审计追溯：月结基准 / 计算日输入 / 版本与记录 / 解释版本 分组展示，只搬运服务端字段。
+    // 月结快照是基准，gate.capture / inputHash 才是计算日完整输入，两者分区呈现不混称；
+    // 旧建议未封存解释版本时显式标注（D-052：不倒填历史记录）。
+    var gate = rec.gate || {};
+    var capture = gate.capture || {};
+    var sealedVersion = (typeof gate.explanationVersion === 'string' && gate.explanationVersion)
+      ? gate.explanationVersion : '';
+    var currentVersion = (typeof window !== 'undefined' && window.Knowledge)
+      ? String(window.Knowledge.EXPLANATION_VERSION) : '';
+    var algorithm = capture.algorithmVersion || '—';
+    var payloadHash = rec.payloadHash ? String(rec.payloadHash) : '';
+    var hash12 = function (v) { return v ? esc(String(v).slice(0, 12)) + '…' : '—'; };
+    html += '<div class="small muted" style="margin-top:4px" data-advice-trace>' +
+      '<div data-advice-trace-baseline' +
+      ' data-close-id="' + esc(rec.closeId || '') + '"' +
+      ' data-snapshot-id="' + esc(rec.snapshotId || '') + '"' +
+      ' data-snapshot-hash="' + esc(String(res.versions.snapshotPayloadHash || '')) + '"' +
+      ' data-cutoff="' + esc(res.versions.dataCutoff || '') + '">' +
+      '追溯：快照 ' + esc(res.versions.snapshotId) +
+      ' · 月结 ' + esc(rec.closeId) +
+      ' · 快照哈希 ' + hash12(res.versions.snapshotPayloadHash) +
+      ' · 月结数据截止 ' + esc(res.versions.dataCutoff) +
+      '（月结快照是基准，不等同于计算输入）</div>' +
+      '<div data-advice-trace-input' +
+      ' data-as-of="' + esc(res.versions.asOf || '') + '"' +
+      ' data-algorithm="' + esc(algorithm) + '"' +
+      ' data-input-hash="' + esc(String(item.inputHash || '')) + '">' +
+      '计算日输入：判定日 ' + esc(res.versions.asOf) +
+      ' · 算法版本 ' + esc(algorithm) +
+      ' · 本次计算输入 ' + hash12(item.inputHash) +
+      '（余额、持仓、价格、汇率及映射已本机封存）</div>' +
+      '<div data-advice-trace-versions' +
+      ' data-rec-id="' + esc(item.id || '') + '"' +
+      ' data-payload-hash="' + esc(payloadHash) + '"' +
+      ' data-rule-version="' + esc(res.versions.ruleVersion || '') + '"' +
+      ' data-target-version="' + esc(res.versions.targetVersion || '') + '"' +
+      ' data-target-level="' + esc(String(res.versions.targetLevel == null ? '' : res.versions.targetLevel)) + '"' +
+      ' data-assessment-id="' + esc(res.versions.assessmentId || '') + '"' +
+      ' data-target-id="' + esc(res.versions.targetId || '') + '">' +
+      '版本与记录：建议 ' + esc(item.id) +
+      ' · payloadHash ' + hash12(payloadHash) +
+      ' · 规则 ' + esc(res.versions.ruleVersion) +
+      ' · 目标 ' + esc(res.versions.targetVersion) + '（L' + res.versions.targetLevel + '）' +
+      ' · 评估 ' + esc(res.versions.assessmentId) +
+      ' · 目标配置 ' + esc(res.versions.targetId) + '</div>' +
+      '<div data-advice-explain-seal' +
+      ' data-sealed="' + (sealedVersion ? '1' : '0') + '"' +
+      ' data-sealed-version="' + esc(sealedVersion) + '"' +
+      ' data-current-version="' + esc(currentVersion) + '">' +
+      '解释版本：' + (sealedVersion
+        ? '本条建议生成时封存 v' + esc(sealedVersion) + '；当前知识卡 v' + esc(currentVersion) +
+          (sealedVersion !== currentVersion ? '（知识卡已更新，链接展示当前文字）' : '')
+        : '当前卡片解释，非生成时封存版本（当前知识卡 v' + esc(currentVersion) + '）') +
+      '</div></div>';
+    return html + '</div>';
+  }
+
+  function runAdvice() {
+    var view = state.targetsView || {};
+    if (view.status !== 'current' || !view.target) { toast('请先生成生效的目标版本', 'warn'); return; }
+    if (state.adviceBusy) return;
+    var cents = Core.yuanToCents(state.adviceAmount);
+    if (cents === null || cents < 0 || !Number.isSafeInteger(cents)) {
+      toast('请输入非负的金额（元，最多到分）', 'warn');
+      return;
+    }
+    state.adviceBusy = true;
+    state.adviceError = '';
+    render();
+    // 先等在途的事实读取落地，再记代数：否则一次刚发起的读取会在请求途中换代，
+    // 把正常响应误判成「晚到」而丢弃。
+    Promise.resolve(state.targetsLoadPromise).then(function () {
+      // G5-R2：记下发起时的事实视图代数；响应返回时若已换代，说明计算期间事实被改写过。
+      var epoch = state.factsEpoch;
+      return Store.listMonthlyCloses().then(function (r) {
+        var formal = (r.items || []).filter(function (c) { return c.status === 'formal' && c.snapshot; });
+        if (!formal.length) throw new Error('本机还没有可引用的正式月结，请先完成月度结账');
+        var close = formal[0];
+        return Store.createRecommendation({
+          snapshotRef: { closeId: close.id, snapshotId: close.snapshot.id, payloadHash: close.snapshot.payloadHash },
+          assessmentRef: { id: view.assessment.id, ruleVersion: view.assessment.ruleVersion },
+          targetVersion: view.target.templateVersion,
+          ruleVersion: view.target.ruleVersion,
+          newFundsMinor: cents
+        }, { idempotencyKey: Core.newId('rec') });
+      }).then(function (res) {
+        if (epoch !== state.factsEpoch) {
+          // 慢请求晚到：不覆盖已换代的状态，页面显示的仍是当前视图判定出的结论。
+          toast('生成期间事实已变化，本次结果未采用，请重新计算', 'warn');
+          return;
+        }
+        state.advice = res;
+        toast(res.status === 'formal' ? '已生成本机正式建议' : '已生成估算建议（未达正式门槛）',
+          res.status === 'formal' ? 'ok' : 'warn');
+        // 生成后立即同步事实视图：过期判定必须比对同一时刻的视图，
+        // 不能拿生成前的旧视图把刚生成的建议误判为历史。
+        ensureTargetsLoaded(true);
+      }).catch(function (e) {
+        if (epoch !== state.factsEpoch) {
+          toast('生成期间事实已变化，本次结果未采用，请重新计算', 'warn');
+          return;
+        }
+        state.advice = null;
+        state.adviceError = (e && e.message) || '写入失败';
+        toast('建议未生成：' + state.adviceError, 'err');
+      });
+    }).then(function () {
+      state.adviceBusy = false;
+      render();
+    });
+  }
 
   /* ================= 弹层 ================= */
   function openSheet(title, bodyHtml, onOpen) {
@@ -175,8 +1339,13 @@
       boot();
     }).catch(function (e) {
       console.error(e);
-      document.getElementById('view').innerHTML = '<div class="empty"><div class="e-icon">⚠️</div>数据加载失败：' +
-        esc(e && e.message || e) + '<div class="small muted" style="margin-top:8px">请刷新重试</div></div>';
+      // G5-R3：连本机状态都读不出来时，静态知识卡仍不依赖服务与账户数据，入口不能一并消失。
+      var kb = [knowledgeLinkHtml('card-capacity-vs-willingness', '能力与意愿'),
+        knowledgeLinkHtml('card-tolerance-band', '容忍带说明')].filter(Boolean).join('、');
+      document.getElementById('view').innerHTML = '<div class="empty">数据加载失败：' +
+        esc(e && e.message || e) +
+        '<div class="small muted" style="margin-top:8px">请刷新重试' +
+        (kb ? '<br>不依赖服务与账户数据，现在就能读：' + kb : '') + '</div></div>';
     });
   }
 
@@ -207,7 +1376,7 @@
     var lock = $('#lock-screen');
     lock.classList.remove('hidden');
     lock.innerHTML =
-      '<div class="lock-box"><div class="lb-icon">🔒</div><h2>小账本已锁定</h2>' +
+      '<div class="lock-box"><h2>小账本已锁定</h2>' +
       '<div class="small muted">输入密码解锁本地数据</div>' +
       '<input type="password" id="lock-pw" placeholder="应用锁密码" autocomplete="off">' +
       '<div id="lock-err" class="small" style="color:var(--red);min-height:18px"></div>' +
@@ -360,16 +1529,21 @@
   function route(page) {
     if (!state.ready) return;
     if (['home', 'cashflow', 'list', 'stats', 'settings', 'add', 'import', 'accounts', 'categories',
-      'budget', 'health', 'reimburse', 'recurring', 'assets', 'close'].indexOf(page) < 0) page = 'home';
+      'budget', 'health', 'reimburse', 'recurring', 'assets', 'close', 'risk', 'targets'].indexOf(page) < 0) page = 'home';
     state.page = page;
     if (page !== 'add') { state.editId = null; }
     if (page !== 'list') { state.selectMode = false; state.selectedIds = {}; }
+    // 先标记复核中，再画首页；不能先把缓存的「有效」状态当作当前结论展示。
+    if (page === 'home') {
+      ensureRiskCurrentLoaded();
+      ensureAllocCurrentLoaded();
+    }
     renderTabbar();
     try {
       render();
     } catch (e) {
       console.error(e);
-      $('#view').innerHTML = '<div class="empty"><div class="e-icon">⚠️</div>页面渲染出错：' +
+      $('#view').innerHTML = '<div class="empty">页面渲染出错：' +
         esc(e && e.message || e) + '<div class="small muted" style="margin-top:8px">数据未受影响，可返回首页重试</div>' +
         '<button class="btn primary" style="margin-top:12px" onclick="location.hash=\'home\'">回首页</button></div>';
     }
@@ -377,27 +1551,65 @@
     // 归因还需要基准快照的封存明细（G4E-1）。
     if (page === 'home' || page === 'close') ensureClosesLoaded(false);
     if (page === 'home') ensureAttributionSnapshot(false);
+    // Phase 5B：风险评估页进入时惰性读取（决策台只需要当前评估判定，见 5E-1 摘要卡）。
+    if (page === 'risk') ensureRiskLoaded(false);
+    // Phase 5E-1 的复核已在首页初次渲染前启动；响应只更新摘要卡。
+    // Phase 5C：目标配置与认可标的同样惰性读取；页面不重算映射与偏离。
+    if (page === 'targets') ensureTargetsLoaded(false);
     window.scrollTo(0, 0);
   }
 
   function renderTabbar() {
-    var tabs = [
-      { id: 'home', icon: '🧭', label: '资产' },
-      { id: 'list', icon: '📋', label: '明细' },
-      { id: '__add', icon: '', label: '' },
-      { id: 'stats', icon: '📊', label: '统计' },
-      { id: 'settings', icon: '⚙️', label: '我的' }
+    // 桌面侧栏复用现有 nav:* 动作；窄屏仍只显示原五个主入口。
+    var icons = {
+      home: '<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+      assets: '<rect x="3" y="5" width="18" height="15" rx="2"/><path d="M3 9h18M7 15h4"/>',
+      risk: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
+      targets: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+      close: '<rect x="4" y="5" width="16" height="16" rx="2"/><path d="M8 3v4m8-4v4M4 10h16m-12 5h3m3 0h2"/>',
+      cashflow: '<path d="M3 7h13m-4-4 4 4-4 4M21 17H8m4-4-4 4 4 4"/>',
+      list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h1M3 12h1M3 18h1"/>',
+      stats: '<path d="M4 20V11m5 9V4m5 16v-7m5 7V8"/>',
+      add: '<path d="M12 4v16M4 12h16"/>',
+      settings: '<circle cx="12" cy="12" r="3"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+    };
+    function glyph(id) {
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icons[id] + '</svg>';
+    }
+    var groups = [
+      { label: '决策空间', tabs: [
+        { id: 'home', label: '资产决策台', mobile: '资产' },
+        { id: 'assets', label: '资产录入', desktop: true },
+        { id: 'risk', label: '风险评估', desktop: true },
+        { id: 'targets', label: '目标配置', desktop: true },
+        { id: 'close', label: '月度结账', desktop: true }
+      ] },
+      { label: '日常账务', tabs: [
+        { id: 'cashflow', label: '现金流与预算', desktop: true },
+        { id: 'list', label: '交易明细', mobile: '明细' },
+        { id: 'stats', label: '统计分析', mobile: '统计' }
+      ] }
     ];
+    function tab(t) {
+      return '<button class="tab' + (t.desktop ? ' desktop-only' : '') + (state.page === t.id ? ' active' : '') +
+        '" data-action="nav:' + t.id + '"' + (state.page === t.id ? ' aria-current="page"' : '') + '>' +
+        '<span class="ti">' + glyph(t.id) + '</span><span class="tab-label">' + t.label + '</span>' +
+        (t.mobile ? '<span class="mobile-label">' + t.mobile + '</span>' : '') + '</button>';
+    }
     $('#tabbar').classList.remove('hidden');
-    $('#tabbar').innerHTML = tabs.map(function (t) {
-      if (t.id === '__add') return '<div class="tab-add"><button data-action="nav:add" title="记一笔">＋</button></div>';
-      return '<button class="tab ' + (state.page === t.id ? 'active' : '') + '" data-action="nav:' + t.id + '">' +
-        '<span class="ti">' + t.icon + '</span><span>' + t.label + '</span></button>';
-    }).join('');
+    $('#tabbar').innerHTML = '<div class="nav-brand"><span class="nav-mark">↗</span><span><b>LEDGER</b><small>PERSONAL FINANCE</small></span></div>' +
+      '<div class="nav-groups">' + groups.map(function (g) {
+        return '<div class="nav-group"><div class="nav-section-label">' + g.label + '</div>' + g.tabs.map(tab).join('') + '</div>';
+      }).join('') + '</div>' +
+      '<div class="nav-footer"><div class="tab-add"><button data-action="nav:add" title="记一笔">' +
+      '<span class="ti">' + glyph('add') + '</span><span class="tab-label">记一笔</span></button></div>' +
+      tab({ id: 'settings', label: '设置与数据', mobile: '我的' }) +
+      '<div class="nav-local">本机运行 · 私密数据留在 Mac</div></div>';
   }
 
   function render() {
     var view = $('#view');
+    view.className = 'view-page view-' + state.page;
     var html = '';
     switch (state.page) {
       case 'home': html = tplDashboard(); break;
@@ -415,6 +1627,8 @@
       case 'recurring': html = tplRecurring(); break;
       case 'assets': html = tplAssets(); break;
       case 'close': html = tplClose(); break;
+      case 'risk': html = tplRisk(); break;
+      case 'targets': html = tplTargets(); break;
     }
     view.innerHTML = html;
   }
@@ -523,8 +1737,8 @@
     var ok = c.byAccountMatches && c.byCurrencyMatches && c.byAssetClassMatches && c.byMarketMatches;
     var consistency = '<div class="small muted" style="margin-top:8px" data-consistency="' + (ok ? 'ok' : 'mismatch') + '">' +
       (ok
-        ? '✓ 四个维度合计与总览一致（机构 / 币种 = 总资产，资产类别 = 投资池，市场 = 投资池持仓）'
-        : '⚠️ 下钻合计与总览不一致：机构 ' + Core.fmtMoney(c.sumByAccountMinor) +
+        ? ' 四个维度合计与总览一致（机构 / 币种 = 总资产，资产类别 = 投资池，市场 = 投资池持仓）'
+        : ' 下钻合计与总览不一致：机构 ' + Core.fmtMoney(c.sumByAccountMinor) +
           ' · 币种 ' + Core.fmtMoney(c.sumByCurrencyMinor) +
           ' · 类别 ' + Core.fmtMoney(c.sumByAssetClassMinor) +
           ' · 市场 ' + Core.fmtMoney(c.sumByMarketMinor) + '，请勿据此决策') +
@@ -713,7 +1927,8 @@
 
     return '<div class="card" data-attribution="ready">' + head + picker + summary + rowHtml +
       '<div class="small muted" style="margin-top:8px;line-height:1.8">' +
-      '· 价格影响 =（期末本地币值 − 期初本地币值）× 期初汇率；汇率影响取残差，两侧相加恒等于估值变化。<br>' +
+      '· 价格影响 =（期末本地币值 − 期初本地币值）× 期初汇率；汇率影响取残差，两侧相加恒等于估值变化。' +
+      knowledgeLinkHtml('card-fx-risk', '汇率风险说明') + '<br>' +
       '· 期初数量按期初日重放事件求得；期初价格与汇率只认基准日当天及之前的事实，绝不插值、不按 1:1 兜底。<br>' +
       '· 期间有买卖、清仓、重录期初，或缺任一端的价格/汇率时，只给估值变化、不做分解。</div></div>';
   }
@@ -722,22 +1937,60 @@
     var ov = Domain.computeOverview(state.assets, { now: todayDateStr(), settings: state.settings });
     var statusChip;
     if (ov.valuationStatus === 'formal') {
-      statusChip = '<span class="dash-chip ok">✅ 数据完整 · 正式口径</span>';
+      statusChip = '<span class="dash-chip ok"> 数据完整 · 正式口径</span>';
     } else if (ov.valuationStatus === 'estimate') {
-      statusChip = '<span class="dash-chip warn">⚠️ 估算口径 · 暂不能生成正式建议</span>';
+      statusChip = '<span class="dash-chip warn"> 估算口径 · 暂不能生成正式建议</span>';
     } else {
       statusChip = '<span class="dash-chip">空状态</span>';
     }
-    var html = '<div class="dash-head"><div><div class="dash-title">资产决策台</div>' +
-      '<div class="small muted">数据日 ' + esc(ov.asOf) + '</div></div>' + statusChip + '</div>';
+    var html = '<div class="dash-head"><div><div class="dash-eyebrow">OVERVIEW / 财务全景</div>' +
+      '<div class="dash-title">资产决策台</div>' +
+      '<div class="small muted">把资产、风险和下一步行动放在同一张桌面上 · 数据日 ' + esc(ov.asOf) + '</div></div>' + statusChip + '</div>';
+
+    /* Phase 5E-1：决策台的风险摘要卡。判定与数值只反映服务端 /risk-assessments/current
+       的结果（双评分与等级、最终上限、硬封顶、评估/到期日、有效状态），
+       这里不复制评分或到期判断，也不据此生成建议；空资产时同样展示：
+       风险评估不依赖资产数据，是正式建议的前置条件之一。 */
+    var riskSummary = riskSummaryCardHtml();
+
+    /* Phase 5E-2：六类配置对照（只读）。数值全部来自 /targets/current，
+       与目标页共用词表；无目标/无估值/分类未确认时给原因与目标页入口。 */
+    var allocCompare = allocationCompareCardHtml();
+    state.allocCompareHtml = allocCompare;
+
+    /* Phase 5C 入口：目标配置与认可标的。摘要只反映服务端给出的状态，
+       页面不在这里重算区间、比例或偏离。 */
+    var targetSub = '风险上限 → 类别区间 · 认可标的白名单';
+    var tv = state.targetsView;
+    if (Store.info().mode !== Store.MODE_API) {
+      targetSub = '本地服务运行后可维护';
+    } else if (tv && tv.status === 'current') {
+      targetSub = '当前目标 L' + tv.target.level + ' · ' + ((tv.missingClasses || []).length
+        ? '缺映射 ' + tv.missingClasses.length + ' 类'
+        : '六类映射齐备');
+    } else if (tv && tv.status === 'stale_assessment') {
+      targetSub = '评估已更新，目标待重新生成';
+    } else if (tv && tv.status === 'no_target') {
+      targetSub = '已有有效评估，尚未生成目标版本';
+    } else if (tv && tv.status === 'no_assessment') {
+      targetSub = '需要先完成风险评估';
+    }
+    var targetEntry =
+      '<div class="card dash-entry" data-action="nav:targets">' +
+      '<div><b>目标配置</b><div class="small muted">' + targetSub + '</div></div>' +
+      '<span class="arrow">›</span></div>';
 
     /* 空状态：不虚构任何总额（S1.4） */
     if (ov.isEmpty) {
-      return html + '<div class="empty dash-empty"><div class="e-icon">🧭</div><b>还没有资产数据</b>' +
+      return html + '<div class="dashboard-empty-layout"><div class="empty dash-empty">' +
+        '<div class="dash-empty-kicker">YOUR FINANCIAL PICTURE</div><b>从完整的资产视角开始</b>' +
+        '<div class="dash-empty-note">还没有资产数据</div>' +
         '<div class="small muted" style="line-height:1.8;margin-top:6px">这里将展示净资产、可投资资产、安全储备与风险配比。<br>' +
         '从资产录入开始：机构 → 账户 → 余额；也可通过「我的 → 恢复备份」导入包含资产数据的备份文件。</div>' +
+        '<div class="dash-empty-actions">' +
         '<button class="btn primary" data-action="nav:assets">录入资产</button>' +
-        '<button class="btn" data-action="nav:cashflow">去记一笔现金流</button></div>';
+        '<button class="btn" data-action="nav:cashflow">去记一笔现金流</button></div></div>' +
+        '<div class="dashboard-empty-rail">' + riskSummary + allocCompare + targetEntry + '</div></div>';
     }
 
     /* 估算口径的阻塞项列表 */
@@ -773,7 +2026,7 @@
         '<span class="r-val">' + Core.fmtMoney(r.valueMinor) + '</span>' +
         '<span class="r-pct">' + (r.pct == null ? '—' : r.pct + '%') + '</span></div>';
     }).join('');
-    var riskCard = '<div class="card"><div class="row small muted"><b>风险资产类别配比</b>' +
+    var riskCard = '<div class="card dash-risk-card"><div class="row small muted"><b>风险资产类别配比</b>' +
       '<span style="margin-left:auto">占可投资资产 ' + Core.fmtMoney(ov.pools.investableMinor) + '</span></div>' +
       (riskRows || '<div class="small muted" style="padding:8px 0">暂无可投资资产</div>') +
       '<div class="small muted" style="margin-top:8px">投资现金计入「现金」类别；受限资产与安全储备不参与配比。</div></div>';
@@ -786,14 +2039,14 @@
       ? '需要安全储备与最近 3 个月的必要支出记录（分类标记为「必要」）'
       : '安全储备 ' + Core.fmtMoney(ov.pools.safetyMinor) + ' ÷ 月均必要支出 ' + Core.fmtMoney(avgNec);
     var emergencyCard =
-      '<div class="card"><div class="row small muted"><b>应急金覆盖</b>' +
+      '<div class="card dash-emergency-card"><div class="row small muted"><b>应急金覆盖</b>' +
       '<button class="link small" style="margin-left:auto" data-action="nav:close">月度结账 ›</button></div>' +
       '<div class="dash-net" style="font-size:26px">' + covMain + '</div>' +
       '<div class="small muted" style="margin-top:4px">' + covHint + '</div></div>';
 
     /* 可新增投资资金 */
     var newFundsCard =
-      '<div class="card"><div class="row small muted"><b>本月可新增投资资金</b>' +
+      '<div class="card dash-new-funds"><div class="row small muted"><b>本月可新增投资资金</b>' +
       '<span style="margin-left:auto">' + (ov.canAdvise ? '正式口径' : '估算') + '</span></div>' +
       '<div class="dash-net" style="font-size:26px">' + Core.fmtMoney(ov.newFundsAvailableMinor) + '<span class="unit"> CNY</span></div>' +
       '<div class="dash-sub"><span>可投资现金 ' + Core.fmtMoney(ov.investableCashMinor) + '</span>' +
@@ -803,7 +2056,7 @@
     /* 待办与权益状态 */
     var todoHtml = '';
     if (ov.todos.length || ov.entitlements.length) {
-      todoHtml = '<div class="card"><div class="row small muted"><b>待办与状态</b></div>';
+      todoHtml = '<div class="card dash-todos"><div class="row small muted"><b>待办与状态</b></div>';
       ov.todos.forEach(function (t) {
         if (t.code === 'safety_target_unset') {
           todoHtml += '<div class="todo-item">· 安全储备目标未设置，储备缺口暂按 0 计算</div>';
@@ -842,9 +2095,14 @@
       '<div><b>月度结账</b><div class="small muted">' + ymLabel(ymShift(todayDateStr(), -1)) + ' 核对清单与结账快照</div></div>' +
       '<span class="arrow">›</span></div>';
 
-    return html + blockerHtml + hero + poolCards + emergencyCard + riskCard + newFundsCard + todoHtml +
-      drilldownCard() + attributionCard() + caliber +
-      assetEntry + closeEntry + cashflowEntry;
+    return html + blockerHtml +
+      '<div class="dash-hero-grid">' + hero + newFundsCard + '</div>' + poolCards +
+      '<div class="dash-content-grid"><div class="dash-content-main">' +
+      riskCard + allocCompare + drilldownCard() + attributionCard() +
+      '</div><div class="dash-content-side">' + emergencyCard + riskSummary + todoHtml +
+      '<div class="dash-side-heading">快捷入口</div>' +
+      assetEntry + closeEntry + targetEntry + cashflowEntry +
+      '</div></div>' + caliber;
   }
 
   /* ================= Phase 3：资产录入与月度结账 ================= */
@@ -959,7 +2217,7 @@
     }).join('');
     var accountSection = '<div class="sec-head"><b>账户</b>' +
       '<button class="link small" data-action="asset:acc">＋新增账户</button></div>' +
-      (accCards || '<div class="empty"><div class="e-icon">🏦</div><b>还没有资产账户</b>' +
+      (accCards || '<div class="empty"><b>还没有资产账户</b>' +
         '<div class="small muted">先建账户，再登记各币种余额</div></div>');
 
     /* 多币种换汇：独立资产事实，不进入现金流收入/支出。 */
@@ -1100,7 +2358,7 @@
       '<span class="small"><button class="link" data-action="holding:opening">＋期初快照</button> ' +
       '<button class="link" data-action="holding:event">＋记录事件</button></span></div>';
     if (!holdingRows && !eventRows) {
-      return section + '<div class="empty"><div class="e-icon">📈</div><b>还没有持仓记录</b>' +
+      return section + '<div class="empty"><b>还没有持仓记录</b>' +
         '<div class="small muted">先在标的目录建立标的，再登记期初快照或买卖事件；持有数量 = 期初 + 买入 − 卖出，由服务端统一推导</div></div>';
     }
     return section +
@@ -1322,7 +2580,7 @@
       '</div>' +
       (items.length
         ? items.map(instrumentRow).join('')
-        : '<div class="empty"><div class="e-icon">📈</div><b>目录里还没有标的</b>' +
+        : '<div class="empty"><b>目录里还没有标的</b>' +
           '<div class="small muted">先搜索并加入，再确认资产类别与风险敞口</div></div>');
   }
 
@@ -1588,8 +2846,8 @@
     var html = '<div class="dash-head"><div><div class="dash-title">月度结账</div>' +
       '<div class="small muted">结账月份 ' + ymLabel(month) + ' · 数据截止 ' + asOf + '</div></div>' +
       (cl.canComplete
-        ? '<span class="dash-chip ok">✅ 无缺项 · 可正式结账</span>'
-        : '<span class="dash-chip warn">⚠️ ' + cl.items.length + ' 类待核对 · 估算口径</span>') +
+        ? '<span class="dash-chip ok"> 无缺项 · 可正式结账</span>'
+        : '<span class="dash-chip warn"> ' + cl.items.length + ' 类待核对 · 估算口径</span>') +
       '</div>';
 
     /* 核对清单 */
@@ -1761,7 +3019,7 @@
       var overCats = bst.cats.filter(function (c) { return c.over; })
         .map(function (c) { return ((categoryById(c.catId) || {}).name || '未分类'); });
       if (bst.total.over && state.ym === curYM()) {
-        budgetHtml += '<div class="over-banner">⚠️ 本月已超支：支出 ' + Core.fmtMoney(bst.total.spent) +
+        budgetHtml += '<div class="over-banner"> 本月已超支：支出 ' + Core.fmtMoney(bst.total.spent) +
           ' / 预算 ' + Core.fmtMoney(bst.total.budget) +
           (overCats.length ? '（' + esc(overCats.join('、')) + ' 超分类预算）' : '') +
           ' <button class="link" data-action="nav:budget">调整预算</button></div>';
@@ -1774,7 +3032,7 @@
 
     // V2.3.3 周期账待生成横幅
     var recurBanner = (state.pendingRecurring > 0 && state.ym === curYM())
-      ? '<div class="over-banner info">🔁 有 ' + state.pendingRecurring + ' 笔周期账待生成 <button class="link" data-action="recur:previewDue">预览生成</button> <button class="link" data-action="nav:recurring">设置</button></div>'
+      ? '<div class="over-banner info"> 有 ' + state.pendingRecurring + ' 笔周期账待生成 <button class="link" data-action="recur:previewDue">预览生成</button> <button class="link" data-action="nav:recurring">设置</button></div>'
       : '';
 
     var accCards = liveAccounts().map(function (a) {
@@ -1787,7 +3045,7 @@
     var catAgg = [];
     Object.keys(agg.byCategory).forEach(function (cid) {
       var c = categoryById(cid);
-      catAgg.push({ id: cid, name: c ? c.name : '未分类', icon: c ? c.icon : '❓', sum: agg.byCategory[cid].sum, count: agg.byCategory[cid].count });
+      catAgg.push({ id: cid, name: c ? c.name : '未分类', icon: c ? c.icon : '', sum: agg.byCategory[cid].sum, count: agg.byCategory[cid].count });
     });
     catAgg.sort(function (a, b) { return b.sum - a.sum; });
     var top5 = catAgg.slice(0, 5);
@@ -1795,7 +3053,7 @@
     var legend = top5.map(function (c, i) {
       var pct = agg.expense ? (c.sum / agg.expense * 100).toFixed(1) : '0';
       return '<div class="legend-item"><i style="background:' + Charts.PALETTE[i % Charts.PALETTE.length] + '"></i>' +
-        '<span>' + c.icon + ' ' + esc(c.name) + '</span><span class="li-pct">' + pct + '% · ' + Core.fmtMoney(c.sum) + '</span></div>';
+        '<span>' + esc(c.name) + '</span><span class="li-pct">' + pct + '% · ' + Core.fmtMoney(c.sum) + '</span></div>';
     }).join('');
 
     // 最近 5 笔
@@ -1807,11 +3065,11 @@
     var mt = mergedTargetsMap();
     var recentHtml = recent.length
       ? recent.map(function (t) { return txnRowHtml(t, mt); }).join('')
-      : '<div class="empty" style="padding:26px"><div class="e-icon">🧾</div>还没有记录，点下方＋记第一笔吧</div>';
+      : '<div class="empty" style="padding:26px">还没有记录，点击「记一笔」添加第一笔</div>';
 
     var emptyGuide = state.txns.length ? '' :
-      '<div class="card" style="text-align:center"><b>欢迎使用小账本 👋</b>' +
-      '<div class="muted small" style="margin:8px 0 4px">数据 100% 存在本机浏览器，零网络请求</div></div>';
+      '<div class="card" style="text-align:center"><b>欢迎使用小账本</b>' +
+      '<div class="muted small" style="margin:8px 0 4px">账本数据保存在本机，可随时导出备份</div></div>';
 
     return tplMonthBar() + budgetBannerJoin(budgetHtml) + recurBanner + emptyGuide +
       '<div class="hero">' +
@@ -1824,8 +3082,8 @@
         '</div>' +
       '</div>' +
       '<div class="quick-actions">' +
-        '<button class="btn primary" data-action="nav:add">✏️ 记一笔</button>' +
-        '<button class="btn" data-action="nav:import">📥 导入账单</button>' +
+        '<button class="btn primary" data-action="nav:add"> 记一笔</button>' +
+        '<button class="btn" data-action="nav:import"> 导入账单</button>' +
       '</div>' +
       '<div class="sec-head"><b>账户余额</b><button class="link small" data-action="nav:accounts">管理</button></div>' +
       '<div class="acc-cards">' + (accCards || '<div class="muted small">暂无账户</div>') + '</div>' +
@@ -1854,9 +3112,9 @@
       var closed = state.txns.some(function (x) { return x.type === 'income' && x.reimburseOf === t.id; });
       chips += closed ? '<span class="chip refund">已报销</span>' : '<span class="chip">待报销</span>';
     }
-    if (mergedTargets && mergedTargets[t.id]) chips += '<span class="chip">🔗含合并</span>';
+    if (mergedTargets && mergedTargets[t.id]) chips += '<span class="chip">含合并</span>';
     return '<div class="txn-item" data-action="txn:detail" data-id="' + esc(t.id) + '">' +
-      '<div class="t-icon">' + txnIcon(t) + '</div>' +
+      '' +
       '<div class="t-main"><div class="t-title">' + esc(txnTitle(t)) + chips + '</div>' +
       '<div class="t-sub">' + esc(txnSub(t)) + '</div></div>' +
       '<div class="t-amt ' + (t.type === 'income' ? 'income' : t.type === 'transfer' ? 'transfer' : 'expense') + '">' + amtStr(t) + '</div></div>';
@@ -1913,16 +3171,16 @@
       if (kids.length) {
         subGrid = '<div class="small muted" style="padding:2px 2px 0">「' + esc(selRoot.name) + '」的二级分类：</div>' +
           '<div class="cat-grid">' +
-          '<button class="cat-cell ' + (d.categoryId === selRoot.id ? 'active' : '') + '" data-action="add:pickCat" data-id="' + esc(selRoot.id) + '"><span class="cc-icon">🎯</span><span>不细分</span></button>' +
+          '<button class="cat-cell ' + (d.categoryId === selRoot.id ? 'active' : '') + '" data-action="add:pickCat" data-id="' + esc(selRoot.id) + '"><span>不细分</span></button>' +
           kids.map(function (k) {
             return '<button class="cat-cell ' + (d.categoryId === k.id ? 'active' : '') + '" data-action="add:pickCat" data-id="' + esc(k.id) + '">' +
-              '<span class="cc-icon">' + k.icon + '</span><span>' + esc(k.name) + '</span></button>';
+              '<span>' + esc(k.name) + '</span></button>';
           }).join('') + '</div>';
       }
       catCells = '<div class="sec-head"><b>选择分类</b><button class="link small" data-action="nav:categories">管理</button></div>' +
         '<div class="cat-grid">' + cats.map(function (c) {
           return '<button class="cat-cell ' + (selRoot && selRoot.id === c.id ? 'active' : '') + '" data-action="add:pickCat" data-id="' + esc(c.id) + '">' +
-            '<span class="cc-icon">' + c.icon + '</span><span>' + esc(c.name) + '</span></button>';
+            '<span>' + esc(c.name) + '</span></button>';
         }).join('') + '</div>' + subGrid;
     }
     var transferRow = d.type === 'transfer'
@@ -2046,14 +3304,10 @@
     var d = state.addDraft;
     var rows = liveAccounts().map(function (a) {
       return '<button class="set-item" data-action="add:acc-set" data-field="' + field + '" data-id="' + esc(a.id) + '" style="width:100%">' +
-        '<span class="si-icon">' + accTypeIcon(a.type) + '</span>' +
         '<span class="si-main">' + esc(a.name) + '</span>' +
         '<span class="small muted">' + Core.fmtMoney(Core.accountBalance(a, state.txns)) + '</span></button>';
     }).join('');
     openSheet(field === 'accountId' ? '选择账户' : '转入账户', rows || '<div class="empty">还没有账户</div>');
-  }
-  function accTypeIcon(type) {
-    return { wechat: '💬', alipay: '🅰️', bank: '🏦', cash: '💵' }[type] || '💰';
   }
 
   /* ================= 明细 ================= */
@@ -2094,7 +3348,7 @@
         if (state.selectMode) {
           var on = !!state.selectedIds[t.id];
           return '<div class="txn-item" data-action="list:toggleSel" data-id="' + esc(t.id) + '" style="' + (on ? 'background:#fdf1dc' : '') + '">' +
-            '<span style="font-size:17px">' + (on ? '✅' : '⬜️') + '</span>' +
+            '<span style="font-size:17px">' + (on ? '已选' : '未选') + '</span>' +
             '<div class="t-main"><div class="t-title">' + esc(txnTitle(t)) + '</div><div class="t-sub">' + esc(txnSub(t)) + '</div></div>' +
             '<div class="t-amt ' + (t.type === 'income' ? 'income' : t.type === 'transfer' ? 'transfer' : 'expense') + '">' + amtStr(t) + '</div></div>';
         }
@@ -2102,10 +3356,10 @@
       }).join('');
       return '<div class="day-head"><span>' + Core.fmtDateCN(g.date) + '</span><span>支出 ' + Core.fmtMoney(g.dayExpense) +
         (g.dayIncome ? ' · 收入 ' + Core.fmtMoney(g.dayIncome) : '') + '</span></div>' + rows;
-    }).join('') : '<div class="empty"><div class="e-icon">🔍</div>本月没有符合条件的记录</div>';
+    }).join('') : '<div class="empty">本月没有符合条件的记录</div>';
 
     var selBar = state.selectMode
-      ? '<div class="card" style="position:fixed;bottom:calc(70px + var(--safe-b));left:14px;right:14px;max-width:492px;margin:0 auto;display:flex;gap:10px;z-index:40">' +
+      ? '<div class="card selection-toolbar">' +
         '<button class="btn grow" data-action="list:cancelSel">取消</button>' +
         '<button class="btn primary grow" data-action="list:applySel">归为分类（已选 ' + Object.keys(state.selectedIds).length + '）</button></div>'
       : '';
@@ -2124,7 +3378,7 @@
     var f = state.listFilters;
     var catOpts = ['<option value="">全部分类</option>', '<option value="__none__"' + (f.category === '__none__' ? ' selected' : '') + '>未分类</option>']
       .concat(state.categories.filter(function (c) { return c.type === 'expense' || c.type === 'income'; }).map(function (c) {
-        return '<option value="' + esc(c.id) + '"' + (f.category === c.id ? ' selected' : '') + '>' + c.icon + ' ' + esc(c.name) + '</option>';
+        return '<option value="' + esc(c.id) + '"' + (f.category === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
       })).join('');
     var accOpts = ['<option value="">全部账户</option>'].concat(liveAccounts().map(function (a) {
       return '<option value="' + esc(a.id) + '"' + (f.account === a.id ? ' selected' : '') + '>' + esc(a.name) + '</option>';
@@ -2151,7 +3405,7 @@
       (t.type === 'transfer'
         ? '<div class="map-row"><span class="muted">账户</span><span style="margin-left:auto">' + esc(accountName(t.account)) + ' → ' + esc(accountName(t.accountTo)) + '</span></div>'
         : '<div class="map-row"><span class="muted">账户</span><span style="margin-left:auto">' + esc(accountName(t.account)) + '</span></div>' +
-          '<div class="map-row"><span class="muted">分类</span><span style="margin-left:auto">' + (txnCategory(t) ? txnCategory(t).icon + ' ' + esc(txnCategory(t).name) : '未分类') + '</span></div>') +
+          '<div class="map-row"><span class="muted">分类</span><span style="margin-left:auto">' + (txnCategory(t) ? esc(txnCategory(t).name) : '未分类') + '</span></div>') +
       '<div class="map-row"><span class="muted">商户/对方</span><span style="margin-left:auto">' + esc(t.merchant || '—') + '</span></div>' +
       '<div class="map-row"><span class="muted">备注</span><span style="margin-left:auto">' + esc(t.note || '—') + '</span></div>' +
       '<div class="map-row"><span class="muted">来源</span><span style="margin-left:auto">' + (t.source === 'manual' ? '手动记账' : '导入 · ' + (SOURCE_NAME[t.source] || t.source)) + '</span></div>';
@@ -2159,13 +3413,13 @@
     // 去重关系
     if (t.mappedTo) {
       var kept = state.txns.find(function (x) { return x.id === t.mappedTo; });
-      rows += '<div class="dup-card"><b>🔗 已合并记录</b><div class="dc-rows">本条与「' + esc(kept ? txnTitle(kept) + ' ' + Core.fmtMoney(kept.amount) : '?') +
+      rows += '<div class="dup-card"><b> 已合并记录</b><div class="dc-rows">本条与「' + esc(kept ? txnTitle(kept) + ' ' + Core.fmtMoney(kept.amount) : '?') +
         '」是同一笔钱，统计中只计一次。</div>' +
         '<button class="btn danger block" data-action="txn:undoMerge" data-id="' + esc(t.id) + '">撤销合并（恢复为两条独立记录）</button></div>';
     }
     var shadows = state.txns.filter(function (x) { return x.mappedTo === t.id; });
     shadows.forEach(function (s) {
-      rows += '<div class="dup-card"><b>🔗 已合并入本条</b><div class="dc-rows">' + esc(SOURCE_NAME[s.source] || s.source) + '：' +
+      rows += '<div class="dup-card"><b> 已合并入本条</b><div class="dc-rows">' + esc(SOURCE_NAME[s.source] || s.source) + '：' +
         esc(txnTitle(s)) + ' ¥' + Core.fmtMoney(s.amount) + '（' + esc(s.date) + '，统计中不再重复计入）</div>' +
         '<button class="btn ghost block" data-action="txn:undoMerge" data-id="' + esc(s.id) + '">撤销这条合并</button></div>';
     });
@@ -2174,13 +3428,13 @@
     if (t.type === 'income' && t.refundFlag) {
       if (t.refundOf) {
         var src = state.txns.find(function (x) { return x.id === t.refundOf; });
-        rows += '<div class="dup-card" style="border-color:#dcfce7"><b>↩️ 已冲销原支出</b>' +
+        rows += '<div class="dup-card" style="border-color:#dcfce7"><b>↩ 已冲销原支出</b>' +
           '<div class="dc-rows">关联「' + esc(src ? txnTitle(src) : '?') + ' ¥' + (src ? Core.fmtMoney(src.amount) : '?') + '」，本分类月支出已相应减少，本条不计入收入。</div>' +
           '<button class="btn ghost block" data-action="refund:unlink" data-id="' + esc(t.id) + '">撤销关联</button></div>';
       } else {
         var rfMatches = Core.matchRefunds(state.txns).filter(function (x) { return x.refund.id === t.id; });
         var cands = rfMatches.length ? rfMatches[0].candidates : [];
-        rows += '<div class="dup-card"><b>↩️ 退款冲销</b><div class="dc-rows">关联原支出后冲减其分类支出（而非计为收入）。</div>' +
+        rows += '<div class="dup-card"><b>↩ 退款冲销</b><div class="dc-rows">关联原支出后冲减其分类支出（而非计为收入）。</div>' +
           (cands.length ? cands.slice(0, 5).map(function (c) {
             return '<button class="btn block" style="margin-top:6px" data-action="refund:link" data-id="' + esc(t.id) + '" data-target="' + esc(c.id) + '">' +
               '关联：' + esc(txnTitle(c)) + ' ¥' + Core.fmtMoney(c.amount) + '（' + esc(c.date) + '）</button>';
@@ -2192,33 +3446,33 @@
     if (t.type === 'expense') {
       var closedIncome = state.txns.find(function (x) { return x.type === 'income' && x.reimburseOf === t.id && !x.mappedTo; });
       if (closedIncome) {
-        rows += '<div class="dup-card" style="border-color:#dcfce7"><b>✅ 报销已闭环</b>' +
+        rows += '<div class="dup-card" style="border-color:#dcfce7"><b> 报销已闭环</b>' +
           '<div class="dc-rows">报销款 ¥' + Core.fmtMoney(closedIncome.amount) + '（' + esc(closedIncome.date) + '）已关联。本笔不计个人支出，报销款不计收入。</div>' +
           '<button class="btn ghost block" data-action="reim:unlink" data-id="' + esc(closedIncome.id) + '">撤销闭环</button></div>';
       } else if (t.reimburseFlag) {
         var sugg = Core.matchReimbursements(state.txns).suggestions.filter(function (s) {
           return s.candidates.some(function (c) { return c.id === t.id; });
         });
-        rows += '<div class="dup-card"><b>🧾 待报销</b><div class="dc-rows">本笔为垫付，待报销到账后关联冲销。</div>' +
+        rows += '<div class="dup-card"><b> 待报销</b><div class="dc-rows">本笔为垫付，待报销到账后关联冲销。</div>' +
           (sugg.length ? sugg.map(function (s) {
             return '<button class="btn block" style="margin-top:6px" data-action="reim:doLink" data-inc="' + esc(s.income.id) + '" data-exp="' + esc(t.id) + '">' +
               '关联报销款：' + esc(s.income.merchant || '收入') + ' ¥' + Core.fmtMoney(s.income.amount) + '（' + esc(s.income.date) + '）</button>';
           }).join('') : '') +
           '<button class="btn ghost block" style="margin-top:6px" data-action="reim:unmark" data-id="' + esc(t.id) + '">取消待报销标记</button></div>';
       } else {
-        rows += '<button class="btn block" style="margin-bottom:10px" data-action="reim:mark" data-id="' + esc(t.id) + '">🧾 标记为待报销</button>';
+        rows += '<button class="btn block" style="margin-bottom:10px" data-action="reim:mark" data-id="' + esc(t.id) + '"> 标记为待报销</button>';
       }
     }
     if (t.type === 'income' && t.reimburseOf) {
       var adv = state.txns.find(function (x) { return x.id === t.reimburseOf; });
-      rows += '<div class="dup-card" style="border-color:#dcfce7"><b>🧾 报销款</b>' +
+      rows += '<div class="dup-card" style="border-color:#dcfce7"><b> 报销款</b>' +
         '<div class="dc-rows">已关联垫付「' + esc(adv ? txnTitle(adv) : '?') + '」，双方不计入收支统计。</div>' +
         '<button class="btn ghost block" data-action="reim:unlink" data-id="' + esc(t.id) + '">撤销关联</button></div>';
     }
 
     // V2.3.3 周期账标识
     if (t.recurringKey) {
-      rows += '<div class="dup-card"><b>🔁 周期账</b><div class="dc-rows">本笔由周期记账模板自动生成（' + esc(t.recurringKey) + '），可在「我的-周期记账」中撤销。</div></div>';
+      rows += '<div class="dup-card"><b> 周期账</b><div class="dc-rows">本笔由周期记账模板自动生成（' + esc(t.recurringKey) + '），可在「我的-周期记账」中撤销。</div></div>';
     }
 
     openSheet('交易详情', rows +
@@ -2244,7 +3498,7 @@
         if (!necCat || (necCat.necessity || '') !== state.statNec) return;
       }
       catAgg.push({
-        id: cid, name: c ? c.name : '未分类', icon: c ? c.icon : '❓',
+        id: cid, name: c ? c.name : '未分类', icon: c ? c.icon : '',
         sum: catAggSource[cid].sum, count: catAggSource[cid].count
       });
     });
@@ -2264,7 +3518,7 @@
           '<div class="small" style="color:' + (over ? 'var(--red)' : 'var(--ink-3)') + '">预算 ' + Core.fmtMoney(b) + (over ? ' · 已超支' : '') + '</div></div>';
       }
       return '<div>' +
-        '<div class="rank-row"><span class="rr-icon">' + c.icon + '</span>' +
+        '<div class="rank-row">' +
         '<span style="min-width:56px">' + esc(c.name) + '</span>' +
         '<span class="rr-bar"><i style="width:' + pct + '%;background:' + Charts.PALETTE[i % Charts.PALETTE.length] + '"></i></span>' +
         '<span class="rr-val">' + (state.statRank === 'count' ? c.count + ' 笔' : Core.fmtMoney(c.sum)) + '</span>' +
@@ -2275,7 +3529,7 @@
     var donutItems = catAgg.slice(0, 6).map(function (c) { return { label: c.name, value: c.sum }; });
     var legend = catAgg.slice(0, 6).map(function (c, i) {
       return '<div class="legend-item"><i style="background:' + Charts.PALETTE[i % Charts.PALETTE.length] + '"></i>' +
-        '<span>' + c.icon + ' ' + esc(c.name) + '</span><span class="li-pct">' + (agg.expense ? (c.sum / agg.expense * 100).toFixed(1) : 0) + '%</span></div>';
+        '<span>' + esc(c.name) + '</span><span class="li-pct">' + (agg.expense ? (c.sum / agg.expense * 100).toFixed(1) : 0) + '%</span></div>';
     }).join('');
 
     // V2.2.1 必要性构成（需要/想要/未标记），点击可筛选排行
@@ -2333,34 +3587,34 @@
     var txnCount = state.txns.length;
     return '<div class="page-title">我的</div>' +
       '<div class="set-group"><div class="sg-title">账本</div>' +
-        setItem('🏦', '账户管理', liveAccounts().length + ' 个账户', 'nav:accounts') +
-        setItem('🏷️', '分类管理', state.categories.length + ' 个分类 · 支持二级', 'nav:categories') +
-        setItem('📥', '导入账单', '微信 / 支付宝 / 银行流水', 'nav:import') +
-        setItem('🔁', '周期记账', (state.settings.recurring || []).length + ' 个模板', 'nav:recurring') +
-        setItem('🧾', '报销管理', '垫付标记 / 待报销清单', 'nav:reimburse') +
+        setItem('账户管理', liveAccounts().length + ' 个账户', 'nav:accounts') +
+        setItem('分类管理', state.categories.length + ' 个分类 · 支持二级', 'nav:categories') +
+        setItem('导入账单', '微信 / 支付宝 / 银行流水', 'nav:import') +
+        setItem('周期记账', (state.settings.recurring || []).length + ' 个模板', 'nav:recurring') +
+        setItem('报销管理', '垫付标记 / 待报销清单', 'nav:reimburse') +
       '</div>' +
       '<div class="set-group"><div class="sg-title">预算与体检</div>' +
-        setItem('💰', '预算管理', (state.settings.budgets && state.settings.budgets.total) ? '总预算 ¥' + Core.fmtMoney(state.settings.budgets.total) + '/月' : '月度总/分类预算', 'nav:budget') +
-        setItem('🩺', '消费体检', '月度报告 / 异常检测 / 订阅清单', 'nav:health') +
+        setItem('预算管理', (state.settings.budgets && state.settings.budgets.total) ? '总预算 ¥' + Core.fmtMoney(state.settings.budgets.total) + '/月' : '月度总/分类预算', 'nav:budget') +
+        setItem('消费体检', '月度报告 / 异常检测 / 订阅清单', 'nav:health') +
       '</div>' +
       '<div class="set-group"><div class="sg-title">数据安全</div>' +
-        setItem('🔐', '应用锁', lock.enabled ? '已开启（数据加密存储）' : '未开启', 'set:lock') +
-        setItem('💾', '导出 JSON 备份', '全量数据，含 ' + txnCount + ' 笔交易', 'set:exportJson') +
-        setItem('📄', '导出 CSV 明细', 'Excel 可直接打开', 'set:exportCsv') +
-        setItem('♻️', '从备份恢复', '选择 JSON 备份文件', 'set:restore') +
-        setItem('🗑️', '清空所有数据', '需输入"清空"确认', 'set:clear') +
+        setItem('应用锁', lock.enabled ? '已开启（数据加密存储）' : '未开启', 'set:lock') +
+        setItem('导出 JSON 备份', '全量数据，含 ' + txnCount + ' 笔交易', 'set:exportJson') +
+        setItem('导出 CSV 明细', 'Excel 可直接打开', 'set:exportCsv') +
+        setItem('从备份恢复', '选择 JSON 备份文件', 'set:restore') +
+        setItem('清空所有数据', '需输入"清空"确认', 'set:clear') +
       '</div>' +
       '<div class="set-group"><div class="sg-title">关于</div>' +
-        setItem('🛡️', '隐私承诺', '零网络请求 · 数据仅存本机', 'set:privacy') +
-        setItem('📖', '账单导出教程', '微信 / 支付宝 / 招行 / 中行', 'set:howto') +
-        setItem('📲', '安装到主屏（PWA）', '浏览器菜单选择"安装应用/添加到主屏幕"', 'set:pwa') +
+        setItem('隐私承诺', '零网络请求 · 数据仅存本机', 'set:privacy') +
+        setItem('账单导出教程', '微信 / 支付宝 / 招行 / 中行', 'set:howto') +
+        setItem('安装到主屏（PWA）', '浏览器菜单选择"安装应用/添加到主屏幕"', 'set:pwa') +
       '</div>' +
       '<div class="small muted" style="text-align:center;padding:10px 0">小账本 v' + APP_VERSION + ' · 本地优先记账</div>' +
       '<input type="file" id="file-restore" accept=".json,application/json" class="hidden">';
   }
-  function setItem(icon, title, sub, action) {
+  function setItem(title, sub, action) {
     return '<button class="set-item" data-action="' + action + '" style="width:100%;text-align:left">' +
-      '<span class="si-icon">' + icon + '</span><span class="si-main"><div>' + esc(title) + '</div><div class="si-sub">' + esc(sub) + '</div></span>' +
+      '<span class="si-main"><div>' + esc(title) + '</div><div class="si-sub">' + esc(sub) + '</div></span>' +
       '<span class="si-arrow">›</span></button>';
   }
 
@@ -2372,7 +3626,6 @@
     }).map(function (a) {
       var bal = a.deleted ? null : Core.accountBalance(a, state.txns);
       return '<div class="set-item">' +
-        '<span class="si-icon">' + accTypeIcon(a.type) + '</span>' +
         '<span class="si-main"><div>' + esc(a.name) + (a.deleted ? ' <span class="chip">已删除</span>' : '') + '</div>' +
         '<div class="si-sub">' + ACC_TYPE_NAME[a.type] + (bal != null ? ' · 余额 ' + Core.fmtMoney(bal) : '') + '</div></span>' +
         (a.deleted
@@ -2427,7 +3680,7 @@
     var NEC_NAME = { need: '必要', want: '想要', save: '储蓄' };
     function catRow(c, indent) {
       var kw = (c.keywords || []).join('、');
-      return '<div class="set-item" style="' + (indent ? 'margin-left:22px;' : '') + '"><span class="si-icon">' + c.icon + '</span>' +
+      return '<div class="set-item" style="' + (indent ? 'margin-left:22px;' : '') + '">' +
         '<span class="si-main"><div>' + (indent ? '└ ' : '') + esc(c.name) +
         (c.parentId ? ' <span class="chip">二级</span>' : '') +
         (c.necessity ? ' <span class="chip" style="background:' + (c.necessity === 'need' ? '#dcfce7;color:#15803d' : c.necessity === 'want' ? '#ffedd5;color:#c2410c' : '#e0e7ff;color:#4338ca') + '">' + (NEC_NAME[c.necessity] || c.necessity) + '</span>' : '') + '</div>' +
@@ -2456,26 +3709,22 @@
       '<div class="form-row">' + formItem('设为', '<select id="bn-nec"><option value="need">必要 need</option><option value="want">想要 want</option><option value="save">储蓄 save</option><option value="">清除标记</option></select>') + '</div>' +
       '<div style="max-height:280px;overflow:auto;padding:4px 0">' + cats.map(function (c) {
         return '<div class="map-row"><input type="checkbox" data-bn="' + esc(c.id) + '" style="width:18px;height:18px">' +
-          '<span class="mr-key">' + c.icon + ' ' + esc(c.name) + (c.parentId ? '（二级）' : '') + '</span></div>';
+          '<span class="mr-key">' + esc(c.name) + (c.parentId ? '（二级）' : '') + '</span></div>';
       }).join('') + '</div>' +
       '<button class="btn primary block" data-action="cat:batchNecGo">应用到勾选分类</button>');
   }
 
-  var ICON_CHOICES = ['🍜', '🚌', '🛒', '🏠', '🎮', '💊', '📚', '📱', '🎁', '🐶', '✈️', '👕', '☕', '🍺', '🚗', '💼', '🎬', '🏋️', '💇', '📦', '💰', '🏆', '📈', '🧧', '↩️', '🧾', '🎂', '❤️'];
 
   function categorySheet(cat, type) {
     var isNew = !cat;
-    var icons = ICON_CHOICES.map(function (ic) {
-      return '<button class="cat-cell ' + (cat && cat.icon === ic ? 'active' : '') + '" data-action="cat:pickIcon" data-icon="' + ic + '" style="padding:6px 2px"><span class="cc-icon">' + ic + '</span></button>';
-    }).join('');
-    window._catIcon = cat ? cat.icon : '📦';
+    window._catIcon = cat ? cat.icon : '';
     // V2.3.4 父级分类 + V2.2.1 必要性
     var t = type || (cat ? cat.type : 'expense');
     var parentOpts = ['<option value="">（一级分类）</option>'].concat(
       state.categories.filter(function (c) {
         return c.type === t && !c.parentId && (!cat || c.id !== cat.id);
       }).map(function (c) {
-        return '<option value="' + esc(c.id) + '"' + (cat && cat.parentId === c.id ? ' selected' : '') + '>' + c.icon + ' ' + esc(c.name) + '</option>';
+        return '<option value="' + esc(c.id) + '"' + (cat && cat.parentId === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
       })).join('');
     var necOpts = [['', '未标记'], ['need', '必要 need'], ['want', '想要 want'], ['save', '储蓄 save']].map(function (o) {
       return '<option value="' + o[0] + '"' + (cat && (cat.necessity || '') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
@@ -2487,8 +3736,6 @@
       (t === 'expense' ? formItem('必要性', '<select id="cat-nec">' + necOpts + '</select>') : '') +
       '</div>' +
       '<div class="form-row">' + formItem('关键词', '<input id="cat-kw" placeholder="逗号分隔，如 肯德基,麦当劳" value="' + esc(cat && cat.keywords ? cat.keywords.join(',') : '') + '">') + '</div>' +
-      '<div style="padding:10px 4px 4px" class="small muted">图标</div>' +
-      '<div class="cat-grid" id="cat-icons">' + icons + '</div>' +
       '<button class="btn primary block" data-action="cat:save" data-id="' + esc(cat ? cat.id : '') + '" data-type="' + esc(t) + '">' + (isNew ? '创建' : '保存') + '</button>' +
       (!isNew ? '<button class="btn danger block" style="margin-top:10px" data-action="cat:del" data-id="' + esc(cat.id) + '">删除此分类</button>' : ''));
   }
@@ -2504,7 +3751,6 @@
       var cat = categoryById(c.catId);
       var pct = c.pct != null ? Math.round(c.pct * 100) : null;
       return '<div class="set-item" style="flex-wrap:wrap">' +
-        '<span class="si-icon">' + (cat ? cat.icon : '❓') + '</span>' +
         '<span class="si-main"><div>' + esc(cat ? cat.name : '未分类') + (c.over ? ' <span class="chip" style="background:#fee2e2;color:var(--red)">超支</span>' : '') + '</div>' +
         '<div class="si-sub">' + Core.fmtMoney(c.spent) + (c.budget ? ' / ' + Core.fmtMoney(c.budget) + (pct != null ? '（' + pct + '%）' : '') : ' · 未设预算') + '</div></span>' +
         '<button class="btn small" data-action="budget:editCat" data-id="' + esc(c.catId) + '">' + (c.budget ? '调整' : '设预算') + '</button>' +
@@ -2569,7 +3815,7 @@
     var flags = healthFlags();
     var anomalyHtml;
     if (detect.insufficient) {
-      anomalyHtml = '<div class="card" style="text-align:center"><div style="font-size:30px">🌱</div>' +
+      anomalyHtml = '<div class="card" style="text-align:center">' +
         '<div class="muted" style="padding:6px 0">' + esc(detect.message) + '</div></div>';
     } else {
       anomalyHtml = detect.anomalies.map(function (a) {
@@ -2582,11 +3828,11 @@
           markBtns += '<div class="small muted" style="margin-top:4px">标记会写入相关交易的标志位</div>';
         }
         return '<div class="dup-card" style="border-left:4px solid ' + (a.severity === 'red' ? 'var(--red)' : '#f59e0b') + '">' +
-          '<div class="row"><b>' + (a.severity === 'red' ? '🔴' : '🟡') + ' ' + esc(ANOMALY_NAME[a.kind] || a.kind) + '</b>' +
+          '<div class="row"><b>' + (a.severity === 'red' ? '重点关注：' : '留意：') + ' ' + esc(ANOMALY_NAME[a.kind] || a.kind) + '</b>' +
           (marked ? '<span class="chip" style="margin-left:auto">' + (marked === 'ok' ? '已标记合理' : '已标记改进') + '</span>' : '') + '</div>' +
           '<div class="dc-rows">' + esc(a.message) + '</div>' + markBtns + '</div>';
       }).join('');
-      if (!detect.anomalies.length) anomalyHtml = '<div class="card" style="text-align:center"><div style="font-size:30px">✅</div><div class="muted" style="padding:6px 0">本月无异常消费，继续保持</div></div>';
+      if (!detect.anomalies.length) anomalyHtml = '<div class="card" style="text-align:center"><div class="muted" style="padding:6px 0">本月无异常消费，继续保持</div></div>';
     }
 
     var subTotal = subs.reduce(function (s, x) { return s + x.monthlyCost; }, 0);
@@ -2600,7 +3846,7 @@
       : '<div class="muted small" style="padding:8px 2px">未发现周期性扣款（需同商户相近金额且周期稳定出现 ≥3 次）</div>';
 
     return tplMonthBar() +
-      '<div class="card"><b>📊 ' + ymLabel(state.ym) + ' 消费体检</b>' +
+      '<div class="card"><b> ' + ymLabel(state.ym) + ' 消费体检</b>' +
       '<div class="result-grid" style="margin-top:10px">' +
       '<div class="rg"><b>' + Core.fmtMoney(agg.expense) + '</b><span class="small muted">本月支出' + (mom != null ? (mom > 0 ? ' ↑' + mom + '%' : mom < 0 ? ' ↓' + (-mom) + '%' : ' 持平') : '') + '</span></div>' +
       '<div class="rg"><b>' + Core.fmtMoney(agg.income) + '</b><span class="small muted">本月收入</span></div>' +
@@ -2637,8 +3883,8 @@
       : (detect.anomalies.length ? detect.anomalies.map(function (a) {
         var fk = state.ym + '|' + anomalyKey(a);
         var mk = flags[fk] === 'ok' ? ' <span class="tag ok">已标记合理</span>' : flags[fk] === 'improve' ? ' <span class="tag imp">已标记改进</span>' : '';
-        return '<div class="anomaly ' + a.severity + '"><b>' + (a.severity === 'red' ? '🔴' : '🟡') + ' ' + esc(ANOMALY_NAME[a.kind] || a.kind) + '</b>' + mk + '<p>' + esc(a.message) + '</p></div>';
-      }).join('') : '<p class="muted">本月无异常消费 ✅</p>');
+        return '<div class="anomaly ' + a.severity + '"><b>' + (a.severity === 'red' ? '重点关注：' : '留意：') + ' ' + esc(ANOMALY_NAME[a.kind] || a.kind) + '</b>' + mk + '<p>' + esc(a.message) + '</p></div>';
+      }).join('') : '<p class="muted">本月无异常消费 </p>');
     var subRows = subs.length ? subs.map(function (s) {
       return '<li>' + esc(s.merchant) + '：每 ' + s.intervalDays + ' 天 ¥' + Core.fmtMoney(s.amount) + '（月成本 ¥' + Core.fmtMoney(s.monthlyCost) + '）</li>';
     }).join('') : '<li class="muted">未发现周期性扣款</li>';
@@ -2654,7 +3900,7 @@
       '.anomaly p{margin:6px 0 0;font-size:14px}.tag{font-size:11px;border-radius:6px;padding:1px 8px;margin-left:6px}.tag.ok{background:#dcfce7;color:#15803d}.tag.imp{background:#ffedd5;color:#c2410c}' +
       'li{margin:6px 0;font-size:14px}.muted{color:#6b7280}footer{margin:32px 0;font-size:11px;color:#9ca3af;text-align:center}' +
       '</style></head><body>' +
-      '<h1>📒 小账本消费体检报告</h1><p class="muted">' + ymLabel(state.ym) + ' · 生成于 ' + new Date().toLocaleString('zh-CN') + ' · 本报告自包含、离线可看</p>' +
+      '<h1> 小账本消费体检报告</h1><p class="muted">' + ymLabel(state.ym) + ' · 生成于 ' + new Date().toLocaleString('zh-CN') + ' · 本报告自包含、离线可看</p>' +
       '<div class="grid">' +
       '<div class="cell"><b>' + Core.fmtMoney(agg.expense) + '</b><span>支出' + (mom != null ? (mom > 0 ? ' ↑' + mom + '%' : ' ↓' + (-mom) + '%') : '') + '</span></div>' +
       '<div class="cell"><b>' + Core.fmtMoney(agg.income) + '</b><span>收入</span></div>' +
@@ -2677,21 +3923,20 @@
     var pendingRows = m.pending.map(function (t) {
       var age = Math.max(0, Core.daysBetween(t.date, todayDateStr()));
       return '<div class="set-item" style="flex-wrap:wrap">' +
-        '<span class="si-icon">🧾</span>' +
         '<span class="si-main"><div>' + esc(t.merchant || txnTitle(t)) + '</div>' +
-        '<div class="si-sub">' + esc(t.date) + ' · 账龄 ' + age + ' 天' + (age > 30 ? ' ⚠️' : '') + '</div></span>' +
+        '<div class="si-sub">' + esc(t.date) + ' · 账龄 ' + age + ' 天' + (age > 30 ? ' · 超过30天' : '') + '</div></span>' +
         '<span style="font-weight:700">¥' + Core.fmtMoney(t.amount) + '</span>' +
         '<button class="btn small" style="margin-left:8px" data-action="reim:link" data-id="' + esc(t.id) + '">关联报销款</button></div>';
     }).join('');
     var suggestionHtml = m.suggestions.map(function (s) {
-      return '<div class="dup-card"><b>💡 收入 ¥' + Core.fmtMoney(s.income.amount) + '（' + esc(s.income.date) + ' ' + esc(s.income.merchant || '未命名') + '）疑似报销款</b>' +
+      return '<div class="dup-card"><b> 收入 ¥' + Core.fmtMoney(s.income.amount) + '（' + esc(s.income.date) + ' ' + esc(s.income.merchant || '未命名') + '）疑似报销款</b>' +
         '<div class="dc-rows">可关联的待报销垫付：' + s.candidates.map(function (c) {
           return '<button class="link" data-action="reim:doLink" data-inc="' + esc(s.income.id) + '" data-exp="' + esc(c.id) + '">' + esc(c.merchant || txnTitle(c)) + ' ¥' + Core.fmtMoney(c.amount) + '</button>';
         }).join(' / ') + '</div></div>';
     }).join('');
     var closedRows = state.txns.filter(function (t) { return t.type === 'income' && t.reimburseOf; }).map(function (inc) {
       var exp = state.txns.find(function (x) { return x.id === inc.reimburseOf; });
-      return '<div class="map-row"><span class="mr-key">✅ ' + esc(exp ? (exp.merchant || txnTitle(exp)) : '?') + ' ↔ ' + esc(inc.merchant || '报销款') + '</span>' +
+      return '<div class="map-row"><span class="mr-key"> ' + esc(exp ? (exp.merchant || txnTitle(exp)) : '?') + ' ↔ ' + esc(inc.merchant || '报销款') + '</span>' +
         '<span style="margin-left:auto">¥' + Core.fmtMoney(inc.amount) + '</span>' +
         '<button class="btn small ghost" data-action="reim:unlink" data-id="' + esc(inc.id) + '">撤销</button></div>';
     }).join('');
@@ -2717,7 +3962,6 @@
     var tpls = state.settings.recurring || [];
     var rows = tpls.map(function (t) {
       return '<div class="set-item" style="flex-wrap:wrap">' +
-        '<span class="si-icon">' + (t.type === 'income' ? '💰' : '🔁') + '</span>' +
         '<span class="si-main"><div>' + esc(t.name) + (t.active === false ? ' <span class="chip">已停用</span>' : '') + '</div>' +
         '<div class="si-sub">' + freqLabel(t) + ' · ¥' + Core.centsToYuan(t.amount) + ' · ' + esc(accountName(t.accountId)) + '</div></span>' +
         '<span class="row" style="gap:6px">' +
@@ -2754,7 +3998,7 @@
       return '<option value="' + esc(a.id) + '"' + (t.accountId === a.id ? ' selected' : '') + '>' + esc(a.name) + '</option>';
     }).join('');
     var catOpts = state.categories.filter(function (c) { return c.type === (t.type || 'expense') && !c.parentId; }).map(function (c) {
-      return '<option value="' + esc(c.id) + '"' + (t.categoryId === c.id ? ' selected' : '') + '>' + c.icon + ' ' + esc(c.name) + '</option>';
+      return '<option value="' + esc(c.id) + '"' + (t.categoryId === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
     }).join('');
     var freqOpts = [['monthly', '每月'], ['weekly', '每周'], ['yearly', '每年'], ['daily', '每天']].map(function (f) {
       return '<option value="' + f[0] + '"' + (t.frequency === f[0] ? ' selected' : '') + '>' + f[1] + '</option>';
@@ -2861,14 +4105,14 @@
       '<div class="map-row"><span class="mr-key">其他银行 / 列映射向导</span><button class="btn small" data-action="wiz:tpl" data-id="custom">自定义映射</button></div>' +
       '</div>';
     return '<div class="drop-zone" data-action="wiz:pickFile">' +
-      '<div style="font-size:36px">📂</div>' +
+      '' +
       '<div style="margin-top:8px">' + (w.fileName ? '已选择：<b>' + esc(w.fileName) + '</b><div class="small muted">点击重新选择</div>' : '点击选择账单 CSV 文件') + '</div>' +
       '<div class="small muted" style="margin-top:8px">支持：微信账单 / 支付宝流水（UTF-8/GBK）/ 银行流水 CSV</div>' +
       '</div>' +
       '<input type="file" id="wiz-file" accept=".csv,text/csv" class="hidden">' +
       '<div id="wiz-parse-msg"></div>' +
       bankTpls +
-      '<div class="small muted" style="padding:6px 4px">💡 收到 XLSX/PDF 流水？请先在 Excel/Numbers 中另存为 CSV 再导入。</div>';
+      '<div class="small muted" style="padding:6px 4px"> 收到 XLSX/PDF 流水？请先在 Excel/Numbers 中另存为 CSV 再导入。</div>';
   }
 
   function wizStep2() {
@@ -2881,7 +4125,7 @@
       if (r.transferLike) transferLike++;
     });
     var errHtml = p.errors.length
-      ? '<div class="dup-card" style="border-color:#fecaca"><b>⚠️ ' + p.errors.length + ' 行无法解析（已跳过）</b>' +
+      ? '<div class="dup-card" style="border-color:#fecaca"><b> ' + p.errors.length + ' 行无法解析（已跳过）</b>' +
         '<div class="dc-rows">' + p.errors.slice(0, 5).map(function (e) { return '第' + e.line + '行：' + esc(e.message); }).join('<br>') + (p.errors.length > 5 ? '<br>…' : '') + '</div></div>'
       : '';
     return '<div class="card"><b>解析结果</b>' +
@@ -2914,7 +4158,7 @@
     var accRows = Object.keys(methods).map(function (m) {
       var cur = w.accountMapping[m] || autoAccountGuess(m);
       var opts = ['<option value="">未指定</option>'].concat(liveAccounts().map(function (a) {
-        return '<option value="' + esc(a.id) + '"' + (cur === a.id ? ' selected' : '') + '>' + accTypeIcon(a.type) + ' ' + esc(a.name) + '</option>';
+        return '<option value="' + esc(a.id) + '"' + (cur === a.id ? ' selected' : '') + '>' + esc(a.name) + '</option>';
       })).join('');
       return '<div class="map-row"><span class="mr-key" title="' + esc(m) + '">' + esc(m) + '</span>' +
         '<select data-change="wiz:accMap" data-key="' + esc(m) + '">' + opts + '</select></div>';
@@ -2922,7 +4166,7 @@
     // 转账目标
     var transferNeeded = Object.keys(w.typeMapping).some(function (k) { return w.typeMapping[k] === 'transfer'; });
     var targetOpts = ['<option value="">（稍后由去重引擎/手动处理）</option>'].concat(liveAccounts().map(function (a) {
-      return '<option value="' + esc(a.id) + '"' + (w.transferTarget === a.id ? ' selected' : '') + '>' + accTypeIcon(a.type) + ' ' + esc(a.name) + '</option>';
+      return '<option value="' + esc(a.id) + '"' + (w.transferTarget === a.id ? ' selected' : '') + '>' + esc(a.name) + '</option>';
     })).join('');
 
     return '<div class="card"><b>① 交易类型 → 记账类型</b><div class="small muted" style="margin:4px 0 6px">退款先记为收入并打退款标记；导入后可关联原交易完成冲销。</div>' + (typeRows || '<div class="small muted">无</div>') + '</div>' +
@@ -2942,7 +4186,7 @@
     var w = state.wiz, m = w.match, b = w.built;
     if (!m) return '<div class="empty">正在分析…</div>';
     var autoHtml = m.autoMerged.map(function (x) {
-      return '<div class="dup-card"><b>✅ 自动合并</b><div class="dc-rows">' +
+      return '<div class="dup-card"><b> 自动合并</b><div class="dc-rows">' +
         esc(txnTitle(x.shadow)) + ' ¥' + Core.fmtMoney(x.shadow.amount) + '（' + (SOURCE_NAME[x.shadow.source] || x.shadow.source) + ' ' + x.shadow.date + '）<br>' +
         '→ 保留' + (SOURCE_NAME[x.kept.source] || x.kept.source) + '记录「' + esc(txnTitle(x.kept)) + '」（' + x.reason + '），银行记录不再计入统计</div></div>';
     }).join('');
@@ -2950,11 +4194,11 @@
       var desc = x.inc
         ? esc(txnTitle(x.inc)) + ' ¥' + Core.fmtMoney(x.inc.amount) + ' 与已有银行端记录配对，自动补齐转入账户，不计收支'
         : '银行端 ' + esc(txnTitle(x.bankRecord)) + ' ¥' + Core.fmtMoney(x.bankRecord.amount) + ' 补齐已有渠道提现/充值转账，不计收支';
-      return '<div class="dup-card"><b>🔁 识别为账户间转账</b><div class="dc-rows">' + desc + '</div></div>';
+      return '<div class="dup-card"><b> 识别为账户间转账</b><div class="dc-rows">' + desc + '</div></div>';
     }).join('');
     var confirmHtml = m.needConfirm.map(function (x, i) {
       var d = w.decisions[i];
-      return '<div class="dup-card"><b>❓ 疑似重复，请确认</b><div class="dc-rows">' +
+      return '<div class="dup-card"><b> 疑似重复，请确认</b><div class="dc-rows">' +
         '待导入：' + esc(txnTitle(x.inc)) + ' ¥' + Core.fmtMoney(x.inc.amount) + ' ' + x.inc.date + '<br>' +
         '已有：' + esc(txnTitle(x.cand)) + ' ¥' + Core.fmtMoney(x.cand.amount) + ' ' + x.cand.date + '（' + (x.cand.source === 'manual' ? '手动' : SOURCE_NAME[x.cand.source] || x.cand.source) + '）<br>' +
         '<span class="muted">' + esc(x.reason) + '</span></div>' +
@@ -2970,7 +4214,7 @@
       '转账两端配对：<b>' + m.transferPairs.length + '</b> 条<br>' +
       '需你确认：<b>' + m.needConfirm.length + '</b> 条' + (pending ? '（还有 ' + pending + ' 条未选择，默认都保留）' : '') + '</div></div>' +
       autoHtml + transferHtml + confirmHtml +
-      (b.warnings.length ? '<div class="dup-card" style="border-color:#fde68a"><b>⚠️ 提示</b><div class="dc-rows">' + b.warnings.slice(0, 5).map(esc).join('<br>') + '</div></div>' : '') +
+      (b.warnings.length ? '<div class="dup-card" style="border-color:#fde68a"><b> 提示</b><div class="dc-rows">' + b.warnings.slice(0, 5).map(esc).join('<br>') + '</div></div>' : '') +
       '<div class="row" style="gap:10px"><button class="btn grow" data-action="wiz:back">上一步</button>' +
       '<button class="btn primary grow" data-action="wiz:apply">确认导入</button></div>';
   }
@@ -2978,7 +4222,7 @@
   function wizStep5() {
     var d = state.wiz.done;
     if (!d) return '';
-    return '<div class="card" style="text-align:center"><div style="font-size:40px">🎉</div><b style="font-size:17px">导入完成</b>' +
+    return '<div class="card" style="text-align:center"><b style="font-size:17px">导入完成</b>' +
       '<div class="result-grid" style="margin-top:14px">' +
       '<div class="rg"><b>' + d.added + '</b><span class="small muted">新导入</span></div>' +
       '<div class="rg"><b>' + d.merged + '</b><span class="small muted">合并/配对</span></div>' +
@@ -3183,7 +4427,7 @@
     var enabled = state.settings.lock && state.settings.lock.enabled;
     if (!enabled) {
       openSheet('开启应用锁',
-        '<div class="dup-card" style="border-color:#fecaca"><b>⚠️ 开启前请务必了解</b><div class="dc-rows">交易数据将使用 AES-GCM 加密存储。<b>密码只存在于你的记忆中，忘记密码 = 数据永远无法恢复。</b>建议先在「导出 JSON 备份」留存一份明文备份。</div></div>' +
+        '<div class="dup-card" style="border-color:#fecaca"><b> 开启前请务必了解</b><div class="dc-rows">交易数据将使用 AES-GCM 加密存储。<b>密码只存在于你的记忆中，忘记密码 = 数据永远无法恢复。</b>建议先在「导出 JSON 备份」留存一份明文备份。</div></div>' +
         '<div class="form-row">' +
         formItem('设置密码', '<input id="lk-pw1" type="password" placeholder="至少 4 位" autocomplete="off">') +
         formItem('确认密码', '<input id="lk-pw2" type="password" placeholder="再输入一次" autocomplete="off">') +
@@ -3267,10 +4511,16 @@
   /* ================= 数据备份 ================= */
 
   function exportJson() {
-    var backup = Core.createBackup(state, APP_VERSION);
     var d = todayDateStr();
-    download('ledger-backup-' + d + '.json', JSON.stringify(backup, null, 2), 'application/json');
-    toast('已导出 JSON 备份（请妥善保管）');
+    // 评估 / 目标 / 认可标的只存在服务端事实源，导出时一并取出（§10.5）
+    Store.companionCollections().then(function (companion) {
+      var backup = Core.createBackup(Object.assign({}, state, companion), APP_VERSION);
+      download('ledger-backup-' + d + '.json', JSON.stringify(backup, null, 2), 'application/json');
+      toast('已导出 JSON 备份（评估 ' + backup.riskAssessments.length + ' 条 · 目标 ' +
+        backup.allocationTargets.length + ' 版 · 认可标的 ' + backup.approvedInstruments.length + ' 条）');
+    }).catch(function (e) {
+      toast('导出失败：' + ((e && e.message) || '无法读取事实源'), 'err');
+    });
   }
 
   function exportCsv() {
@@ -3302,11 +4552,14 @@
             accounts: state.accounts, categories: state.categories, txns: state.txns,
             settings: state.settings, assets: state.assets
           };
+          COMPANION_KEYS.forEach(function (k) { before[k] = state[k]; });
           state.accounts = restored.accounts;
           state.categories = restored.categories;
           state.txns = restored.txns;
           state.settings = restored.settings;
           state.assets = Domain.normalizeAssets(restored.assets); // v1 备份 → 空集合（S1.1）
+          // 备份里的评估 / 目标 / 认可标的是整份覆盖（旧备份缺键 → 空集合，不伪造默认值）
+          COMPANION_KEYS.forEach(function (k) { state[k] = restored[k]; });
           save({ forceBackup: true }).then(function (ok) {
             if (ok) {
               toast('恢复完成');
@@ -3317,6 +4570,7 @@
               state.txns = before.txns;
               state.settings = before.settings;
               state.assets = before.assets;
+              COMPANION_KEYS.forEach(function (k) { state[k] = before[k]; });
               toast('恢复未完成，当前数据保持不变', 'err');
               render();
             }
@@ -3327,7 +4581,7 @@
 
   function clearAllSheet() {
     openSheet('清空所有数据',
-      '<div class="dup-card" style="border-color:#fecaca"><b>⚠️ 此操作不可撤销</b><div class="dc-rows">将删除全部账户、分类、交易与设置。建议先「导出 JSON 备份」。</div></div>' +
+      '<div class="dup-card" style="border-color:#fecaca"><b> 此操作不可撤销</b><div class="dc-rows">将删除全部账户、分类、交易与设置。建议先「导出 JSON 备份」。</div></div>' +
       '<div class="form-row">' + formItem('输入"清空"', '<input id="clr-input" placeholder="清空" autocomplete="off">') + '</div>' +
       '<button class="btn danger block" data-action="clear:go">永久清空</button>');
   }
@@ -3359,11 +4613,11 @@
   function privacySheet() {
     openSheet('隐私承诺',
       '<div style="line-height:1.9;font-size:14px">' +
-      '🔐 <b>零网络请求</b>：本应用不加载任何外部资源、无埋点、无统计上报，断网可完整使用（可在浏览器 DevTools Network 面板验证）。<br><br>' +
-      '💾 <b>数据仅存本机</b>：全部数据保存在本机浏览器的 IndexedDB 中，不上传任何服务器。<br><br>' +
-      '🔐 <b>应用锁加密</b>：开启后交易数据经 PBKDF2 派生密钥 + AES-GCM 加密落盘，密码不落盘、不可找回。<br><br>' +
-      '📦 <b>数据永不锁定</b>：随时可导出 JSON 全量备份与 CSV 明细，换浏览器/换电脑不丢数据。<br><br>' +
-      '⚠️ <b>注意</b>：浏览器「清除站点数据」会清空 IndexedDB，请定期导出备份。</div>');
+      ' <b>零网络请求</b>：本应用不加载任何外部资源、无埋点、无统计上报，断网可完整使用（可在浏览器 DevTools Network 面板验证）。<br><br>' +
+      ' <b>数据仅存本机</b>：全部数据保存在本机浏览器的 IndexedDB 中，不上传任何服务器。<br><br>' +
+      ' <b>应用锁加密</b>：开启后交易数据经 PBKDF2 派生密钥 + AES-GCM 加密落盘，密码不落盘、不可找回。<br><br>' +
+      ' <b>数据永不锁定</b>：随时可导出 JSON 全量备份与 CSV 明细，换浏览器/换电脑不丢数据。<br><br>' +
+      ' <b>注意</b>：浏览器「清除站点数据」会清空 IndexedDB，请定期导出备份。</div>');
   }
 
   function howtoSheet() {
@@ -3392,6 +4646,25 @@
     'ym:today': function () { state.ym = curYM(); render(); },
 
     'sheet:close': closeSheet,
+
+    // 5E-4 本地知识卡：只按已知 id 打开；未知 id 显式降级，不展示任何解释
+    'know:open': function (el) {
+      var id = el && el.dataset ? el.dataset.cardId : '';
+      var card = (typeof window !== 'undefined' && window.Knowledge)
+        ? window.Knowledge.getCard(id) : null;
+      if (!card) {
+        openSheet('知识卡',
+          '<div class="small" data-know-missing>没有编号为「' + esc(id || '（空）') +
+          '」的知识卡：此处不展示解释，也不据此给出任何判断。目录可能已更新，请刷新页面。</div>');
+        return;
+      }
+      openSheet(card.title,
+        '<div class="small muted" data-know-meta>解释版本 ' + esc(window.Knowledge.EXPLANATION_VERSION) +
+        ' · 概念与规则说明，不含你的账户事实，也不构成投资建议。</div>' +
+        '<div class="small" data-know-card="' + esc(card.id) + '" style="line-height:1.8;margin-top:8px;padding-bottom:14px">' +
+        card.body.map(function (p) { return '<div style="margin-bottom:8px">' + esc(p) + '</div>'; }).join('') +
+        '</div>');
+    },
 
     // 记一笔
     'add:type': function (el) {
@@ -3452,7 +4725,7 @@
       if (!ids.length) { toast('请先勾选交易', 'warn'); return; }
       var cats = state.categories.filter(function (c) { return c.type === 'expense' || c.type === 'income'; });
       var grid = '<div class="cat-grid">' + cats.map(function (c) {
-        return '<button class="cat-cell" data-action="list:applyCat" data-id="' + esc(c.id) + '"><span class="cc-icon">' + c.icon + '</span><span>' + esc(c.name) + '</span></button>';
+        return '<button class="cat-cell" data-action="list:applyCat" data-id="' + esc(c.id) + '"><span>' + esc(c.name) + '</span></button>';
       }).join('') + '</div>';
       openSheet('归为分类（' + ids.length + ' 笔）', grid);
     },
@@ -3502,6 +4775,73 @@
       nav('close');
       // 刚结完账回来要看到新快照，因此强制重拉一次
       ensureClosesLoaded(true);
+    },
+
+    // Phase 5B：风险评估与复评
+    'nav:risk': function () { nav('risk'); },
+    // Phase 5E-1：决策台摘要的复评入口 —— 只预置原因并跳到风险页，判定与写入仍在服务端。
+    'risk:reassess': function (el) {
+      state.riskDraft = { answers: {}, reason: (el && el.dataset.reason) || 'initial' };
+      state.riskView = 'form';
+      nav('risk');
+    },
+    'risk:retry': function () { ensureRiskCurrentLoaded(); },
+    // Phase 5E-2：配置对照的重新读取（与风险摘要平行，不整页 render）
+    'alloc:retry': function () { ensureAllocCurrentLoaded(); },
+    'risk:start': function (el) {
+      state.riskDraft = { answers: {}, reason: (el && el.dataset.reason) || 'initial' };
+      state.riskView = 'form';
+      render();
+    },
+    'risk:answer': function (el) {
+      state.riskDraft.answers[el.dataset.q] = el.dataset.o;
+    },
+    'risk:submit': submitRiskAssessment,
+    'risk:cancel': function () {
+      // 草稿只存在于内存（§5.3）：离开即丢弃，不冒充已保存的评估
+      state.riskView = 'list';
+      state.riskDraft = { answers: {}, reason: 'initial' };
+      render();
+    },
+
+    // Phase 5C：目标配置与认可标的映射
+    'nav:targets': function () { nav('targets'); },
+    'target:reload': function () { ensureTargetsLoaded(true); },
+    'target:generate': generateTarget,
+    // Phase 5D：只提交金额与引用绑定，判定与分配全部由服务端重算
+    'advice:run': runAdvice,
+    'map:add': function (el) {
+      var cls = el.dataset.cls;
+      var pick = document.querySelector('#map-pick-' + cls);
+      if (!pick || !pick.value) { toast('请选择要认可的标的', 'warn'); return; }
+      var ids = mappingIdsFor(cls).map(function (r) { return r.instrumentId; });
+      if (ids.indexOf(pick.value) >= 0) { toast('该标的已在此类别下', 'warn'); return; }
+      ids.push(pick.value);
+      mappingAction(cls, function () { return ids; });
+    },
+    'map:remove': function (el) {
+      var cls = el.dataset.cls;
+      mappingAction(cls, function (rows) {
+        return rows.filter(function (r) { return r.id !== el.dataset.id; }).map(function (r) { return r.instrumentId; });
+      });
+    },
+    'map:up': function (el) {
+      var cls = el.dataset.cls;
+      mappingAction(cls, function (rows) {
+        var i = rows.map(function (r) { return r.id; }).indexOf(el.dataset.id);
+        if (i <= 0) return rows.map(function (r) { return r.instrumentId; });
+        var swap = rows[i - 1]; rows[i - 1] = rows[i]; rows[i] = swap;
+        return rows.map(function (r) { return r.instrumentId; });
+      });
+    },
+    'map:down': function (el) {
+      var cls = el.dataset.cls;
+      mappingAction(cls, function (rows) {
+        var i = rows.map(function (r) { return r.id; }).indexOf(el.dataset.id);
+        if (i < 0 || i >= rows.length - 1) return rows.map(function (r) { return r.instrumentId; });
+        var swap = rows[i + 1]; rows[i + 1] = rows[i]; rows[i] = swap;
+        return rows.map(function (r) { return r.instrumentId; });
+      });
     },
     'asset:acc': assetAccountSheet,
     'asset:saveAcc': function () {
@@ -4012,7 +5352,7 @@
       if (!incomes.length) { toast('未找到金额相同且晚于垫付日期的收入', 'warn'); return; }
       openSheet('选择报销款收入', incomes.map(function (inc) {
         return '<button class="set-item" style="width:100%" data-action="reim:doLink" data-inc="' + esc(inc.id) + '" data-exp="' + esc(exp.id) + '">' +
-          '<span class="si-icon">💰</span><span class="si-main"><div>' + esc(inc.merchant || '收入') + '</div>' +
+          '<span class="si-main"><div>' + esc(inc.merchant || '收入') + '</div>' +
           '<div class="si-sub">' + esc(inc.date) + '</div></span><span>¥' + Core.fmtMoney(inc.amount) + '</span></button>';
       }).join(''));
     },
@@ -4190,17 +5530,12 @@
     // 分类
     'cat:add': function (el) { categorySheet(null, el.dataset.type); },
     'cat:edit': function (el) { categorySheet(categoryById(el.dataset.id)); },
-    'cat:pickIcon': function (el) {
-      window._catIcon = el.dataset.icon;
-      $all('#cat-icons .cat-cell').forEach(function (b) { b.classList.remove('active'); });
-      el.classList.add('active');
-    },
     'cat:save': function (el) {
       var id = el.dataset.id, type = el.dataset.type;
       var name = $('#cat-name').value.trim();
       if (!name) { toast('请填写分类名', 'warn'); return; }
       var kws = $('#cat-kw').value.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
-      var icon = window._catIcon || '📦';
+      var icon = window._catIcon || '';
       var parentId = ($('#cat-parent') || {}).value || null;
       var necessity = type === 'expense' ? (($('#cat-nec') || {}).value || null) : null;
       if (id) {
@@ -4276,6 +5611,8 @@
   };
 
   var inputs = {
+    // 5D 金额输入只记在内存里：整页重绘（例如生成建议后）不丢用户刚打的数字
+    'advice:amount': function (el) { state.adviceAmount = el.value; },
     'list:q': function (el) {
       state.listFilters.q = el.value;
       var list = $('#view .txn-list');

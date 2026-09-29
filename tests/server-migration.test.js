@@ -6,18 +6,18 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { openDatabase, all, get, tableExists } = require('../server/db');
+const { openDatabase, all, get, run, tableExists, indexInfo } = require('../server/db');
 const M = require('../server/migrations');
 const { REQUIRED_TABLES } = require('../server/backup');
 const { setup } = require('./server-helpers');
 
-test('迁移 v1–v7：schema_migrations 记录版本并建齐必需表', () => {
+test('迁移 v1–v10：schema_migrations 记录版本并建齐必需表', () => {
   const ctx = setup('ledger-mig-');
   try {
     const version = M.currentVersion(ctx.db);
     assert.strictEqual(version, M.LATEST_VERSION);
     const rows = all(ctx.db, 'SELECT version, name FROM schema_migrations ORDER BY version');
-    assert.strictEqual(rows.length, 7);
+    assert.strictEqual(rows.length, 10);
     assert.strictEqual(rows[0].version, 1);
     assert.strictEqual(rows[0].name, 'phase2-initial-schema');
     assert.strictEqual(rows[1].version, 2);
@@ -32,6 +32,12 @@ test('迁移 v1–v7：schema_migrations 记录版本并建齐必需表', () => 
     assert.strictEqual(rows[5].name, 'phase4c-opening-dedupe');
     assert.strictEqual(rows[6].version, 7);
     assert.strictEqual(rows[6].name, 'phase4d-quote-source-symbol');
+    assert.strictEqual(rows[7].version, 8);
+    assert.strictEqual(rows[7].name, 'phase5b-risk-assessments');
+    assert.strictEqual(rows[8].version, 9);
+    assert.strictEqual(rows[8].name, 'phase5c-allocation-targets');
+    assert.strictEqual(rows[9].version, 10);
+    assert.strictEqual(rows[9].name, 'phase5d-recommendations');
     assert.strictEqual(tableExists(ctx.db, 'asset_transfers'), true, 'v3 应建立换汇事实表');
     assert.ok(
       get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'uq_instruments_dedupe'"),
@@ -52,6 +58,138 @@ test('迁移 v1–v7：schema_migrations 记录版本并建齐必需表', () => 
     // v7：报价行承载 provider 原始代码列（D-044）；元素键由写入路径强制，不加数据库索引
     const quoteCols = all(ctx.db, 'PRAGMA table_info(quotes)').map((c) => c.name);
     assert.ok(quoteCols.includes('source_symbol'), 'v7 应给 quotes 加 source_symbol 列');
+    // v8：风险评估追加版本表（D-047）——表、冻结语义列与稳定排序索引齐备
+    assert.strictEqual(tableExists(ctx.db, 'risk_assessments'), true, 'v8 应建立 risk_assessments 表');
+    const riskCols = all(ctx.db, 'PRAGMA table_info(risk_assessments)').map((c) => c.name);
+    ['rule_version', 'answers_json', 'capacity_score', 'willingness_score', 'risk_ceiling',
+      'ceiling_source', 'hard_caps_json', 'explain_codes_json', 'assessed_at', 'expiry',
+      'reason', 'created_at'].forEach((c) => {
+      assert.ok(riskCols.includes(c), 'v8 risk_assessments 应有列 ' + c);
+    });
+    assert.ok(
+      get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_risk_assessments_assessed'"),
+      'v8 应建立评估当前选取索引'
+    );
+    // v9（D-048）：目标版本表 + 认可标的映射表，承载追溯列与三条唯一不变量
+    assert.strictEqual(tableExists(ctx.db, 'allocation_targets'), true, 'v9 应建立 allocation_targets 表');
+    assert.strictEqual(tableExists(ctx.db, 'approved_instruments'), true, 'v9 应建立 approved_instruments 表');
+    const targetCols = all(ctx.db, 'PRAGMA table_info(allocation_targets)').map((c) => c.name);
+    ['template_version', 'rule_version', 'level', 'classes_json', 'assessment_id',
+      'assessed_at', 'assessment_expiry', 'effective_from', 'created_at'].forEach((c) => {
+      assert.ok(targetCols.includes(c), 'v9 allocation_targets 应有列 ' + c);
+    });
+    const mapCols = all(ctx.db, 'PRAGMA table_info(approved_instruments)').map((c) => c.name);
+    ['asset_class', 'instrument_id', 'position', 'created_at', 'updated_at'].forEach((c) => {
+      assert.ok(mapCols.includes(c), 'v9 approved_instruments 应有列 ' + c);
+    });
+    ['uq_allocation_targets_natural', 'idx_allocation_targets_effective',
+      'uq_approved_instruments_instrument', 'uq_approved_instruments_slot'].forEach((n) => {
+      assert.ok(
+        get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", [n]),
+        'v9 应建立索引 ' + n
+      );
+    });
+    // v10（D-049）：建议产物表 —— 承载「引用了哪份快照 / 评估 / 目标、请求与可分配金额、
+    // 门禁明细、结果本体与哈希」的列与两条索引齐备
+    assert.strictEqual(tableExists(ctx.db, 'recommendations'), true, 'v10 应建立 recommendations 表');
+    const recCols = all(ctx.db, 'PRAGMA table_info(recommendations)').map((c) => c.name);
+    ['status', 'rule_version', 'target_version', 'assessment_id', 'target_id', 'close_id', 'snapshot_id',
+      'snapshot_hash', 'data_cutoff', 'as_of', 'requested_new_funds_minor', 'available_new_funds_minor',
+      'allocatable_new_funds_minor', 'allocated_total_minor', 'input_hash', 'gate_json', 'todos_json',
+      'result_json', 'payload_hash', 'created_at'].forEach((c) => {
+      assert.ok(recCols.includes(c), 'v10 recommendations 应有列 ' + c);
+    });
+    ['uq_recommendations_input', 'idx_recommendations_created'].forEach((n) => {
+      assert.ok(
+        get(ctx.db, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", [n]),
+        'v10 应建立索引 ' + n
+      );
+    });
+    assert.strictEqual(indexInfo(ctx.db, 'recommendations', 'uq_recommendations_input').unique, true,
+      'input_hash 索引必须是唯一索引（D-040：不变量由索引承载）');
+    // CHECK 只挡结构：越界等级与非类别词表值在建表层就被挡下
+    run(
+      ctx.db,
+      `INSERT INTO risk_assessments (id, rule_version, answers_json, capacity_score, willingness_score,
+         capacity_level, willingness_level, risk_ceiling, ceiling_source, hard_caps_json,
+         explain_codes_json, assessed_at, expiry, reason, created_at)
+       VALUES ('ra-chk','risk-rules-v1','[]',15,12,5,5,5,'equal','[]','[]','2026-09-20','2027-09-20','initial','2026-09-20T10:00:00.000Z')`
+    );
+    assert.throws(
+      () => run(ctx.db,
+        `INSERT INTO allocation_targets (id, template_version, rule_version, level, classes_json,
+           assessment_id, assessed_at, assessment_expiry, effective_from, created_at)
+         VALUES ('at-x','risk-targets-v1','risk-rules-v1',9,'{}','ra-chk','2026-09-20','2027-09-20','2026-09-21','2026-09-21T10:00:00.000Z')`),
+      /CHECK constraint failed/,
+      'level 必须被 CHECK 挡在 1–5'
+    );
+    assert.throws(
+      () => run(ctx.db,
+        `INSERT INTO approved_instruments (id, asset_class, instrument_id, position, created_at, updated_at)
+         VALUES ('aim-x','crypto','inst-chk',0,'2026-09-21T10:00:00.000Z','2026-09-21T10:00:00.000Z')`),
+      /CHECK constraint failed|FOREIGN KEY constraint failed/,
+      '类别词表与标的引用都由数据库兜底'
+    );
+    // §10.6：目标引用的评估不可被级联删除；用户映射引用的标的同理
+    assert.throws(
+      () => run(ctx.db, `INSERT INTO allocation_targets (id, template_version, rule_version, level,
+         classes_json, assessment_id, assessed_at, assessment_expiry, effective_from, created_at)
+         VALUES ('at-y','risk-targets-v1','risk-rules-v1',5,'{}','ra-missing','2026-09-20','2027-09-20','2026-09-21','2026-09-21T10:00:00.000Z')`),
+      /FOREIGN KEY constraint failed/,
+      '目标不得引用不存在的评估'
+    );
+    // 反向：真有一条目标引用 ra-chk 时，评估也删不掉（ON DELETE RESTRICT，§10.6）
+    run(ctx.db,
+      `INSERT INTO allocation_targets (id, template_version, rule_version, level, classes_json,
+         assessment_id, assessed_at, assessment_expiry, effective_from, created_at)
+       VALUES ('at-ref','risk-targets-v1','risk-rules-v1',5,'{}','ra-chk','2026-09-20','2027-09-20','2026-09-21','2026-09-21T10:00:00.000Z')`);
+    assert.throws(
+      () => run(ctx.db, 'DELETE FROM risk_assessments WHERE id = ?', ['ra-chk']),
+      /FOREIGN KEY constraint failed/,
+      'ON DELETE RESTRICT：有目标引用时评估删不掉'
+    );
+
+    // v10 的数据库兜底：状态词表、金额非负、JSON 列结构（语义复核仍留在领域 / 仓储唯一实现）
+    const REC_INSERT_COLUMNS = ['id', 'status', 'rule_version', 'target_version', 'assessment_id', 'target_id',
+      'close_id', 'snapshot_id', 'snapshot_hash', 'data_cutoff', 'as_of', 'requested_new_funds_minor',
+      'available_new_funds_minor', 'allocatable_new_funds_minor', 'allocated_total_minor', 'input_hash',
+      'gate_json', 'todos_json', 'result_json', 'payload_hash', 'created_at'];
+    function recRow(over) {
+      const base = {
+        id: 'rec-x', status: 'estimate', rule_version: 'risk-rules-v1', target_version: 'risk-targets-v1',
+        assessment_id: 'ra-chk', target_id: 'at-ref', close_id: 'close-chk', snapshot_id: 'snap-chk',
+        snapshot_hash: 'f'.repeat(64), data_cutoff: '2026-09-30', as_of: '2026-09-30',
+        requested_new_funds_minor: 1, available_new_funds_minor: 1, allocatable_new_funds_minor: 1,
+        allocated_total_minor: 1, input_hash: 'a'.repeat(64), gate_json: '{}', todos_json: '[]',
+        result_json: '{}', payload_hash: 'b'.repeat(64), created_at: '2026-09-30T10:00:00.000Z'
+      };
+      return Object.assign(base, over || {});
+    }
+    function insertRec(over) {
+      const r = recRow(over);
+      run(ctx.db, 'INSERT INTO recommendations (' + REC_INSERT_COLUMNS.join(',') + ') VALUES (' +
+        REC_INSERT_COLUMNS.map(() => '?').join(',') + ')', REC_INSERT_COLUMNS.map((c) => r[c]));
+    }
+    assert.throws(() => insertRec({ id: 'rec-chk', status: 'accepted' }),
+      /CHECK constraint failed/, 'status 必须被 CHECK 挡在 formal / estimate');
+    assert.throws(() => insertRec({ id: 'rec-neg', requested_new_funds_minor: -1 }),
+      /CHECK constraint failed/, '金额列必须被 CHECK 挡在非负');
+    assert.throws(() => insertRec({ id: 'rec-json', todos_json: 'not json' }),
+      /CHECK constraint failed|must be JSON/, 'todos_json 必须是合法 JSON 数组');
+    // §10.6：正式建议引用的评估与目标版本删不掉，也不得指向不存在的评估
+    insertRec({ id: 'rec-ref', input_hash: 'c'.repeat(64) });
+    assert.throws(() => run(ctx.db, 'DELETE FROM allocation_targets WHERE id = ?', ['at-ref']),
+      /FOREIGN KEY constraint failed/, '有建议引用的目标版本删不掉');
+    assert.throws(() => run(ctx.db, 'DELETE FROM risk_assessments WHERE id = ?', ['ra-chk']),
+      /FOREIGN KEY constraint failed/, '有建议引用的评估删不掉');
+    assert.throws(() => insertRec({ id: 'rec-bad', assessment_id: 'ra-none', input_hash: 'd'.repeat(64) }),
+      /FOREIGN KEY constraint failed/, '建议不得引用不存在的评估');
+    // 反向：close_id / snapshot_id 是**封存审计引用**而不是活动外键 —— 全量写入路径
+    // （PUT /state / 旧备份恢复）会整体重建 monthly_closes 与 close_snapshots，
+    // 给它们加 RESTRICT 会让「保留建议、重建账务事实」直接失败（D-049 记录该取舍）。
+    insertRec({ id: 'rec-audit', close_id: 'close-gone', snapshot_id: 'snap-gone', input_hash: 'e'.repeat(64) });
+    assert.ok(get(ctx.db, 'SELECT id FROM recommendations WHERE id = ?', ['rec-audit']),
+      '引用已不存在的快照仍必须读得出当时的封存结论');
 
     const missing = REQUIRED_TABLES.filter((t) => !tableExists(ctx.db, t));
     assert.deepStrictEqual(missing, [], '缺少表：' + missing.join(', '));
@@ -69,9 +207,14 @@ test('已发布 v2 库前向迁移到最新版本：保留账户与余额并新�
     db.exec("INSERT INTO account_units (id,account_id,currency,balance_minor,as_of) VALUES ('u1','a1','HKD',123456,'2026-09-15')");
 
     const migrated = M.migrate(db);
-    assert.deepStrictEqual(migrated.applied, [3, 4, 5, 6, 7]);
+    assert.deepStrictEqual(migrated.applied, [3, 4, 5, 6, 7, 8, 9, 10]);
     assert.strictEqual(tableExists(db, 'asset_transfers'), true);
     assert.strictEqual(get(db, 'SELECT balance_minor FROM account_units WHERE id = ?', ['u1']).balance_minor, 123456);
+    // D-047 §5.3 / D-048：旧库前向迁移后三张表必须为空 —— 不伪造默认评估、目标或认可标的
+    assert.strictEqual(all(db, 'SELECT id FROM risk_assessments').length, 0, '前向迁移不得生成默认评估');
+    assert.strictEqual(all(db, 'SELECT id FROM allocation_targets').length, 0, '前向迁移不得生成默认目标版本');
+    assert.strictEqual(all(db, 'SELECT id FROM approved_instruments').length, 0, '前向迁移不得替用户认可任何标的');
+    assert.strictEqual(all(db, 'SELECT id FROM recommendations').length, 0, '前向迁移不得伪造任何一条历史建议');
   } finally {
     db.close();
   }

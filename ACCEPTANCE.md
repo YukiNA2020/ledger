@@ -3,6 +3,108 @@
 > 版本：v3 MVP 冻结稿  
 > 用途：定义“做完”的可观察证据。执行 Agent 必须使用虚构数据完成自动化与人工验收，不得把真实财务数据写入仓库、日志或外部服务。
 
+## 当前验收截面（2026-09-28 补口进展）
+
+2026-09-28 Phase 6 前桌面改版：`2.4.22-desktop-blue` / schema v10（零迁移）。桌面 1440px 与窄屏 390px 实际浏览器检查通过；桌面 10 个、窄屏 5 个导航页面均能渲染且无横向溢出或页面异常；全量 `node --test` **648/648**，完整浏览器 wiring **34/34**，G5-R1～R3 的反例复验保持通过，断网知识卡可点击。样式、导航位置与决策台布局变化不改变任何计算、门禁或写入。截图与日志见 `docs/evidence/desktop-redesign-20260928/`；浏览器附加审计见 `docs/evidence/phase5-review-20260927/browser-18812.json`。G5-R4 状态不变。
+
+2026-09-28 Phase 5 验收补口：**G5-R1～R3 已修复并通过原反例复验；G5-R4 实际计时仍未完成 → Phase 5 仍不判定为完整验收通过，Phase 6 未开始。** 版本 `2.4.21-phase5g5` / schema v10（零迁移）。
+
+| 缺口 | 判定 | 证据 |
+|---|---|---|
+| G5-R1 不可变引用一致性 | ✅ 通过 | `validateRecommendationReferences` 交叉比对 `assessmentId` / `targetId` 与 `gate.capture` 同 id 记录，冲突 400 + 事务回滚；+5 用例；`reference-review.cjs` **5/5、exit 0** |
+| G5-R2 变更后旧建议显示 | ✅ 通过 | `Domain.adviceStaleness` 身份比对 → 页面 `data-advice-status="stale"`，不再显示「全部门禁通过」；`factsEpoch` 守卫慢请求；+12 用例；`mappingRevocationProbe` / `staleQuoteProbe` 转绿 |
+| G5-R3 服务不可达知识入口 | ✅ 通过 | 风险摘要 / 配置对照 / 启动失败三处真实 `know:open` 入口；断网重载 `knowledgeEntryCount=2` 且真实点击打开正文 |
+| G5-R4 四问理解实际计时 | ⏸ **未通过** | 无受测者、起止时间、耗时与正确率记录；2026-09-28 尝试时受测者正式账本为空，按用户决定延后 |
+
+回归实测（2026-09-28）：全量 `node --test` **648/648**、受影响定向 **87/87**、记账/导入回归 **79/79**、两套干净浏览器 18785×2 + 18786 **34/34 且三项审计探针全绿**（外部请求 0）、`node --check` + `git diff --check` 通过。修复方式与复验明细见 [PHASE5_REVIEW.md](./PHASE5_REVIEW.md) §8。
+
+### 此前截面：2026-09-27 独立复核（保留历史证据，R4 结论仍未被推翻）
+
+2026-09-27 全阶段独立复核：**Phase 5 暂不通过完整验收，当前任务为 Phase 5 验收补口（G5-R1～R4），Phase 6 未开始。** 版本仍 `2.4.20-phase5e6` / schema v10，产品代码未改。全量 631/631、定向 142/142、记账/导入 79/79、原 wiring 34/34 × 2 均通过，但独立补测复现两项 P1（恢复引用不一致、当前事实变化后仍显示旧正式建议）及离线入口缺口；一分钟理解缺少实际计时。以 [Phase 5 全阶段独立验证](./PHASE5_REVIEW.md) 为当前结论。
+
+### 此前集成验收截面（保留历史证据，不作为当前完成状态）
+
+**5E-6 整体验收通过，5E-1～5E-6 全部闭合，Phase 5（风险问卷与配置建议）整体验收通过。** 版本 2.4.20-phase5e6 / schema v10。全量 631/631（无增删用例），定向 5C/5D/5E 28/28，记账/导入回归 79/79，浏览器 wiring 34/34 × 2（全新隔离临时数据库 / origin：18673、18674，2026-09-27；此前 5E-5 为 631/631 + 31/31 × 2（18661、18662），5E-4 为 627/627 + 30/30 × 2（18643、18644、18651），原 18641、18642、18631、18632 等为历史证据）。5E-1～5E-6 的逐项结论见下文「Phase 5E-1」～「Phase 5E-6」各表与 [PHASE5E_BREAKDOWN.md](./PHASE5E_BREAKDOWN.md)；R-01～R-06、失败反例与兼容边界见 [PHASE5D_ACCEPTANCE_GAPS.md](./PHASE5D_ACCEPTANCE_GAPS.md)。下方旧日期的验收数字/范围是相应阶段历史截面；当前 recommendations API 已实现，不能把 5C 当时的 501 当成当前行为。
+
+本轮锁定：十态端到端全部闭合——空资产、首次评估、待复评、无目标、无正式月结、行情过期、分类未确认、无认可标的、0 元、正常建议（既有检查 + 新增状态矩阵检查，见下节）。S5.1～S5.3 整体验收通过：领域评分 == API 记录 == 页面风险摘要（capacity 5→L2 < willingness 12→L5，上限 2，取较低一侧）；从原始状态独立重算的 `categoryAllocations` / `explainCodes` / `roundingNote` / `deviations` 与库中建议逐字节相等且页面 == 重算，7 项 gate 与领域检查集合相等且全过；追溯四组字段 == 记录；`GET /overview` == `Domain.computeOverview` 整对象，首页四问（净资产 / 可投资 / 主要风险暴露 / 新增资金方向）与 API 同源，一分钟理解演练观察值记录于 `docs/evidence/phase5e6-wiring.txt`（不宣告 Phase 7 真实使用指标通过）。5E-1 起的 4D/4E/5C 旧用例偶发观察项在本项 7 轮 wiring 未复现，断言未改，按观察关闭。4A 数据源、S2.3 实机启动及 Phase 7 计时不因此视为通过；Phase 6 状态机未开始。
+
+### Phase 5E-6 整体验收（2026-09-27，`2.4.20-phase5e6`）
+
+| 场景 / 门禁 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 无正式月结 | wiring 新增检查 1 步骤 1 | ✅ | 客户端 `runAdvice` 拒绝，文案「本机还没有可引用的正式月结，请先完成月度结账」，不出现建议结果卡，建议行总数 0 |
+| 0 元 | 同上步骤 2 | ✅ | 当月正式月结后 0 元生成 `formal` 建议；`data-advice-requested/allocatable/allocated` 全为 0，六类 `data-allocated` 合计 0；API 侧 `allocatedTotal + roundingNote.unallocatedMinor = allocatable` 守恒、`result.status=formal` |
+| 分类未确认 | 同上步骤 3 | ✅ | 只翻转未映射但有持仓的 `theme_equity` → `suggested`（映射引用的 voo/vgt 保持 confirmed，整份状态 PUT 不被 422 拒绝）；建议为 `estimate`，展示 `classification_unconfirmed` blocker、「估算建议（未达正式门槛）」、「formalRecommendation 为空」，不出现「正式建议」标题 |
+| 行情过期 | 同上步骤 4–5 | ✅ | 每标的单条报价 + 单条汇率，价格日 = today-7（> `MAX_STALE_DAYS=5`）；估算建议带 `quote_stale` + `fx_stale`、无 `classification_unconfirmed`；决策台 `.dash-blockers` 点名「行情已过期 / 汇率已过期」，净资产卡仍在，新增资金卡标估算、不出现「正式口径」 |
+| 行总账与读取复核 | 同上步骤 6 | ✅ | 3 行产物（1 正式 + 2 估算）、`total=3`、`invalidCount=0`，两条估算行各带稳定 blocker 码 |
+| S5.1 上限取较低一侧 | wiring 新增检查 2 | ✅ | 领域 `scoreRiskAnswers` == `GET /risk-assessments/current` 逐字段（能力 5→L2 < 意愿 12→L5、上限 2、来源 capacity、硬封顶 0、ruleVersion）；页面 `[data-risk-summary]` 数值与领域一致，「取较低的一侧」「高意愿不能覆盖低能力」与知识卡入口 `card-capacity-vs-willingness` 齐备 |
+| S5.2 分配与解释码三层相等 | 同上（独立重算 + 页面 DOM） | ✅ | 重算产物与库中建议逐字节相等；页面类别行 `data-allocated` == 重算；7 项 gate == `Domain.RECOMMENDATION_GATE_CHECKS` 且全部 passed；宽基偏离 -985bps 页面 == API == 领域且 < 0；正式建议把请求的 2,000 元全部补进低配宽基 |
+| S5.3 可追溯 | 同上 | ✅ | 追溯四组字段（基准 / 输入 / 版本记录 / 解释版本）与记录逐项一致；决策台配置对照卡六类逐字段 == `GET /targets/current`，`canAdvise=1` |
+| 十态其余六态 | 既有检查（147/188、1271、2083、2287、1619）+ 本轮全量执行 | ✅ | 空资产、首次评估、待复评四态、无目标、无认可标的、正常建议在本轮 34 项内全部实际通过 |
+| 一分钟理解演练 | wiring 新增检查 3（`DRILL:` 日志，两轮一致） | ✅ | ①净资产 1,470,000.00；②可投资 970,000.00；③主要风险暴露 现金 500,000.00（占可投资 51.5%）；④宽基 -985bps 低于目标区间 → 本月可新增 500,000.00 中请求的 2,000 元已全部补宽基；`GET /overview` 与领域重算整对象逐字节相等；只记录观察值，不宣告 Phase 7 通过 |
+| 浏览器 wiring 全量 | `tests/app-wiring.html`（`?v=5e6`，隔离临时服务） | ✅ **34/34 × 2** | 18673、18674 两个全新临时库与 origin，干净 Chromium profile 连续两轮全绿；见 `docs/evidence/phase5e6-wiring.txt` |
+| 稳定性观察项关闭 | 4D 自动更新汇率开关 / 4E 收益归因 / 5C 认可标的候选下拉 | ✅ | 本项期间 7 轮 wiring（18663～18674）全部通过、未复现；只观察记录，未改断言换取绿色 |
+| 产品修复（判定日时钟） | `server/api.js` `GET /overview` | ✅ | 与其余端点统一走可注入 `ctx.today`，生产行为不变；回归网 `tests/server-phase5c.test.js:334`；见 D-053 |
+| 全量与回归 | `node --test` | ✅ **631/631** | 定向 5C/5D/5E 28/28；记账/导入回归 79/79；`node --check` 与 `git diff --check` 通过 |
+| 范围边界 | 本轮 diff | ✅ | 不改分配算法、建议写入算法、5A 冻结规则、目标 API、映射，schema 仍 v10 零迁移；`APP_VERSION` 与 SW 缓存键 `2.4.20-phase5e6` |
+
+**Phase 5 判定：整体验收通过。** 5E-6 是 Phase 5 唯一有权做此判断的一步，本节即该判断的证据。MVP 是否整体通过仍取决于未完成的 4A 数据源门禁、S2.3 实机验证与 Phase 7 两个月真实验证；Phase 6 的接受/暂缓/执行/复盘状态机未开始。
+
+### Phase 5E-5 审计追溯（局部验收，2026-09-26，`2.4.19-phase5e5`）
+
+| 场景 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 月结基准与计算输入分开陈述 | wiring C7.11 `data-advice-trace-baseline` / `data-advice-trace-input` | ✅ | 基准组显示月结 id、快照 id、`snapshotPayloadHash`、数据截止并写明「月结快照是基准，不等同于计算输入」；输入组显示判定日、完整 `inputHash`、算法 `cash-reallocation-v1`；两组字段逐项等于库中记录，不用月结哈希冒充计算输入 |
+| 版本与记录可核对 | 同上 `data-advice-trace-versions` | ✅ | 建议 id、`payloadHash`、`ruleVersion`、目标版本、评估 / 目标 id 与 `GET /recommendations` 读取视图逐项一致 |
+| 新建议封存解释版本 | wiring C7.11 + `tests/server-phase5e5.test.js` | ✅ | POST 打章于 gate 区；页面标「本条建议生成时封存」，封存 / 当前版本均等于 `Knowledge.EXPLANATION_VERSION`，不出现未封存标注 |
+| 封存不进计算身份 | server-phase5e5 打章用例 | ✅ | 打章前后 `inputHash` / `id` / `capture` 逐位不变，仍可按原 capture 重放；顶层 recordKeys 保持 5D 冻结 20 键 |
+| 旧建议未封存显式标注 | wiring 新增第 31 项检查 | ✅ | 全量状态剥章写回后记录仍 `invalidCount=0`；页面标「当前卡片解释，非生成时封存版本」，封存版本留空、当前卡片版本照常显示 |
+| 重复生成绝不倒填 | 同上（`created=false` + 第三次生成） | ✅ | 同一输入幂等回到原行，响应与库中记录均无 `explanationVersion`，总条数恒为 1 |
+| gate 键契约与兼容 | server-phase5e5 合法性矩阵 | ✅ | `{checks}` / `{checks,capture}` / `{checks,capture,explanationVersion}` 全通过；多余键、非字符串 / 空白版本、缺 checks 拒绝；无 capture 旧记录仍计入 `invalidRecords` |
+| 浏览器 wiring 全量 | `tests/app-wiring.html`（`?v=5e5`，隔离临时服务） | ✅ **31/31 × 2** | 18661、18662 两个全新临时库与 origin，干净 Chromium profile 连续两轮全绿；见 `docs/evidence/phase5e5-wiring.txt` |
+| 范围边界 | 本轮 diff | ✅ | 零分配算法 / 建议写入算法 / 5A 规则 / 目标 API / 映射改动，schema 仍 v10、零迁移；`APP_VERSION` 与 SW 缓存键 `2.4.19-phase5e5` |
+| 全量回归 | `node --test` | ✅ **631/631** | 619 基线 + 8 知识卡 + 4 个 5E-5 用例 |
+
+5E-5 只完成 `PHASE5E_BREAKDOWN.md` 的第 5 项；整个 Phase 5 的端到端三层复核与退出门禁仍待 5E-6，不得据本节宣布 5E 或 MVP 已验收。
+
+### Phase 5E-4 本地知识卡（局部验收，2026-09-25，`2.4.18-phase5e4`）
+
+独立复测：全量 Node 627/627；全新隔离临时库浏览器 wiring 30/30（18651）。在生产首页（非 `/tests/` harness）确认 Service Worker 缓存包含 `js/knowledge.js` 与首页缓存壳，浏览器断网后重载仍可打开 `card-fx-risk`，显示解释版本 1 与“不构成投资建议”声明。离线实测步骤和结果见 `docs/evidence/phase5e4-offline.txt`。
+
+| 场景 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 必过六张卡存在 | `tests/knowledge.test.js` | ✅ | 能力与意愿、应急金上限、容忍带、新增资金优先、汇率风险、为何不默认卖出；id 与键一致，标题与正文段落完整 |
+| 稳定 id 与版本 | 同上（`cardIds` 深比对 + `EXPLANATION_VERSION`） | ✅ | 15 张卡 id 只增不改名；版本为非空字符串，与 `APP_VERSION` 独立 |
+| 每个引用 id 可解 | 同上 | ✅ | 题卡 / 硬封顶 `explainKey` 与 code、`RECOMMENDATION_EXPLAIN_CODES` 全量 `resolve` 非 null |
+| 未知 id 显式降级 | 同上 + wiring 新增检查 | ✅ | `getCard` 返回 null（含 `constructor`/`__proto__`）；打开未知 id 显示缺卡提示，不渲染任何卡片正文 |
+| 离线可读、无云端 AI | 同上（词面）+ wiring | ✅ | 卡片正文无 http 链接、无网络请求、无云端 AI 字样 |
+| 无收益承诺、无具体股票建议 | 同上（词面） | ✅ | 无保本/稳赚/保证收益、无「建议/推荐买入」类动作、无证券代码 |
+| 页面只链接已知卡 | wiring `assertKnowLinksResolve`（C9.4/C9.5/C7.11/归因） | ✅ | 四处真实挂载点入口全部指向已知卡；未知 id 不渲染入口 |
+| 卡片页脚边界声明 | wiring 打开卡片断言 | ✅ | 显示「解释版本 N」与「不构成投资建议」，并断言无收益承诺词 |
+| 浏览器 wiring 全量 | `tests/app-wiring.html`（`?v=5e4`） | ✅ **30/30 × 2** | 18643、18644 两个全新临时库与 origin，干净 Chromium profile 连续两轮全绿 |
+| 范围边界 | 本轮 diff | ✅ | 零 Domain / API / Store / 算法 / 规则 / 映射 / 5E-5 字段改动，schema 仍 v10 |
+| 全量回归 | `node --test` | ✅ **627/627** | 619 基线 + 8 个新增用例 |
+
+### Phase 5E-3 建议解释（局部验收，2026-09-24）
+
+独立复核（`2.4.17-phase5e3`）：高配类别的服务端分配 0 元现可见为 0.00，避免旧版「—」与缺失值混淆；浏览器逐类别核对可见金额、保证 fixture 确有高配类别，并严格检查估算态不含正式建议标题。全量 619/619，干净临时库 wiring 29/29 × 2（18641、18642）。
+
+| 场景 | 方法 | 结果 | 说明 |
+|---|---|---|---|
+| 类别排序依据 | wiring C7.11（`data-advice-order`） | ✅ | 低配时写「先补低于区间下限」；解释码与 `ADVICE_EXPLAIN_LABELS` 同源 |
+| 现金保底 / 未分配 | `data-advice-cash-floor` | ✅ | 「保留现金配置下限」；有未分配时显示金额并说明继续留作现金 |
+| 认可标的与未映射待办 | `data-advice-todos` / `data-todo` / `data-retained` | ✅ | 无映射时金额原样保留为类别级待办，明确「不转投陌生标的」，instrument-count=0 |
+| 尾差 | `data-advice-rounding` / `data-leftover` / `data-receivers` | ✅ | 展示冻结排序规则原文与承接类别，data 与 API 相同 |
+| 默认不卖出具体原因 | `data-advice-nosell` | ✅ | 有高配时点名类别并说明「只提示风险，不生成卖出指令」 |
+| 正式 / 估算标签与 blocker | `data-advice-status` / `data-blocker` | ✅ | formal 全过门禁；估算态展示 5D 产物 blocker（如 `snapshot_hash_mismatch`），不冒充正式 |
+| 守恒公式 | `Σ分配 + 未分配 = 可分配` 文案与 data 层 | ✅ | 与 API `roundingNote` 逐字段相同，页面不重算 |
+| 高配为 0 | `data-basis="above_max"` 行 `data-allocated` | ✅ | 与 API `categoryAllocations` 相同 |
+| 无映射不转投 | 反例：清空 `broad_equity` 映射后重算 | ✅ | `data-todo="missing_approved_instrument"`，保留金额，不指向未知标的 |
+| 门禁失败只展示估算 | 模拟 `Store.createRecommendation` 返回篡改产物 | ✅ | `data-advice-status="estimate"`，blocker 码出现，不出现 `formalRecommendation` 内容 |
+| 范围边界 | 本轮 diff 仅 `js/app.js`、`sw.js`、`tests/app-wiring.*` 与文档 | ✅ | 零 Domain / API / Store / 建议算法 / 建议写入改动，schema 仍 v10 |
+| 全量回归 | `node --test` | ✅ **619/619** | 与 5D/5E-1/5E-2 基线一致 |
+| 浏览器 wiring 全量 | `tests/app-wiring.html`（`?v=5e3`，隔离临时服务） | ✅ **29/29 × 2** | 18631、18632 两个全新临时库与 origin，干净 Chromium profile 连续两轮全绿 |
+
 ## 1. 实施前基线门禁
 
 开始任何 v3 编码前：
@@ -334,10 +436,84 @@ Phase 5 拆为 5A–5E（见 [`PHASE5_BREAKDOWN.md`](./PHASE5_BREAKDOWN.md)）�
 | S5.1 能力约束意愿 | 规则侧已锁定 | `tests/domain-phase5a.test.js` 5A-8（fixture 样例）：高意愿（意愿 12 → L5）+ 应急金不足 + 收入不稳定 → 上限取能力侧 L2，三个硬封顶逐条列出；5A-19 补口反例：规则常量被原地改写后评分与查表必须不变 | 5B（领域 + 真实 HTTP + 浏览器三层） |
 | S5.2 新增资金优先 | 契约与排序 / 尾差规则已冻结 | 5A-16 输出契约与稳定排序规则；5A-20 补口反例：未知 `targetVersion` 不得作为建议输入；fixture `samples.S5_2` 记录 CNY 2,000 样例与期望（优先补宽基权益、金额守恒、无卖出），`verifiesIn: 5D` | 5D |
 | S5.3 数据门槛 | 门槛条件已枚举，门禁实现在既有 blocker 之上 | fixture `samples.S5_3` 列出 `quote_stale` / `classification_unconfirmed` / `close_incomplete` / `baseline_hash_mismatch` / `assessment_expired` 五个触发条件与「正式建议为空」期望，`verifiesIn: 5D` | 5D |
-| 目标模板合法性（5A 内部） | 唯一冻结模板已锁定 | 5A-21/23/28 拒绝额外类别、错等级/版本、原型链与访问器；5A-31 进一步拒绝同版本下另一套虽自洽但未登记的比例；内置五级模板副本全部通过 | 5C |
+| 目标模板合法性（5A 内部） | 唯一冻结模板已锁定 | 5A-21/23/28 拒绝额外类别、错等级/版本、原型链与访问器；5A-31 进一步拒绝同版本下另一套虽自洽但未登记的比例；内置五级模板副本全部通过 | 5C ✅ 已复核（5C-1 逐字段比对冻结 fixture；5C-4 拒绝同版本偷换比例） |
 
 **5A 的规则与契约层验收已通过**；S5.1 的持久化/API/UI 闭环仍由 5B 承载，S5.2–S5.3 的建议算法与正式门禁仍由 5D 承载，不能把 5A 通过误写成整个 Phase 5 已完成。
 
+### Phase 5B｜风险评估与复评机制验收（2026-09-21，`2.4.7-phase5b`）
+
+**最终结论：Phase 5B 通过，可进入 5C。** 5B 把 5A 冻结规则落成追加式风险评估事实：schema v8 新增 `risk_assessments`；服务端只接受原始答案、评估日和复评原因，并重算双评分、等级、硬封顶、风险上限与到期日；历史不覆盖，当前评估按确定性顺序选出。
+
+| 验收点 | 结果 | 证据 |
+|---|---|---|
+| 领域确定性与 S5.1 | ✅ 通过 | `tests/domain-phase5b.test.js` **18/18**：相同答案与规则版本逐字段相同；高意愿不能突破低能力；硬封顶只降不升；边界、缺答、未知题目/选项、重复回答、未来日期、规则错配均 fail closed |
+| 服务端重算与隐私边界 | ✅ 通过 | `tests/server-phase5b.test.js`：客户端伪造分数/上限/到期等派生字段均 400，未知输入原文不进入错误消息；落库值逐字段等于服务端领域函数重算结果 |
+| 追加历史、幂等与当前评估 | ✅ 通过 | 同 key 同载荷回放不追加，同 key 不同载荷 409；复评产生新 id 且旧行保持原样；有效期到期日当天有效、次日过期，空态区分 `no_assessment/all_expired/invalid_records` |
+| 读取即复核 | ✅ 通过（第二轮补口） | 直接篡改数据库派生值后，历史列表不返回该记录为可用项，并报告 `invalidCount=1/total=1`；`/current` 返回 `invalid_records`。显式非法 `asOf`（不存在日历日或非日期文本）均 400，不静默回退到今天 |
+| 迁移、全量写入与备份恢复 | ✅ 通过 | 迁移 v8 只新增一张表，旧库前向迁移后为空；`PUT /state` 对伪造/重复记录整体回滚；v8 必需表、索引、列在备份恢复切换前校验；合法记录往返无损 |
+| 浏览器闭环 | ✅ 通过 | 两个全新临时数据目录、两个不同 loopback origin 连续两轮 **25/25**；问卷缺答拒绝、服务端重算落库、双评分/较低侧/硬封顶解释、复评追加与历史渲染全部通过 |
+| 范围边界 | ✅ 通过 | schema 停在 v8；没有目标配置表、建议金额算法、5E 知识卡或 Phase 6 状态机；自动测试零真实网络请求 |
+
+最终门禁：5B 定向 **27/27**（领域 18 + 服务端 9）；全量 `node --test` **546/546**；浏览器 wiring **25/25 × 2**；静态语法与 `git diff --check` 通过。复核缺口及闭合证据见 [`PHASE5B_ACCEPTANCE_GAPS.md`](./PHASE5B_ACCEPTANCE_GAPS.md)。
+
+
+### Phase 5C｜目标配置与认可标的映射（2026-09-21，`2.4.9-phase5c`）
+
+**结论：独立复核缺口 G5C-7～9 已修复，等待独立复验确认。** 5C 把 5B 的有效风险评估落成资产类别目标区间：`allocation_targets`（迁移 v9，追加式版本 + 自然键唯一）与 `approved_instruments`（类别 → 用户认可标的，只有用户判断可写）。等级与比例由服务端按 5A 冻结模板派生；当前比例与偏离复用 `computeOverview` 的**同一遍**估值；缺行情/汇率/分类沿用既有 blocker 与 `canAdvise`，不新写第二套判断。
+
+| 验收点 | 结果 | 证据 |
+|---|---|---|
+| 每个风险上限稳定映射到一个合法目标版本，目标比例精确守恒（§6.4） | ✅ 通过 | `tests/domain-phase5c.test.js` 5C-1：五级模板逐字段等于 `tests/fixtures/phase5-risk-rules.json` 的冻结副本，`ΣtargetBps = 10000`，`min ≤ target ≤ max`，个股 target 恒为 0，五级模板互不相同；5C-2 同一评估重复映射逐字段一致 |
+| 目标版本不回写历史（§6.2 工作项 5） | ✅ 通过 | 真实 HTTP：复评后 `POST /targets` 生成新 id 与新等级（L5 → L2），旧版本逐字段保持原样；自然键 `(assessment_id, template_version, effective_from)` 重复请求返回 200 `created:false` 同一版本；同自然键写入两条在 `PUT /state` 路径 409 `duplicate_target` |
+| 派生值只有一份来源，客户端不可信 | ✅ 通过 | `POST /targets` 请求体必须是 JSON 对象且载荷白名单只有 `effectiveFrom`；带 `level`/`classes` 或提交 `null`/数组/字符串/数字均 400 `invalid_target_payload` 且不落库；错误 message 不回显输入原文 |
+| 当前配置与 Phase 4 估值逐分一致；缺价格/汇率或分类未确认时沿用既有 blocker | ✅ 通过 | 5C-8 与真实 HTTP：六类 `valueMinor` 与 `GET /api/v1/overview` 的 `riskClasses` 逐项相等、投资池合计一致；`blockers` 集合与总览**逐字相同**、`canAdvise` 由 `computeOverview` 独占；类别合计与投资池不一致时 `invalid_valuation_input` 拒绝（证明没跑第二遍估值） |
+| 边界值、空组合、只有现金、某类别为 0%（§6.4） | ✅ 通过 | 5C-7 端点含入：`min-1 → below_min`、`min → within`、`max → within`、`max+1 → above_max`，任意金额组合 `ΣpctBps = 10000`（最大余数法 + 同余数按类别序）；5C-9 投资池为 0 → `no_investable`，比例与容忍带全为 null；只有现金 → cash 100% `above_max`、下界为 0 的类别仍算 `within`；定点放缩超出安全整数 fail closed |
+| 目标版本读取即复核 | ✅ 通过 | 5C-4/5C-5 反例：同版本偷换比例、错等级、未知模板/规则版本、`expiry ≠ assessedAt + 365`、生效日越界、类别缺失或多余、原型链注入、多余自有键全部 fail closed；与被引用评估交叉核对（上限/评估日/规则版本被改）同样拒绝。真实 HTTP 直接改库后 `GET /targets` 返回 `items=[] / invalidCount=1`，`/targets/current` 报 `invalid_records` |
+| 当前生效目标的可区分空态 | ✅ 通过 | `selectCurrentTarget` 五态与真实 HTTP：`no_assessment`（还没有效评估）/ `no_target`（有评估未生成、或引用对了但生效日未到）/ `stale_assessment`（引用已不是当前有效评估）/ `invalid_records` / `current`；排序与数据库行序无关（5C-6 乱序输入得到同一序列） |
+| 认可标的只引用已存在、分类已确认且类别一致的标的 | ✅ 通过 | 真实 HTTP 三条反例分别 422 `unknown_instrument` / `classification_unconfirmed` / `class_mismatch`；`PUT /state` 通道的伪造引用同样整体回滚且原数据不动；引用不存在的评估 422 `invalid_assessment_ref`（不再以 500 出现） |
+| 多候选、明确稳定排序、顺序是用户判断 | ✅ 通过 | 5C-11 与真实 HTTP：类别内按 `position` 升序、跨类别按 `RISK_CLASSES` 序；整类替换按提交顺序落 position，推进服务端时钟后重复提交同一清单仍保持 id、`created_at` 与 `updated_at` 逐字段不变；a,b → b,a 换位成功，保留创建时间并只对真实位置变化更新时间（G5C-2/G5C-8）；`UNIQUE(instrument_id)` 与 409 `instrument_already_mapped` 保证一个标的不属两个类别 |
+| provider 刷新不得修改用户映射 | ✅ 通过 | 真实 HTTP：`POST /market-data/refresh` 与 `POST /instruments`（provider 路径）前后 `GET /approved-instruments` 的 `rows` 逐字段相同；结构上 provider 与确认路径都不写 `approved_instruments`；分类被外部改回 suggested 时映射行保留并显示 `classification_unconfirmed`（不静默丢行），该类别同时被报为缺映射 |
+| 缺映射不阻止显示偏离，只阻止落到证券（§6.3） | ✅ 通过 | 5C-12：目标比例 > 0 且无可用候选的类别才报缺映射（个股 target 为 0 不算缺）；偏离表在零映射时照常输出；页面在缺映射类别上标注「缺映射」 |
+| 迁移、全量写入、备份恢复 | ✅ 通过 | v9 只新增两张表（列 / CHECK / 三条唯一索引 + 读取序索引由测试逐条断言；`ON DELETE RESTRICT` 双向验证：目标不能引用不存在的评估、有目标引用的评估删不掉）；旧库 v8 → v9 前向迁移后两表为空；`PUT /state` 三集合逐条复核、非法整体回滚、缺键清空；备份按版本校验 v9 必需表/列/索引（DROP 唯一索引的库在切换前被挡下），恢复往返目标与映射逐字段无损 |
+| 页面不持有第二套口径 | ✅ 通过 | wiring 第 26 项：页面显示等级/模板/区间/六类金额与比例，且与 `GET /api/v1/overview`、`GET /api/v1/targets/current` 逐项一致；候选下拉只列已确认且类别一致的标的；进入本页同步事实源（G5C-5）；错误提示不回显输入原文 |
+| 全量保存不得抹掉或并发覆盖追加式事实 | ✅ 通过（独立复核补口） | G5C-1/G5C-7：`Store.saveAll` 对 `/state` 只发单次 PUT，不再 GET 后回传旧快照；仓储在同一 SQLite 事务内保留未显式集合。真实 HTTP 模拟旧页面快照之后并发追加复评/目标与换位映射，页面保存后仍逐字段保持；显式空集合仍是清空指令，未带保留标志的旧备份路径继续缺键清空 |
+| 范围边界 | ✅ 通过 | 5C-13/5C-15 与真实 HTTP：输出不含 `newFundsMinor` / `categoryAllocations` / 买卖金额 / 建议或决策状态键；`POST /recommendations` 仍是 501；未新增数据源、未开启自动行情；schema 停在 v9；自动测试零真实网络请求 |
+
+当前修复门禁：5C 定向 **27/27**（领域 15 + 服务端 12）；受影响回归 **85/85**；全量 `node --test` **576/576**；浏览器 wiring **26/26 × 2**（两个全新临时数据库、两个不同 loopback origin）；`node --check` 与 `git diff --check` 通过。缺口与闭合证据见 [`PHASE5C_ACCEPTANCE_GAPS.md`](./PHASE5C_ACCEPTANCE_GAPS.md)，口径见 `DECISIONS.md` D-048。**独立复验确认前不写「已通过验收」，不进入 5D 的实现提交。**
+
+### Phase 5E-1｜决策台风险摘要（2026-09-23，`2.4.12-phase5e1`）
+
+2026-09-24 复核：发现返回首页时缓存的「有效」状态会在请求完成前短暂冒充当前判定。`2.4.13-phase5e1` 已在请求开始时显示「核对中」，读取失败显示「未复核」，并只替换风险摘要卡；新增浏览器断言覆盖首屏待决状态和归因区 DOM 保持。修正后全量 619/619，干净临时库 wiring 28/28。下表原 `2.4.12` 结果保留为历史验收截面。
+
+| 检查项 | 方法 | 结论 | 备注 |
+|---|---|---|---|
+| 首页能说清「能力、意愿与最终上限」 | `tests/app-wiring.js` 新增用例「决策台风险摘要」（浏览器 wiring，两套全新临时库 / origin 18591、18592） | ✅ **28/28 × 2** | 摘要逐字段（`data-risk-*`）与服务端 `GET /risk-assessments/current` 完全一致，并与风险页文本同源 |
+| 四态可区分 | 同上：清空账本 → 无评估；追加过期评估 → 已过期；追加剩余 15 天评估 → 即将到期；追加当日评估 → 有效 | ✅ 通过 | `no_assessment / current+valid / current+expiring_soon / all_expired` 各为独立文案与角标；`invalid_records` 与读取失败另列降级态 |
+| 过期不得显示为「当前有效」 | 同上：过期态断言摘要不含「当前有效」、不含上限/得分属性，并给出 `annual_expired` 复评入口 | ✅ 通过 | 判定与到期日均来自服务端，页面不重算 |
+| 缺数据不冒充 | 无评估与 `unavailable` / 读取失败三态断言不出现 `L0`、`0 分`，且读取失败保留上次判定并显式标注可能过期 | ✅ 通过 | 失败态另有「重新读取评估判定」入口；入口卡在任何状态下都不收回 |
+| 范围边界 | 本轮 diff 仅 `js/app.js`、`sw.js`、`tests/app-wiring.*` 与文档 | ✅ 通过 | 零 Domain / API / Store / 问卷 / 目标 / 建议算法改动，schema 仍 v10；全量 `node --test` 619/619 与 5D 基线一致 |
+| 首页渲染不打断既有交互 | 摘要复核解析后仅在判定内容变化时重渲染决策台 | ✅ 通过 | 修复前观察：无条件重渲染会干扰归因基准选择，导致 4E 用例偶发失败 |
+
+稳定性观察（不属于 5E-1 失败，列为 5E-6 门禁项）：wiring 全量另有两个轮次各出现 1 项与本项无关的旧用例单次偶发失败（4D「启动时自动更新汇率开关」、4E「收益归因」）；在**停用 5E-1 首页复核的对照副本**上同样复现过 5C「目标配置 · 认可标的候选下拉」，属既有时序敏感用例，本项不修改其断言换取绿色。
+
+5E-1 只完成 `PHASE5E_BREAKDOWN.md` 的第 1 项；S5.1 的完整解释链（配置对照、建议解释、知识卡、审计追溯）与整个 Phase 5 的端到端验收仍待 5E-2～5E-6，不得据本节宣布 5E 或 MVP 已验收。
+
+### Phase 5E-2｜决策台配置对照（2026-09-24，`2.4.14-phase5e2`）
+
+独立补测（`2.4.15-phase5e2`）：补全新评估后的 `stale_assessment` 与合法清空后的 `no_assessment` 真实 API 路径；`invalid_records` 的浏览器显示用模拟服务端响应验证，损坏记录的服务端判定由 `tests/server-phase5c.test.js` 验证。无估值时六类当前比例均为空并写「比例不可用」，目标区间中的合法 0% 保留。全量 619/619、两套干净库 wiring 29/29 × 2；下表 `2.4.14` 是原验收截面，尤其“篡改目标”的浏览器说法以本段为准。
+
+| 检查项 | 方法 | 结论 | 备注 |
+|---|---|---|---|
+| 首页能说清六类「现在多少、目标在哪、偏了多少、数据哪天」 | `tests/app-wiring.js` C9.5（浏览器 wiring，18605、18606 两套全新临时库与 origin） | ✅ **29/29 × 2** | 对照卡逐字段与 `GET /api/v1/targets/current` 同源；复用 `Store.allocationCurrent()`，页面不重算比例、偏离或 `canAdvise` |
+| 缺目标、缺评估、无估值、记录不可复核各自成立 | 同上：清空账本 → 无目标态；生成目标前 → 尚未评估/待更新态；移除全部可投资持仓 → `no_investable`（pct-bps 全空）；篡改目标 → `invalid_records` | ✅ 通过 | 各态独立文案 + 通往 `nav:targets` 的入口；`invalid_records` 按 `invalidCount/total` 显式保留（承 D-047 ⑥ / D-050 ②） |
+| 缺数据不得出现 0% 或「正式口径」 | 无估值态断言六类比例均为 `—` 而非 `0%`，且不含「正式口径」；估算态显示既有 blocker 文案并保留估算标签 | ✅ 通过 | 判定只来自服务端；`canAdvise`/blocker 不在页面二次合成（不变量 3 / D-025） |
+| 首页渲染不打断既有交互 | 慢响应（人为延迟）期间断言状态为「核对中」且归因区 DOM 节点身份不变；内容未变时二次复核不重写 DOM | ✅ 通过 | 只 `outerHTML` 替换对照卡；用 `state.allocCompareHtml` 缓存比对，对齐 D-050 ③ 的局部替换纪律 |
+| 读取失败可恢复 | 断言失败态标「未复核」、保留上次对照并显示 `alloc:retry`；点击重试后恢复当前数据 | ✅ 通过 | 不把「读不到」说成「没有目标」 |
+| 范围边界 | 本轮 diff 仅 `js/app.js`、`sw.js`、`tests/app-wiring.*` 与文档 | ✅ 通过 | 零 Domain / API / Store / 目标 / 映射 / 建议算法改动，schema 仍 v10；`POST /targets` 201 与 fxRates 字段形状仅在测试 fixture 中修正，未改产品逻辑 |
+
+实现过程中修正了三处 wiring fixture/断言缺陷（fxRates 需 `base/quote` 字段、生成目标返回 201 而非 200、归因节点身份比较误用了 `goHome` 之前的旧节点引用），均属测试基建，不计入产品缺陷。稳定性观察沿用 5E-1 小节的 4D/4E/5C 偶发项，仍列为 5E-6 门禁项，不由本项修复。
+
+5E-2 只完成 `PHASE5E_BREAKDOWN.md` 的第 2 项；S5.1 的完整解释链（建议解释、知识卡、审计追溯）与整个 Phase 5 的端到端验收仍待 5E-3～5E-6，不得据本节宣布 5E 或 MVP 已验收。
 
 ### S5.1 能力约束意愿
 

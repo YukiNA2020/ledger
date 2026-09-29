@@ -1,0 +1,4 @@
+{"probe":"same input one second later","first":201,"second":409,"error":{"code":"duplicate_recommendation","message":"同一份输入已有另一条建议产物（历史建议不可覆盖）","retryable":false}}
+{"probe":"mapping order changed same day","status":409,"error":{"code":"duplicate_recommendation","message":"同一份输入已有另一条建议产物（历史建议不可覆盖）","retryable":false}}
+{"probe":"balance changed after close without resealing","write":201,"status":201,"adviceStatus":"formal","currentCash":{"assetClass":"cash","valueMinor":60000000,"pctBps":5608},"sealedCash":{"assetClass":"cash","valueMinor":50000000,"pct":51.5},"sameSnapshot":true}
+{"probe":"ordinary five-key save loses close history","write":200,"closeCount":0,"recommendationCount":2,"validRecommendationCount":2,"invalidCount":0,"subsequentAdvice":409,"error":{"code":"unknown_snapshot","message":"引用的结账快照在本机不存在，无法绑定建议输入","retryable":false}}

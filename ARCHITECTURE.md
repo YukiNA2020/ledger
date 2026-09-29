@@ -1,5 +1,15 @@
 # Ledger 架构设计
 
+## 2026-09-23 当前实现增量
+
+当前 `2.4.23-ui-polish` / schema v10，Phase 5（排除 G5-R4）限定范围复验通过。以下旧日期截面不代表当前缺失功能。
+
+- `server/recommendations.js`：纯计算编排，复用 Domain 的估值、偏离、分配、映射、正式门禁。无外部依赖，不访问网络、数据库或隐式时钟。
+- `recommendations.gate_json.capture`：封存完整计算输入，算法版本 `cash-reallocation-v1`；与原始月结快照并存。`input_hash` 识别全部输入，`payload_hash` 识别结果记录；读取进行结构校验、重放与月结快照引用核对。历史旧记录缺 capture 时保留但标记未验证。
+- 池内现金转配不增加投资池分母，先留现金配置下限；本金、类别、标的与余量以整数最小单位守恒。不生成负金额或卖出指令。
+- `/state`、Core JSON 备份与 Store 伴随集合均包含 monthlyCloses / closeSnapshots；普通五键保存于 SQLite 同一事务保留全部六个伴随集合，显式数组覆盖，旧备份缺键恢复空历史。快照恢复校验原文哈希、引用与日期，失败回滚。
+- 无新增迁移：沿用本轮已有 v10 recommendations 表；未增加 Phase 6 表或新行情源。细节见 D-049 和 `PHASE5D_ACCEPTANCE_GAPS.md`。
+
 > 对应产品范围：[PRODUCT.md](./PRODUCT.md)  
 > 实施顺序：[ROADMAP.md](./ROADMAP.md)
 
@@ -8,6 +18,10 @@
 本文描述目标架构，不描述已经存在的能力。后续 Agent 必须按 ROADMAP 分阶段落地，不能把目标图当成当前系统图。
 
 截至 2026-09-20，Phase 1（资产领域基础）、Phase 2（本地服务与 SQLite）、Phase 3（账户、负债与月度结账）、Phase 4B（标的目录与分类确认）、Phase 4C（持仓账本与证券事件）、Phase 4D（日终行情、汇率与失败兜底）与 Phase 4E（估值下钻与收益归因，含第一轮与第二轮复核补口）与 Phase 5A（风险问卷与配置规则冻结）已落地：已有 `js/domain.js` 领域模型、资产决策台、`server/` 下的本地服务与 SQLite（迁移器、repository、备份恢复、Keychain 适配器、登录项脚本）、前端存储门面 `js/store.js`；Phase 4A 的 provider 契约（`server/providers/contract.js`）、固定时钟与离线 fixture 已完成，Phase 4B 的标的检索/候选/元数据缓存/预分类/确认锁定与稳定标的 id 已可用（`server/instrument-catalog.js`、`/api/v1/instruments*`、资产页「标的目录」区块），Phase 4C 的期初快照与证券事件写入、推导持仓视图与资产页「持仓与证券事件」区块已可用（`POST /portfolio-openings` / `POST|GET /security-events`、`deriveHoldings` 唯一推导、迁移 v6，口径见 D-042 ⑦⑧）；Phase 4D 的行情/汇率编排层（`server/market-data.js`）、Frankfurter 汇率源（**pin ECB 端点** `/v2/providers/ecb/rates`，D-036）、Keychain 惰性读 Key 与手动补价兜底已可用（`POST /api/v1/quotes` / `POST /api/v1/market-data/refresh`、迁移 v7 的 `quotes.source_symbol`、资产页「行情（收盘价）」区块，口径见 D-044），其中**行情自动抓取默认关闭**——D-038 的六条启用门禁经 2026-09-17 逐条复测后无候选通过（证据见 `server/providers/SOURCES.md` §8），开关只认服务端 settings，门禁通过后仅需接入 provider；Phase 4E 的估值下钻与收益归因已可用（`js/domain.js` 的 `computeAssetDrilldown` / `computeReturnAttribution` / `computeAttributionBaselinePositions` / `baselinePositionsFromSnapshot` / `findQuoteAsOf` / `findFxRateAsOf` / `holdingsAsOf`、决策台「估值下钻」与「收益归因」两个区块、月结快照封存的 `attribution` 与 `attributionPositions` 字段），四个下钻维度与总览共用 `valueAssetItems` 的**同一遍**估值、「价格影响 + 汇率影响」逐行恒等于估值变化、as-of 查询绝不返回未来行；**归因期初腿只认封存明细（D-045 ⑨，G4E-1 复核补口）**——期初数量/价格/汇率只来自快照 payload 的 `attributionPositions`（基准月末 as-of 口径封存，重算前校验快照原文哈希），绝不按当前事实表倒算，结账后回填旧业务日期事实改写不了已结账月的归因，本轮**零新数据源、零迁移**；4B 同日完成独立复核**两轮**补口 —— 标的 id 只能由服务端按首次创建时的 identity key 派生并永久锁定、去重键在所有写入路径（含全量 `/state`）强制并由迁移 v4 唯一索引兜底、同代码跨市场报 `ambiguous_instrument`、全量写入逐条校验（非法记录整体拒绝而非静默丢行）、备份结构校验按版本覆盖必需索引（D-040）、检索合并与建立路径共用同一套退化匹配。**尚无**行情自动抓取（4D 交付的是“门禁就绪但未开启”）。Phase 5A 已冻结风险问卷与配置规则并通过验收（D-046）：题库与分值（能力 5 题 / 意愿 4 题）、等级边界（下界含入）、4 条硬封顶（只降不升）、5 级目标区间模板（六类 basis points、Σtarget 精确 100%、个股 target 恒为 0）、容忍带、复评词表与有效期、稳定错误码、建议输入输出契约与排序 / 尾差规则，都在 `js/domain.js`（唯一实现，浏览器与服务端共用），冻结副本为 `tests/fixtures/phase5-risk-rules.json`；全部对外规则常量递归冻结，所有 5A 输入对象只消费精确自有数据字段，答案校验后按冻结题库顺序规范化，完整评分结果不依赖调用方排列，当前目标版本绑定唯一模板、金额只接受安全整数且未来评估日 fail closed（G5A-1～12 全部闭合）；但**尚未**有 `risk_assessments` 持久化、风险评估 API 与问卷页面（5B 起），也**尚未**有决策状态机（Phase 6 起）。
+
+**2026-09-21 状态增量（覆盖上方 2026-09-20 截面）：** Phase 5B 已通过验收。迁移 v8 新增 `risk_assessments`；`js/domain.js` 提供风险评估记录校验、服务端重算与当前有效评估选出；`server/api.js` 提供追加写入、历史列表与当前评估接口；`js/app.js` 已有问卷、结果解释、到期状态与复评历史。客户端不提交或持有权威派生值，历史读取与全量恢复均经过领域重算闸。
+
+**2026-09-21 状态增量二（Phase 5C，独立复核缺口修复后待复验）：** 迁移 **v9** 新增 `allocation_targets`（目标版本，追加式 + 自然键唯一）与 `approved_instruments`（类别 → 用户认可标的，仅用户判断可写）。`js/domain.js` 的 5C 段落提供 `computeAllocationTarget`（上限 → 5A 冻结模板）、`validateAllocationTargetRecord`（含与被引用评估交叉核对）、`selectCurrentTarget`（五态：`current/no_target/no_assessment/stale_assessment/invalid_records`）、`computeAllocationDeviation`（**只消费 `computeOverview` 的同一遍估值**，bps 最大余数法，`Σ` 恒为 10000，池为 0 → `no_investable`）、`checkApprovedMapping` / `classesMissingMapping`（失效引用与分类冲突保留原行并显式报告）。`server/api.js` 提供 `GET|POST /api/v1/targets`、`GET /api/v1/targets/current`、`GET|POST /api/v1/approved-instruments`；服务端只受理对象形状的可选生效日期与整类清单，等级/比例/派生值一律重算。`js/app.js` 新增「目标配置」页（决策台入口 `nav:targets`）。页面保存不再 GET 后补回追加式集合：`Store.saveAll` 在单次 PUT 中声明保留意图，`repository.writeState` 在同一 SQLite 事务内保存未显式给出的 `riskAssessments` / `allocationTargets` / `approvedInstruments`，消除并发覆盖窗口；JSON 备份三集合同步导出与恢复。认可标的未变化的重复提交保留 `updatedAt`。尚未落地的是 5D 的新增资金分配与正式建议门禁、5E 的解释整合与知识卡，以及 Phase 6 状态机。
 
 ## 1. 架构原则
 
@@ -33,7 +47,7 @@
 
 可复用资产是已经由 Node 测试覆盖的纯逻辑和账单导入交互。已解决的限制：浏览器数据难以自动备份（现由服务端每日备份 + 30 份保留覆盖）、API Key 无法安全保存（现由 Keychain 适配器覆盖）、KV Schema 不适合持仓与快照关系查询（现由 SQLite 关系表覆盖）。
 
-仍未满足的目标架构能力：开机自动打开端到端、行情自动抓取（编排与契约已就绪，源受 D-038 门禁默认关闭）、规则引擎（Phase 5A 已冻结规则与契约，5B 起落地实现）、决策状态机（Phase 6）。
+仍未满足的目标架构能力：开机自动打开端到端、行情自动抓取（编排与契约已就绪，源受 D-038 门禁默认关闭）、新增资金分配与正式建议门禁（5D）、建议解释与知识卡（5E）、决策状态机（Phase 6）。风险评估与复评子系统已在 5B 落地，目标配置与认可标的映射已在 5C 落地（D-048）。
 
 ## 3. 目标系统
 
@@ -93,6 +107,8 @@ Phase 2 已落地其中的接口版本前缀、事务/迁移/备份恢复与 Key
 
 ### 4.3 Frontend
 
+2026-09-28 桌面改版（`2.4.22-desktop-blue`）：仍为本地原生 HTML/CSS/JS、零外部字体或 UI 依赖。`#tabbar` 在宽屏作为固定工作台侧栏，窄屏保留原五入口；`#view` 按页面限定宽度，决策台在宽屏分为资产概览、资金池、配置与侧栏快捷入口。所有导航继续使用原 `data-action="nav:*"`，领域计算、Store 门面、API、SQLite schema 不变。前端资源随 SW 缓存版本同步更新，断网知识卡仍可从真实页面入口打开。
+
 - 首页资产决策台；
 - 现金流、持仓、负债、受限资产和设置的下钻页面；
 - 所有异步请求显示 `loading/success/stale/error`；
@@ -142,8 +158,9 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 
 - `monthly_closes(id, month, status, completed_at, data_cutoff)`。
 - `snapshots(id, close_id?, captured_at, snapshot_type, payload_hash)`。
-- `risk_assessments(id, capacity_score, willingness_score, risk_ceiling, answers_json, assessed_at, reason)`。
-- `allocation_targets(id, asset_class, min_pct, target_pct, max_pct, effective_from)`。
+- `risk_assessments(id, rule_version, answers_json, capacity_score, willingness_score, capacity_level, willingness_level, risk_ceiling, ceiling_source, hard_caps_json, explain_codes_json, assessed_at, expiry, reason, created_at)`：迁移 v8；一行一次评估，只追加不覆盖；读取与恢复按原始答案及当时规则版本重算核对。
+- `allocation_targets(id, template_version, rule_version, level, classes_json, assessment_id, assessed_at, assessment_expiry, effective_from, created_at)`：迁移 **v9**（5C，D-048）；一行一个目标版本，**只追加不回写**，自然键 `(assessment_id, template_version, effective_from)` 唯一索引兜底；`level` 与六类 `minBps/targetBps/maxBps` 全部由服务端按「该评估的 `ceiling` + 5A 冻结模板」派生后封存，并记住所引用的评估（`assessment_id` 为 `ON DELETE RESTRICT`）。两条读取路径都按「模板版本 + 等级 + 所引用评估」重算核对。
+- `approved_instruments(id, asset_class, instrument_id, position, created_at, updated_at)`：迁移 **v9**（5C）；「资产类别 → 用户认可标的」白名单，一行一条，`position` 是用户给的类别内优先级。`UNIQUE(instrument_id)`（一个标的只属一个类别）与 `UNIQUE(asset_class, position)` 由显式唯一索引承载；`instrument_id` 为 `ON DELETE RESTRICT`，删除标的必须先显式解除用户映射。**只有用户判断写入本表**：行情与目录 provider 的刷新/确认路径不触碰这里任何一列。引用完整性在读取时判定（标的缺失 / 分类回到 suggested / 类别不一致 → 保留原行并给出 `issues`）。
 - `decisions(id, snapshot_id, state, recommendation_json, explanation_version, reason, created_at, updated_at)`。
 - `decision_events(id, decision_id, from_state, to_state, note, occurred_at)`。
 
@@ -189,6 +206,8 @@ POST   /api/v1/market-data/refresh
   # 仍 501（4D）；受 D-038 门禁约束，门禁未通过前自动抓取保持关闭
 POST   /api/v1/monthly-closes
 POST   /api/v1/risk-assessments
+GET    /api/v1/risk-assessments
+GET    /api/v1/risk-assessments/current?asOf=
 POST   /api/v1/recommendations
 POST   /api/v1/decisions/{id}/events
 POST   /api/v1/backups

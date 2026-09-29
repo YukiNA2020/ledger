@@ -1,0 +1,27 @@
+2026-09-26 / APP_VERSION=2.4.19-phase5e5 / SQLite schema v10
+5E-5 审计追溯 · 浏览器 wiring 证据
+Provider: fixture.getFxRates; no real market-data provider.
+Run A: http://127.0.0.1:18661/tests/app-wiring.html?v=5e5
+Temporary database: isolated phase5d-wiring-server.cjs temp dir (ledger-fix5d-browser-qv5LmZ)
+Result: 完成：31 项通过，0 项失败 (body[data-result]=pass)
+Run B: http://127.0.0.1:18662/tests/app-wiring.html?v=5e5
+Temporary database: isolated phase5d-wiring-server.cjs temp dir (ledger-fix5d-browser-Weh2lo)
+Result: 完成：31 项通过，0 项失败 (body[data-result]=pass)
+Harness: /tmp/opencode/run_wiring_5e5.py (Playwright headless Chromium, clean persistent profile per run,
+profile dir deleted after run; server SIGTERM after each run, server temp dir self-cleaned)
+node --test: 631/631; node --check js/app.js js/store.js js/domain.js sw.js server/api.js
+  server/repository.js tests/app-wiring.js tests/server-phase5e5.test.js: OK; git diff --check: OK
+5E-5 scope verified:
+- C7.11 extended: trace groups data-advice-trace-baseline / -input / -versions / -explain-seal,
+  each attribute compared against the stored recommendation record (close id, snapshot id,
+  snapshotPayloadHash, dataCutoff, asOf, inputHash, algorithmVersion=cash-reallocation-v1,
+  payloadHash, ruleVersion, targetVersion, assessmentId, targetId); baseline text must separate
+  月结基准 from 计算输入; sealed advice shows 本条建议生成时封存 with versions equal to
+  Knowledge.EXPLANATION_VERSION and no 未封存 label.
+- New check 5E-5 审计追溯: fresh sealed advice (31st check) -> strip gate.explanationVersion
+  via full-state PUT (record stays invalidCount=0) -> same-input regenerate returns the same row
+  (created=false) with data-sealed=0 and 当前卡片解释，非生成时封存版本 label, sealed-version
+  empty, current-version shown; third regenerate still returns the original unstamped row
+  (no backfill), single recommendation total=1, trace fields still match the library record.
+Expected console noise: /tests/sw.js 404, negative-path 401/400/415/422 responses (8 console msgs total).
+No test filtering/skipping.

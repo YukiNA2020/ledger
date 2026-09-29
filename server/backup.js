@@ -49,7 +49,10 @@ const REQUIRED_TABLES_V1 = [
 
 const REQUIRED_TABLES_BY_VERSION = {
   2: ['monthly_closes', 'close_snapshots'],
-  3: ['asset_transfers']
+  3: ['asset_transfers'],
+  8: ['risk_assessments'],
+  9: ['allocation_targets', 'approved_instruments'],
+  10: ['recommendations']
 };
 
 // 必需**索引**随 schema 版本增长：有些不变量由索引承载，光看表齐不齐看不出来。
@@ -64,16 +67,97 @@ const REQUIRED_INDEXES_BY_VERSION = {
     unique: true,
     columns: ['account_id', 'instrument_id'],
     partial: false
-  }]
+  }],
+  8: [{ table: 'risk_assessments', name: 'idx_risk_assessments_assessed', unique: false }],
+  // Phase 5C（D-048）：目标的自然键唯一索引与「一个标的一处映射、类别内顺序不重复」两条唯一索引
+  // 都承载不变量 —— 被手工删掉后迁移器不会重建，于是重复目标 / 跨类别冲突映射能静默写回，
+  // 因此按版本登记在恢复切换之前校验（与 v4 / v6 同一纪律）。
+  9: [
+    {
+      table: 'allocation_targets',
+      name: 'uq_allocation_targets_natural',
+      unique: true,
+      columns: ['assessment_id', 'template_version', 'effective_from']
+    },
+    { table: 'allocation_targets', name: 'idx_allocation_targets_effective', unique: false },
+    { table: 'approved_instruments', name: 'uq_approved_instruments_instrument', unique: true },
+    {
+      table: 'approved_instruments',
+      name: 'uq_approved_instruments_slot',
+      unique: true,
+      columns: ['asset_class', 'position']
+    }
+  ],
+  // Phase 5D（D-049）：input_hash 唯一索引承载「同一份输入只有一份建议产物」这条幂等不变量，
+  // 被删掉后同一请求能写出多行互相矛盾的建议，因此与 v4 / v6 / v9 同纪律按名校验。
+  10: [
+    { table: 'recommendations', name: 'uq_recommendations_input', unique: true, columns: ['input_hash'] },
+    { table: 'recommendations', name: 'idx_recommendations_created', unique: false }
+  ]
 };
 
 // 必需**列**随 schema 版本增长（复核 G4C-6）：有些事实承载在列上，光看表齐不齐看不出来。
 // v5 的 amount_minor 承载分红/费用事件总额——缺列的 v5 库恢复后迁移器不会补列
 // （版本已应用），读取事件时才炸。校验必须把这类库挡在切换之前。
 // v7 的 quotes.source_symbol 承载行情 provider 返回的原始代码（Phase 4D 追溯要求）。
+// v8 的 risk_assessments 整表新增：这里登记承载冻结语义的列（原始答案、当时规则版本、
+// 双评分、上限判定、日期与复评原因），缺任何一列都无法证明历史评估可追溯。
 const REQUIRED_COLUMNS_BY_VERSION = {
   5: [{ table: 'security_events', name: 'amount_minor' }],
-  7: [{ table: 'quotes', name: 'source_symbol' }]
+  7: [{ table: 'quotes', name: 'source_symbol' }],
+  8: [
+    { table: 'risk_assessments', name: 'answers_json' },
+    { table: 'risk_assessments', name: 'rule_version' },
+    { table: 'risk_assessments', name: 'capacity_score' },
+    { table: 'risk_assessments', name: 'willingness_score' },
+    { table: 'risk_assessments', name: 'risk_ceiling' },
+    { table: 'risk_assessments', name: 'ceiling_source' },
+    { table: 'risk_assessments', name: 'assessed_at' },
+    { table: 'risk_assessments', name: 'expiry' },
+    { table: 'risk_assessments', name: 'reason' },
+    { table: 'risk_assessments', name: 'created_at' }
+  ],
+  // v9（Phase 5C）：目标版本承载「来自哪一份评估、哪个模板/规则版本、何时生效」，
+  // 认可标的承载「类别 → 标的 → 用户顺序」。缺任何一列都无法证明目标可追溯或映射未被改写。
+  9: [
+    { table: 'allocation_targets', name: 'classes_json' },
+    { table: 'allocation_targets', name: 'template_version' },
+    { table: 'allocation_targets', name: 'rule_version' },
+    { table: 'allocation_targets', name: 'level' },
+    { table: 'allocation_targets', name: 'assessment_id' },
+    { table: 'allocation_targets', name: 'assessed_at' },
+    { table: 'allocation_targets', name: 'assessment_expiry' },
+    { table: 'allocation_targets', name: 'effective_from' },
+    { table: 'allocation_targets', name: 'created_at' },
+    { table: 'approved_instruments', name: 'asset_class' },
+    { table: 'approved_instruments', name: 'instrument_id' },
+    { table: 'approved_instruments', name: 'position' },
+    { table: 'approved_instruments', name: 'created_at' },
+    { table: 'approved_instruments', name: 'updated_at' }
+  ],
+  // v10（Phase 5D）：建议产物承载「引用了哪份快照 / 评估 / 目标、请求与可分配金额、门禁明细、
+  // 结果本体与哈希」。缺任何一列，Phase 6 接手的就不再是可追溯的封存计算结果。
+  10: [
+    { table: 'recommendations', name: 'status' },
+    { table: 'recommendations', name: 'rule_version' },
+    { table: 'recommendations', name: 'target_version' },
+    { table: 'recommendations', name: 'assessment_id' },
+    { table: 'recommendations', name: 'target_id' },
+    { table: 'recommendations', name: 'close_id' },
+    { table: 'recommendations', name: 'snapshot_id' },
+    { table: 'recommendations', name: 'snapshot_hash' },
+    { table: 'recommendations', name: 'data_cutoff' },
+    { table: 'recommendations', name: 'as_of' },
+    { table: 'recommendations', name: 'requested_new_funds_minor' },
+    { table: 'recommendations', name: 'allocatable_new_funds_minor' },
+    { table: 'recommendations', name: 'allocated_total_minor' },
+    { table: 'recommendations', name: 'input_hash' },
+    { table: 'recommendations', name: 'gate_json' },
+    { table: 'recommendations', name: 'todos_json' },
+    { table: 'recommendations', name: 'result_json' },
+    { table: 'recommendations', name: 'payload_hash' },
+    { table: 'recommendations', name: 'created_at' }
+  ]
 };
 
 function requiredTablesFor(version) {
@@ -490,6 +574,7 @@ module.exports = {
   REQUIRED_INDEXES_BY_VERSION,
   requiredIndexesFor,
   requiredTablesFor,
+  requiredColumnsFor,
   LAST_BACKUP_META,
   backupFileName,
   listBackups,
