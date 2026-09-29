@@ -206,6 +206,13 @@ function createDecision(db, payload, ctx) {
     decisionFail('unknown_recommendation', '决策引用的建议不存在：' + req.recommendationId);
   }
   const rec = recEntry.record;
+  // 契约 §2.1 ②：记录必须先通过读取复核。这里采用与 GET /recommendations 完全同一份
+  // 读取视图结果（形状 + 封存 payloadHash + capture 重放 + G5-R1 引用一致）——
+  // 封存哈希被改坏的建议在列表里已计入 invalidCount，同样**不能**创建任何决策，
+  // 包括 deferred / dismissed / proposed（不只是 accepted 的时效重核）。
+  if (!R.readRecommendationView(db).items.some((item) => item.id === req.recommendationId)) {
+    decisionFail('invalid_recommendation_record', '决策引用的建议未通过完整读取复核（封存哈希或引用链不一致）：' + req.recommendationId);
+  }
   const recShape = Domain.validateRecommendationRecord(rec);
   if (!recShape.ok) {
     decisionFail('invalid_recommendation_record', '决策引用的建议复核失败：' + (recShape.error && recShape.error.detail));
@@ -468,36 +475,40 @@ function decisionListResponse(db, query, ctx) {
   const fxRates = state.assets && state.assets.fxRates || [];
 
   const all = R.readValidatedDecisions(db);
-  const items = all.items.map((entry) =>
-    decisionListItem(db, entry, recMap, view, assetsSig, securityEvents, fxRates));
 
+  // 聚合（states / months）覆盖全部有效决策，供筛选界面使用；过滤在条目装配前完成。
   const states = [];
   const months = [];
-  items.forEach((item) => {
-    if (states.indexOf(item.state) === -1) states.push(item.state);
-    item.eventMonths.forEach((m) => {
-      if (months.indexOf(m) === -1) months.push(m);
+  all.items.forEach((entry) => {
+    const state = entry.decision.state;
+    if (states.indexOf(state) === -1) states.push(state);
+    entry.events.forEach((e) => {
+      const ym = String(e.occurredAt).slice(0, 7);
+      if (months.indexOf(ym) === -1) months.push(ym);
     });
   });
   states.sort();
   months.sort();
 
-  let filtered = items;
+  let entries = all.items;
   if (query.state != null) {
     if (Domain.DECISION_STATES.indexOf(query.state) === -1) {
       decisionFail('invalid_decision_payload', 'state 查询参数不在状态词表内');
     }
-    filtered = filtered.filter((item) => item.state === query.state);
+    entries = entries.filter((entry) => entry.decision.state === query.state);
   }
   if (query.month != null) {
     if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(query.month)) {
       decisionFail('invalid_decision_payload', 'month 查询参数必须是 YYYY-MM');
     }
-    filtered = filtered.filter((item) => item.eventMonths.indexOf(query.month) !== -1);
+    entries = entries.filter((entry) =>
+      entry.events.some((e) => String(e.occurredAt).slice(0, 7) === query.month));
   }
   if (query.recommendationId != null) {
-    filtered = filtered.filter((item) => item.recommendationId === query.recommendationId);
+    entries = entries.filter((entry) => entry.decision.recommendationId === query.recommendationId);
   }
+  // 契约 §8.3：from / to 按**每条事件的 occurred_at** 判区间——只要任一状态事件落在
+  // 区间内即命中（不能只看月初或最后一次事件，否则中间事件会被漏掉）。
   if (query.from != null || query.to != null) {
     if (query.from != null && !Domain.isCalendarDate(query.from)) {
       decisionFail('invalid_decision_payload', 'from 查询参数必须是真实日历日');
@@ -505,19 +516,17 @@ function decisionListResponse(db, query, ctx) {
     if (query.to != null && !Domain.isCalendarDate(query.to)) {
       decisionFail('invalid_decision_payload', 'to 查询参数必须是真实日历日');
     }
-    filtered = filtered.filter((item) => {
-      const dates = item.eventMonths.map((m) => m + '-01').concat(
-        item.lastEventAt ? [item.lastEventAt] : []);
-      const inRange = (date) =>
-        (query.from == null || date >= query.from) && (query.to == null || date <= query.to);
-      return dates.some(inRange);
-    });
+    entries = entries.filter((entry) => entry.events.some((e) =>
+      (query.from == null || e.occurredAt >= query.from) &&
+      (query.to == null || e.occurredAt <= query.to)));
   }
-  filtered.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '') || a.id.localeCompare(b.id));
+  const items = entries.map((entry) =>
+    decisionListItem(db, entry, recMap, view, assetsSig, securityEvents, fxRates));
+  items.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '') || a.id.localeCompare(b.id));
 
   return {
     ok: true,
-    items: filtered,
+    items: items,
     total: all.total,
     invalidCount: all.invalidCount,
     states: states,
@@ -535,7 +544,9 @@ function decisionDetailResponse(db, decisionId, ctx) {
   const events = R.getDecisionEvents(db, decisionId);
   const links = R.readDecisionLinks(db).filter((l) => l.decisionId === decisionId);
   const validRecommendationIds = new Set(R.readRecommendationView(db).items.map((r) => r.id));
-  const checked = R.validateDecisionWithIntegrity(db, decision, events, links, validRecommendationIds);
+  const securityEventsForCheck = R.readSecurityEvents(db);
+  const securityEventsByIdForCheck = new Map(securityEventsForCheck.map((e) => [e.id, e]));
+  const checked = R.validateDecisionWithIntegrity(db, decision, events, links, validRecommendationIds, securityEventsByIdForCheck);
   if (!checked.ok) {
     decisionFail('invalid_decision_record', '决策复核失败：' + checked.error.detail);
   }

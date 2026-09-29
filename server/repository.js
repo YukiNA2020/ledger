@@ -2258,7 +2258,7 @@ function updateDecisionForRow(db, decision) {
 
 // 决策读取复核（契约 §4.5）：链式一致 + 快照原文哈希 + 事件防篡改哈希 + 建议引用复核。
 // 任何一条不过 → invalid_decision_record；列表把失败行计入 invalidCount，详情接口直接 400。
-function validateDecisionWithIntegrity(db, decision, events, links, validRecommendationIds) {
+function validateDecisionWithIntegrity(db, decision, events, links, validRecommendationIds, securityEventsById) {
   const chain = Domain.validateDecisionEventChain(decision, events);
   if (!chain.ok) return chain;
   for (const event of chain.events) {
@@ -2276,6 +2276,15 @@ function validateDecisionWithIntegrity(db, decision, events, links, validRecomme
   for (const link of links) {
     const checked = Domain.validateDecisionLinkRecord(link);
     if (!checked.ok) return checked;
+    // 契约 §4.5 第 5 条：每条活动关联的 security_event_id 必须指向存在的 buy 事件。
+    // 该检查属于读取复核（fail closed）：被篡改的关联让**这一条决策**失效
+    // （列表排除并计入 invalidCount、详情 400），绝不使整页列表失败。
+    if (link.unlinkedOn == null) {
+      const ev = securityEventsById ? securityEventsById.get(link.securityEventId) : getSecurityEvent(db, link.securityEventId);
+      if (!ev || ev.eventType !== 'buy') {
+        return { ok: false, error: { code: 'invalid_decision_record', detail: '活动关联指向的证券事件缺失或不是 buy：' + link.securityEventId } };
+      }
+    }
   }
   return { ok: true, decision: decision, events: chain.events, links: links };
 }
@@ -2286,12 +2295,13 @@ function readValidatedDecisions(db) {
   const events = readDecisionEvents(db);
   const links = readDecisionLinks(db);
   const validRecommendationIds = new Set(readRecommendationView(db).items.map((r) => r.id));
+  const securityEventsById = new Map(readSecurityEvents(db).map((e) => [e.id, e]));
   const out = [];
   let invalidCount = 0;
   decisions.forEach((decision) => {
     const dEvents = events.filter((e) => e.decisionId === decision.id);
     const dLinks = links.filter((l) => l.decisionId === decision.id);
-    const checked = validateDecisionWithIntegrity(db, decision, dEvents, dLinks, validRecommendationIds);
+    const checked = validateDecisionWithIntegrity(db, decision, dEvents, dLinks, validRecommendationIds, securityEventsById);
     if (!checked.ok) {
       invalidCount += 1;
       return;
