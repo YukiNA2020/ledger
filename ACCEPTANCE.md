@@ -3,6 +3,10 @@
 > 版本：v3 MVP 冻结稿  
 > 用途：定义“做完”的可观察证据。执行 Agent 必须使用虚构数据完成自动化与人工验收，不得把真实财务数据写入仓库、日志或外部服务。
 
+## 最新计划（2026-09-28）
+
+**6A「规则与契约」已完成**：权威文本 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)，决策 D-057，零业务代码、零迁移、零页面；§8 已按冻结口径更新。下一入口 **6B 状态与存储**；[拆解文档](./PHASE6_BREAKDOWN.md) 定义逐项任务。G5-R4 延后到 6E-3，不阻塞 6A～6D，仍是 6F 最终验收必过项。以下较早截面保留历史证据，不定义当前任务顺序。
+
 ## 当前验收截面（2026-09-28 补口进展）
 
 2026-09-28 Phase 6 前桌面改版：`2.4.22-desktop-blue` / schema v10（零迁移）。桌面 1440px 与窄屏 390px 实际浏览器检查通过；桌面 10 个、窄屏 5 个导航页面均能渲染且无横向溢出或页面异常；全量 `node --test` **648/648**，完整浏览器 wiring **34/34**，G5-R1～R3 的反例复验保持通过，断网知识卡可点击。样式、导航位置与决策台布局变化不改变任何计算、门禁或写入。截图与日志见 `docs/evidence/desktop-redesign-20260928/`；浏览器附加审计见 `docs/evidence/phase5-review-20260927/browser-18812.json`。G5-R4 状态不变。
@@ -537,14 +541,50 @@ Phase 5 退出证据：相同输入重复计算结果一致；每条建议能展
 
 ## 8. Phase 6｜执行与复盘
 
+> 2026-09-28 由 **6A** 冻结口径（D-057，权威文本 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)）。本节只写可验收的行为；实现完成前一律标记待验收。
+
 ### S6.1 合法状态流转
 
-允许：`proposed → accepted/deferred/dismissed`、`accepted → executed`、`executed → reviewed`。  
-拒绝：`proposed → reviewed`、`dismissed → executed` 等跳步或终态反转。
+七个状态：`proposed / accepted / deferred / dismissed / executed / reviewed / archived`。
 
-每次状态变化必须保存时间、理由、操作者（固定为本地用户）和当时快照；产品不调用券商交易接口。
+- 允许（**恰好 6 条**）：`proposed → accepted/deferred/dismissed`、`accepted → executed`、`accepted → archived`、`executed → reviewed`。
+- 拒绝（**其余 38 个有序对**，含全部自转移）：`proposed → executed/reviewed/archived`、`executed → accepted/reviewed` 之外的逆向、`deferred/dismissed/archived/reviewed → *` 一切出口、`accepted → deferred/dismissed/reviewed`、任意 `X → X`。
+- **验收必须数据驱动遍历全部 7×6 = 44 个有序对**，不得只抽样代表样例：合法 → 状态改变且恰好追加 1 条事件；非法 → HTTP 409 `illegal_transition` 且状态、事件数、关联数逐项不变（事务整体回滚）。
+- **`deferred → accepted` 永久非法**：暂缓 / 忽略是归档出口，只进历史不进待执行清单；事实变化后由规则引擎生成新建议（新 `inputHash` → 新 id）再走新决策。同一 `recommendationId` 重复创建返回既有决策（`created:false`），不改状态、不追加事件。
+- **只有 `status === 'formal'` 的建议能创建决策**：估算建议 → 409 `recommendation_not_formal`，不进待执行清单、不可接受。接受时服务端独立重核 `Domain.adviceStaleness`，失效 → 409 `recommendation_stale`；客户端角标不作为授权依据。`deferred`/`dismissed` 创建不做重核。
+- `intent` 白名单只有 `accepted|deferred|dismissed`；出现 `executed|reviewed|archived|proposed` → 409 `illegal_transition` 且**不创建任何决策行**。
 
-Phase 6 退出证据：使用虚构数据完整跑通两次“建议—决定—交易记录—复盘”，非法跳转测试通过。
+每次状态变化必须保存时间（本地日 `occurred_at` + ISO `recorded_at`）、理由码与自由文本 `note`、操作者（固定 `local-user`，客户端提交即 400）和当时封存快照（`snapshot_json` + `snapshot_hash`）；**没有快照哈希与 `seq` 链式一致性复核通过，读取直接失败**（`invalid_decision_record`，不返回"修好"的数据）。产品不调用券商交易接口。
+
+### S6.2 交易关联与不重复入账
+
+- **只关联 `buy`**：`sell`/`dividend`/`fee` → 409 `invalid_link_target`；分批可关联多笔 buy；手续费（buy 自带 `fee_minor`）单列为交易费用，不计入本金、不参与偏差。
+- **一条证券事件同时只属一条决策**（部分唯一索引，活动行唯一）：已挂本决策 → `created:false`；已挂另一决策 → 409 `event_already_linked`；不做跨决策拆单。
+- 关联只允许在 `accepted`/`executed`；解绑是软删除（`unlinked_on` + 必填 `unlink_note`），保留行不删历史；`reviewed` 后一切冻结。
+- 进度只反映事实、不改状态：`remainingMinor = 建议金额 − Σ(按各自交易日 as-of 汇率折 CNY 的 buy 本金)`；缺汇率按"有偏差"处理并记录 `fxUnavailable`，**不按 1:1 / 期末汇率 / 伪 0 兜底**。
+- `accepted → executed` 要求活动关联 ≥1（否则 409 `no_linked_events`）且显式命令推进，**不按金额相等自动判定**；有偏差必须 `note`（否则 400 `deviation_note_required`）。
+- **无交易必须能关闭**：0 元建议 / 全部保留现金 / 接受后放弃 → `accepted → archived`（活动关联必须为 0，否则 409 `has_linked_events`），理由必填（`no_trade` / `abandoned`），**不得伪造 0 元证券交易、不得用零关联的 `executed` 顶替**；归档不进复盘。
+- 实际交易复用既有证券事件，关联和重试不得重复创建交易、不得改写 `security_events`、不得写入 `txns` 或自动扣减现金；删除仍被活动关联引用的事件 → 409 `linked_event_missing` 且整笔回滚。现金仍按原规则人工核对（`cashReconciled := !freshness.balanceStale`），不自动扣减或重复计入。
+- 记事实 ≠ 重新批准建议：给失效建议补记已发生的交易**允许**，但不会改变决策状态，也不会重算建议金额。
+
+### S6.3 复盘、历史与恢复
+
+- **三时点逐事件封存**：决策时点、执行时点、复盘时点各存一份完整快照；快照一次性封存，此后改行情 / 目标 / 资产不改写历史；参照目标固定为**决策所引用的历史目标版本**（`targetRef`），当前目标如需展示必须单独标注。
+- **复盘是配置对照，不是业绩归因**：按六类（恒 6 行）比较三时点的金额、比例（basis points）与相对目标偏离；禁止出现"建议收益""跑赢目标"一类把配置变化说成收益的表述。
+- **缺数据不可比、不出伪 0**：`available = canAdvise && cashReconciled`，为 false 时金额与类别字段全 `null`，`reason ∈ {cash_not_reconciled, valuation_not_formal}` + 既有 blockers 解释；投资池为 0 是合法可比状态（比例列 `null`），不算缺数据。复盘本身不因缺数据被拒绝，但页面必须显著标注不可比。
+- **月度历史按 `decision_events.occurred_at` 本地事件月归属**：跨月决策多次出现、详情为完整时间线、回填交易日与操作时间分列、空月份不出条目。
+- 配置前后对照必须能由当时快照复核（哈希 + `seq` 链 + 引用完整性）；当前行情或目标变化不改写历史复盘。
+- 覆盖面：跨月历史、缺数据降级、**普通五键保存必须保留三个新集合**、显式 `decisions: []` 才清空、**缺三键的旧备份恢复为空历史**、v10→v11 迁移空表不伪造历史、新旧备份恢复、备份结构校验（**含把部分唯一索引换成普通索引必须拒止**）；任何失败不破坏活库。
+
+### S6.4 延后补齐 G5-R4
+
+6E-3 在有数据的页面上由真人计时，四问全部正确且总耗时 ≤60 秒；记录受测者代号、版本、数据来源、起止时间、答案与核对结果。自动化 DOM 读取不算真人理解证据。缺失时 Phase 6 只能写“待真人验收”。具体流程见拆解 §7。
+
+### S6.5 阶段范围守卫不得静默放宽
+
+6B 必须**逐条更新** `tests/domain-phase5a.test.js 5A-18`（`LATEST_VERSION` 10 → 11）、`server-api.test.js` / `server-phase3.test.js` 的 501 断言、`tests/server-phase5d.test.js`（改为断言 `recommendations` 仍无状态列）、`tests/domain-phase5d.test.js 5D-24`（Phase 6 代码放新段落并**新增**同形状守卫，5D 边界只移动不删断言）与备份/迁移/伴随集合断言（6 → 9）。**禁止删用例换绿色**；逐条改断言并在注释写明原因。清单见契约 §11。
+
+Phase 6 退出证据：使用两套独立虚构建议完整跑通两次“建议—决定—交易记录—复盘”（含分批与跨月，即契约 F-A / F-B），§10.2 的 28 条反向清单、44 个有序对全遍历、幂等/并发、迁移/恢复、旧功能及浏览器回归通过，G5-R4 已完成。逐项清单见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) §8；本节新增项目均为待验收要求，未宣告实现。
 
 ## 9. MVP 两个月验收
 

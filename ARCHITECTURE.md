@@ -10,6 +10,16 @@
 - `/state`、Core JSON 备份与 Store 伴随集合均包含 monthlyCloses / closeSnapshots；普通五键保存于 SQLite 同一事务保留全部六个伴随集合，显式数组覆盖，旧备份缺键恢复空历史。快照恢复校验原文哈希、引用与日期，失败回滚。
 - 无新增迁移：沿用本轮已有 v10 recommendations 表；未增加 Phase 6 表或新行情源。细节见 D-049 和 `PHASE5D_ACCEPTANCE_GAPS.md`。
 
+## 2026-09-28 Phase 6 6A 契约增量（零代码）
+
+6A 只冻结规则与契约，**未写任何业务代码、未迁移、未改页面**；本文件 §5.3 的 `decisions` / `decision_events` / `decision_links` 与 §5.6 的 Phase 6 接口已由草图改为**冻结目标**，权威文本是 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（决策记录 D-057）：
+
+- 状态机 7 状态（新增终态 `archived`）× 6 = 44 个有序对，合法 6 / 非法 38；`deferred` 不可回跳。6B 必须全遍历。
+- 迁移 **v11 `phase6-decisions`** 目标：三张表 + `UNIQUE(recommendation_id)` + `UNIQUE(decision_id, seq)` + 部分唯一索引 `uq_decision_links_active ... WHERE unlinked_on IS NULL`；备份 `REQUIRED_TABLES/INDEXES/COLUMNS_BY_VERSION[11]` 登记，并**对称补上"部分索引被换成普通索引"的拒止校验**。
+- 伴随集合由 6 扩为 9（增 `decisions` / `decisionEvents` / `decisionLinks`），`CLEAR_ORDER` 头部插三表；旧备份缺键恢复空历史不变。
+- 复盘三时点快照结构、17 个错误码→HTTP 映射、幂等与快照哈希复核、正反向 fixture 清单与 **6B 必须显式更新的阶段范围守卫测试**（§11）都在契约里。
+
+
 > 对应产品范围：[PRODUCT.md](./PRODUCT.md)  
 > 实施顺序：[ROADMAP.md](./ROADMAP.md)
 
@@ -156,13 +166,16 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 
 ### 5.3 结账与决策
 
+Phase 6 的 `decisions` / `decision_events` / `decision_links` 及相关接口由 6A 于 2026-09-28 冻结为契约，见 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（D-057）；**6B 按该契约建表，不得另改字段**。不得把目标当成已有 schema，也不得另建一份可变建议金额作为事实源。
+
 - `monthly_closes(id, month, status, completed_at, data_cutoff)`。
 - `snapshots(id, close_id?, captured_at, snapshot_type, payload_hash)`。
 - `risk_assessments(id, rule_version, answers_json, capacity_score, willingness_score, capacity_level, willingness_level, risk_ceiling, ceiling_source, hard_caps_json, explain_codes_json, assessed_at, expiry, reason, created_at)`：迁移 v8；一行一次评估，只追加不覆盖；读取与恢复按原始答案及当时规则版本重算核对。
 - `allocation_targets(id, template_version, rule_version, level, classes_json, assessment_id, assessed_at, assessment_expiry, effective_from, created_at)`：迁移 **v9**（5C，D-048）；一行一个目标版本，**只追加不回写**，自然键 `(assessment_id, template_version, effective_from)` 唯一索引兜底；`level` 与六类 `minBps/targetBps/maxBps` 全部由服务端按「该评估的 `ceiling` + 5A 冻结模板」派生后封存，并记住所引用的评估（`assessment_id` 为 `ON DELETE RESTRICT`）。两条读取路径都按「模板版本 + 等级 + 所引用评估」重算核对。
 - `approved_instruments(id, asset_class, instrument_id, position, created_at, updated_at)`：迁移 **v9**（5C）；「资产类别 → 用户认可标的」白名单，一行一条，`position` 是用户给的类别内优先级。`UNIQUE(instrument_id)`（一个标的只属一个类别）与 `UNIQUE(asset_class, position)` 由显式唯一索引承载；`instrument_id` 为 `ON DELETE RESTRICT`，删除标的必须先显式解除用户映射。**只有用户判断写入本表**：行情与目录 provider 的刷新/确认路径不触碰这里任何一列。引用完整性在读取时判定（标的缺失 / 分类回到 suggested / 类别不一致 → 保留原行并给出 `issues`）。
-- `decisions(id, snapshot_id, state, recommendation_json, explanation_version, reason, created_at, updated_at)`。
-- `decision_events(id, decision_id, from_state, to_state, note, occurred_at)`。
+- `decisions(id, recommendation_id, state, last_seq, created_at, updated_at)`：迁移 **v11**（6A 契约，尚未实现）；一行一条决策，`recommendation_id` **UNIQUE** 且 `ON DELETE RESTRICT`（一条建议最多一条决策），`state ∈ proposed/accepted/deferred/dismissed/executed/reviewed/archived`。**不复制建议金额与理由**：金额读建议记录，理由 / actor / 快照只在事件上，避免两份可分叉的真相。
+- `decision_events(id, decision_id, seq, from_state, to_state, reason_code, note, occurred_at, recorded_at, actor, snapshot_json, snapshot_hash, payload_hash)`：迁移 **v11**；一行一次状态跳转，`UNIQUE(decision_id, seq)`（seq 每条决策内从 1 连续递增），`occurred_at` 是**本地日**事件月归属键，`recorded_at` 是 ISO 时刻，`actor` 恒为 `local-user`，`snapshot_json` 为 `canonicalJson` 且 `snapshot_hash = SHA-256` 原文；读取时哈希与 `seq` 链式一致性同时复核，任一失败即 `invalid_decision_record`（fail closed，不"修好"返回）。
+- `decision_links(id, decision_id, security_event_id, linked_on, linked_at, note, unlinked_on, unlinked_at, unlink_note)`：迁移 **v11**；**软删除**关联行，`unlinked_on IS NULL` 表示活动；`security_event_id ON DELETE RESTRICT`，部分唯一索引 `uq_decision_links_active(security_event_id) WHERE unlinked_on IS NULL` 保证一条证券事件同时只属一条决策（可解绑后重挂）。只允许 `buy` 事件，只允许在 `accepted`/`executed` 状态关联。
 
 ### 5.4 现金流
 
@@ -177,6 +190,7 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 - 初始持仓快照与后续证券事件不能重复贡献数量或成本。
 - 每个报价和汇率必须携带数据日期、抓取时间、来源和状态。
 - 每次正式建议必须绑定不可变快照、规则版本与风险评估版本。
+- 决策状态只由显式命令推进，不按金额相等自动判定；`id`/`seq`/`state`/时间/`actor`/快照等派生值由服务端生成，载荷中出现即 400。
 - 删除财务事实优先使用可审计的软删除；月结快照和决策事件不得级联丢失。
 
 ### 5.6 建议的最小 API 面
@@ -209,7 +223,19 @@ POST   /api/v1/risk-assessments
 GET    /api/v1/risk-assessments
 GET    /api/v1/risk-assessments/current?asOf=
 POST   /api/v1/recommendations
+POST   /api/v1/decisions
+  # 6A 契约，6B 实现：键白名单 recommendationId / intent / note；intent ∈ accepted|deferred|dismissed
+  #   → 409 illegal_transition、recommendation_not_formal、recommendation_stale；422 unknown_recommendation
 POST   /api/v1/decisions/{id}/events
+  # 现为 501 not_implemented；6B 实现真实行为（键 toState / note）
+POST   /api/v1/decisions/{id}/links
+  # 6D：只接受 buy；409 event_already_linked / illegal_state_for_link / invalid_link_target；422 unknown_security_event
+POST   /api/v1/decisions/{id}/links/unlink
+  # 6D：软删除留痕，note 必填；409 link_not_active
+GET    /api/v1/decisions?state=&month=&recommendationId=&from=&to=
+  # 月度按 decision_events.occurred_at 本地事件月；复核失败行不返回，计入 invalidCount
+GET    /api/v1/decisions/{id}
+  # 返回 decision + 完整 events 时间线 + links + 快照 + execution；复核失败 → 400 invalid_decision_record
 POST   /api/v1/backups
 POST   /api/v1/restores
 ```

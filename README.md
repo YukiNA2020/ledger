@@ -4,11 +4,11 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 
 ## 当前状态
 
-- 当前版本 **`2.4.23-ui-polish`**，SQLite **schema v10**。按用户要求，Phase 6 前先完成了**桌面优先、天空蓝背景的前端改版**：宽屏侧栏、资产决策台分区、卡片/表单/弹层统一视觉；业务算法、API、数据结构不变。预览见 [桌面截图](./docs/evidence/desktop-redesign-20260928/dashboard-fixture-desktop.png)（虚构 fixture）。Phase 5 在用户明确排除 G5-R4 的范围内已复验通过；原定完整验收仍缺四问理解的实际计时，Phase 6 未开始。详见 [Phase 5 全阶段独立验证](./PHASE5_REVIEW.md) §9。
+- 当前版本 **`2.4.23-ui-polish`**，SQLite **schema v10**。按用户要求，Phase 6 前先完成了**桌面优先、天空蓝背景的前端改版**：宽屏侧栏、资产决策台分区、卡片/表单/弹层统一视觉；业务算法、API、数据结构不变。预览见 [桌面截图](./docs/evidence/desktop-redesign-20260928/dashboard-fixture-desktop.png)（虚构 fixture）。Phase 5 在用户明确排除 G5-R4 的范围内已复验通过；原定完整验收仍缺四问理解的实际计时。**2026-09-28 Phase 6A 完成**：规则与契约冻结在 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（D-057）——7 状态 44 有序对状态机（新增终态 `archived`）、buy-only 交易关联、三时点快照、迁移 v11 与备份/回滚方案；零业务代码，版本与 schema 不变，当前阶段为 6B。详见 [Phase 5 全阶段独立验证](./PHASE5_REVIEW.md) §9。
 - 已实现风险问卷、目标配置与认可标的维护、确定性新增资金分配、正式建议门禁及本机建议封存。资金来自已有投资现金，转配不增加投资池总额；建议绑定完整计算输入，可离线重算。决策台首页新增只读风险上限摘要：双评分与等级、最终上限及来源、硬封顶、评估/到期日与有效状态；以及只读六类配置对照：当前金额/比例、目标区间、偏离与数据日，缺目标或缺估值时给出原因与目标页入口。目标页建议结果补齐类别排序依据、现金保底/未分配、认可标的与未映射待办、尾差、默认不卖出的具体原因，正式/估算标签与 blocker 直接取 5D 产物。解释性概念收敛为本地知识卡（稳定 id + 解释版本，离线静态文本，不构成建议），页面按已知 id 链接、未知 id 显式降级。建议详情可区分月结基准、计算日输入与解释版本：新建议在 gate 区封存生成时解释版本，旧建议未封存时显式标注「当前卡片解释，非生成时封存版本」，重复生成绝不倒填（D-052）。
 - 普通页面保存与 JSON 备份恢复覆盖月结、全部快照、评估、目标、映射和建议。原有记账、账单导入与收益归因回归通过。
 - 2026-09-28 补口复验：全量 **648/648**、受影响定向 **87/87**、记账/导入回归 **79/79**、干净浏览器 wiring **34/34 × 3**（18785×2、18786，外部请求 0）且三项审计探针全绿；两条反例脚本当前 `reference-review.cjs` **5/5、exit 0**、`browser-review.py` **pass**（此前应退出 1）。2026-09-27 的 631/631、定向 142/142、独立评分 13,312 组与分配 5,000 组为上一截面。
-- 桌面细节优化已获认可；[Phase 6 开发拆解](./PHASE6_BREAKDOWN.md) 已完成，下一步由用户交给其他 agent 执行 6A。业务开发未开始；G5-R4 安排到 6E-3，是 6F 最终验收门禁。见 [工作 Agent 入口](./NEXT_AGENT.md)。
+- 桌面细节优化已获认可；[Phase 6 开发拆解](./PHASE6_BREAKDOWN.md) 已完成，6A 契约已冻结，下一步由其他 agent 执行 **6B「状态机、事件、存储与 API」**。业务代码仍未开始；G5-R4 安排到 6E-3，是 6F 最终验收门禁。见 [工作 Agent 入口](./NEXT_AGENT.md)。
 - 保留既有未决项：Phase 4A 的 D-038/T-002 行情源门禁未闭合，自动行情仍关闭；S2.3 的真实 macOS 重启/登录验证、真实月结耗时验收未完成。本轮复核不代表上述历史门禁或整个 MVP 已验收。
 
 ## 产品一句话
@@ -43,6 +43,7 @@ Ledger 是一个只为单一用户服务的 Mac 本地财务决策工具。它�
 - [DECISIONS.md](./DECISIONS.md)：已确认决策、假设、延期项与变更规则。
 - [ACCEPTANCE.md](./ACCEPTANCE.md)：跨阶段验收场景、测试数据和发布门禁。
 - [NEXT_AGENT.md](./NEXT_AGENT.md)：下一位执行 Agent 的当前任务、边界和可复制指令。
+- [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)：Phase 6 冻结契约（6A 交付，6B～6F 的唯一规则来源）。
 - [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md)：Phase 6 顺序任务、验收、R4 延后安排与 agent 指令。
 - [PHASE5E_BREAKDOWN.md](./PHASE5E_BREAKDOWN.md)：5E 的六个顺序小任务及逐项退出证据。
 - [STATUS.md](./STATUS.md)：旧版开发状态与历史证据；新状态以本 README 和 ROADMAP 为准。
@@ -93,4 +94,4 @@ node docs/evidence/phase5d-wiring-server.cjs 8499
 
 ## 下一步
 
-下一开发入口是 Phase 6A「规则与契约」，见 [拆解与可复制指令](./PHASE6_BREAKDOWN.md)。G5-R4 在 6E-3 补齐，未通过不得宣告 6F 完整验收通过。
+下一开发入口是 Phase 6B「状态机、事件、存储与 API」：规则以 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md) 为准，任务与可复制指令见 [拆解](./PHASE6_BREAKDOWN.md) §4/§10。G5-R4 在 6E-3 补齐，未通过不得宣告 6F 完整验收通过。
