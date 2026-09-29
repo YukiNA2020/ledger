@@ -5,7 +5,7 @@
 
 ## 最新计划（2026-09-28）
 
-**6A「规则与契约」已完成**：权威文本 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)，决策 D-057，零业务代码、零迁移、零页面；§8 已按冻结口径更新。下一入口 **6B 状态与存储**；[拆解文档](./PHASE6_BREAKDOWN.md) 定义逐项任务。G5-R4 延后到 6E-3，不阻塞 6A～6D，仍是 6F 最终验收必过项。以下较早截面保留历史证据，不定义当前任务顺序。
+**6A「规则与契约」已完成**：权威文本 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)，决策 D-057，零业务代码、零迁移、零页面；§8 已按冻结口径更新（2026-09-29 复核勘误六处实现口径冲突，见契约头部与 D-057 勘误）。下一入口 **6B 状态与存储**；[拆解文档](./PHASE6_BREAKDOWN.md) 定义逐项任务。G5-R4 延后到 6E-3，不阻塞 6A～6D，仍是 6F 最终验收必过项。以下较早截面保留历史证据，不定义当前任务顺序。
 
 ## 当前验收截面（2026-09-28 补口进展）
 
@@ -548,8 +548,8 @@ Phase 5 退出证据：相同输入重复计算结果一致；每条建议能展
 七个状态：`proposed / accepted / deferred / dismissed / executed / reviewed / archived`。
 
 - 允许（**恰好 6 条**）：`proposed → accepted/deferred/dismissed`、`accepted → executed`、`accepted → archived`、`executed → reviewed`。
-- 拒绝（**其余 38 个有序对**，含全部自转移）：`proposed → executed/reviewed/archived`、`executed → accepted/reviewed` 之外的逆向、`deferred/dismissed/archived/reviewed → *` 一切出口、`accepted → deferred/dismissed/reviewed`、任意 `X → X`。
-- **验收必须数据驱动遍历全部 7×6 = 44 个有序对**，不得只抽样代表样例：合法 → 状态改变且恰好追加 1 条事件；非法 → HTTP 409 `illegal_transition` 且状态、事件数、关联数逐项不变（事务整体回滚）。
+- 拒绝（**其余 43 个有序对**，含全部 7 条自转移）：`proposed → executed/reviewed/archived`、`executed → accepted/reviewed` 之外的逆向、`deferred/dismissed/archived/reviewed → *` 一切出口、`accepted → deferred/dismissed/reviewed`、任意 `X → X`。
+- **验收必须数据驱动遍历全部 7×7 = 49 个有序对（含自转移）**，不得只抽样代表样例：合法 → 状态改变且恰好追加 1 条事件；非法 → HTTP 409 `illegal_transition` 且状态、事件数、关联数逐项不变（事务整体回滚）。
 - **`deferred → accepted` 永久非法**：暂缓 / 忽略是归档出口，只进历史不进待执行清单；事实变化后由规则引擎生成新建议（新 `inputHash` → 新 id）再走新决策。同一 `recommendationId` 重复创建返回既有决策（`created:false`），不改状态、不追加事件。
 - **只有 `status === 'formal'` 的建议能创建决策**：估算建议 → 409 `recommendation_not_formal`，不进待执行清单、不可接受。接受时服务端独立重核 `Domain.adviceStaleness`，失效 → 409 `recommendation_stale`；客户端角标不作为授权依据。`deferred`/`dismissed` 创建不做重核。
 - `intent` 白名单只有 `accepted|deferred|dismissed`；出现 `executed|reviewed|archived|proposed` → 409 `illegal_transition` 且**不创建任何决策行**。
@@ -564,7 +564,7 @@ Phase 5 退出证据：相同输入重复计算结果一致；每条建议能展
 - 进度只反映事实、不改状态：`remainingMinor = 建议金额 − Σ(按各自交易日 as-of 汇率折 CNY 的 buy 本金)`；缺汇率按"有偏差"处理并记录 `fxUnavailable`，**不按 1:1 / 期末汇率 / 伪 0 兜底**。
 - `accepted → executed` 要求活动关联 ≥1（否则 409 `no_linked_events`）且显式命令推进，**不按金额相等自动判定**；有偏差必须 `note`（否则 400 `deviation_note_required`）。
 - **无交易必须能关闭**：0 元建议 / 全部保留现金 / 接受后放弃 → `accepted → archived`（活动关联必须为 0，否则 409 `has_linked_events`），理由必填（`no_trade` / `abandoned`），**不得伪造 0 元证券交易、不得用零关联的 `executed` 顶替**；归档不进复盘。
-- 实际交易复用既有证券事件，关联和重试不得重复创建交易、不得改写 `security_events`、不得写入 `txns` 或自动扣减现金；删除仍被活动关联引用的事件 → 409 `linked_event_missing` 且整笔回滚。现金仍按原规则人工核对（`cashReconciled := !freshness.balanceStale`），不自动扣减或重复计入。
+- 实际交易复用既有证券事件，关联和重试不得重复创建交易、不得改写 `security_events`、不得写入 `txns` 或自动扣减现金；删除曾被任何关联行（活动或已解绑）引用的事件 → 409 `linked_event_missing` 且整笔回滚。现金仍按原规则人工核对（`cashReconciled := !freshness.balanceStale`），不自动扣减或重复计入。
 - 记事实 ≠ 重新批准建议：给失效建议补记已发生的交易**允许**，但不会改变决策状态，也不会重算建议金额。
 
 ### S6.3 复盘、历史与恢复
@@ -584,7 +584,7 @@ Phase 5 退出证据：相同输入重复计算结果一致；每条建议能展
 
 6B 必须**逐条更新** `tests/domain-phase5a.test.js 5A-18`（`LATEST_VERSION` 10 → 11）、`server-api.test.js` / `server-phase3.test.js` 的 501 断言、`tests/server-phase5d.test.js`（改为断言 `recommendations` 仍无状态列）、`tests/domain-phase5d.test.js 5D-24`（Phase 6 代码放新段落并**新增**同形状守卫，5D 边界只移动不删断言）与备份/迁移/伴随集合断言（6 → 9）。**禁止删用例换绿色**；逐条改断言并在注释写明原因。清单见契约 §11。
 
-Phase 6 退出证据：使用两套独立虚构建议完整跑通两次“建议—决定—交易记录—复盘”（含分批与跨月，即契约 F-A / F-B），§10.2 的 28 条反向清单、44 个有序对全遍历、幂等/并发、迁移/恢复、旧功能及浏览器回归通过，G5-R4 已完成。逐项清单见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) §8；本节新增项目均为待验收要求，未宣告实现。
+Phase 6 退出证据：使用两套独立虚构建议完整跑通两次“建议—决定—交易记录—复盘”（含分批与跨月，即契约 F-A / F-B），§10.2 的 28 条反向清单、49 个有序对全遍历、幂等/并发、迁移/恢复、旧功能及浏览器回归通过，G5-R4 已完成。逐项清单见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) §8；本节新增项目均为待验收要求，未宣告实现。
 
 ## 9. MVP 两个月验收
 

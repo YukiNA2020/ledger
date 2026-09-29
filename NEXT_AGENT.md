@@ -6,7 +6,7 @@
 
 先按 AGENTS.md 必读顺序阅读，再读 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md) 与 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md)（6B 范围见拆解 §4，必须显式更新的守卫测试见契约 §11）。ROADMAP「唯一当前阶段」为任务指针。下一位 agent 完成 6B 后才能交给 6C，不要一次实现整个 Phase 6。
 
-6B 要点（细节以契约为准）：迁移 v11 建 `decisions` / `decision_events` / `decision_links` 三表；转移校验用数据驱动测试**全遍历 44 个有序对**（契约 §1.2 即期望值）；`POST /api/v1/decisions/{id}/events` 从 501 占位改为真实行为；伴随集合 6 → 9、`CLEAR_ORDER` 头部插三表；备份 `REQUIRED_*[11]` 登记并补上「部分唯一索引被换成普通索引」的对称拒止；幂等记录与业务写入同一事务。只做状态机与存储，不做决定页面（6C）与交易关联 UI（6D）。
+6B 要点（细节以契约为准）：迁移 v11 建 `decisions` / `decision_events` / `decision_links` 三表；转移校验用数据驱动测试**全遍历 49 个有序对（含自转移）**（契约 §1.2 即期望值）；`POST /api/v1/decisions/{id}/events` 从 501 占位改为真实行为；伴随集合 6 → 9、`CLEAR_ORDER` 头部插三表；备份 `REQUIRED_*[11]` 登记并补上「部分唯一索引被换成普通索引」的对称拒止；幂等记录与业务写入同一事务。只做状态机与存储，不做决定页面（6C）与交易关联 UI（6D）。
 
 ## G5-R4 不再阻塞前半程
 

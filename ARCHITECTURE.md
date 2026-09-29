@@ -14,7 +14,7 @@
 
 6A 只冻结规则与契约，**未写任何业务代码、未迁移、未改页面**；本文件 §5.3 的 `decisions` / `decision_events` / `decision_links` 与 §5.6 的 Phase 6 接口已由草图改为**冻结目标**，权威文本是 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（决策记录 D-057）：
 
-- 状态机 7 状态（新增终态 `archived`）× 6 = 44 个有序对，合法 6 / 非法 38；`deferred` 不可回跳。6B 必须全遍历。
+- 状态机 7 状态（新增终态 `archived`）完整矩阵 7×7 = 49 个有序对，合法 6 / 非法 43（含自转移）；`deferred` 不可回跳。6B 必须全遍历。
 - 迁移 **v11 `phase6-decisions`** 目标：三张表 + `UNIQUE(recommendation_id)` + `UNIQUE(decision_id, seq)` + 部分唯一索引 `uq_decision_links_active ... WHERE unlinked_on IS NULL`；备份 `REQUIRED_TABLES/INDEXES/COLUMNS_BY_VERSION[11]` 登记，并**对称补上"部分索引被换成普通索引"的拒止校验**。
 - 伴随集合由 6 扩为 9（增 `decisions` / `decisionEvents` / `decisionLinks`），`CLEAR_ORDER` 头部插三表；旧备份缺键恢复空历史不变。
 - 复盘三时点快照结构、17 个错误码→HTTP 映射、幂等与快照哈希复核、正反向 fixture 清单与 **6B 必须显式更新的阶段范围守卫测试**（§11）都在契约里。

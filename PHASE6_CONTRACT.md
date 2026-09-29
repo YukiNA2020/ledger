@@ -1,6 +1,7 @@
 # Phase 6 契约（6A 冻结稿）
 
 > 2026-09-28；执行子阶段：**6A 规则与契约**。基线代码 `2.4.23-ui-polish` / SQLite **v10**。
+> **2026-09-29 复核勘误**（不改四条已确认产品口径，只修实现口径）：①有序对计数为完整矩阵 **7×7 = 49**（合法 6 / 非法 43，含自转移）；②`RESTRICT` + 软删除 ⇒ 曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 修正为 20 × 100.00 = 2,000.00 本金；④归档理由 `no_trade` / `abandoned` 补按关联历史的可判定规则；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥§4.4 `reason` 公式补 `available` 判定。明细见 DECISIONS D-057 勘误。
 > 顺序入口：[ROADMAP.md](./ROADMAP.md)；任务来源：[PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) §3；执行入口：[NEXT_AGENT.md](./NEXT_AGENT.md)。
 > **本文件是 6A～6F 的唯一规则来源。** 与本文件冲突的旧文档、旧测试注释或代码注释，一律以本文件为准，并按 §11 更新；发现本文件未覆盖的分歧，先在本文件补一条规则再实现，不得在代码里就地裁定。
 
@@ -62,9 +63,9 @@ archived   已归档放弃（终态，6A 新增）
 | **reviewed** | × | × | × | × | × | × | × |
 | **archived** | × | × | × | × | × | × | × |
 
-- 合法跳转 **6** 条，非法跳转 **38** 条，合计 7×6 = 44 个有序对。
+- 合法跳转 **6** 条，非法跳转 **43** 条（含 7 条自转移），合计 **7×7 = 49 个有序对**（上表为含自转移的完整矩阵；若不计自转移则为 7×6 = 42 个，合法 6 / 非法 36）。2026-09-29 勘误：原稿「7×6 = 44、非法 38」为计数错误。
 - 与 ACCEPTANCE S6.1 的原始矩阵完全一致，只在 `accepted` 行新增 `→ archived` 一条（DECISIONS D-057）。
-- **6B 必须写一个数据驱动测试，遍历全部 44 个有序对**：合法 → 状态改变且恰好追加 1 条事件；非法 → HTTP 409 `illegal_transition` 且状态、事件条数、关联条数全部不变。上表即该测试的期望值，不得只测几个代表样例。
+- **6B 必须写一个数据驱动测试，遍历全部 49 个有序对（含自转移）**：合法 → 状态改变且恰好追加 1 条事件；非法 → HTTP 409 `illegal_transition` 且状态、事件条数、关联条数全部不变。上表即该测试的期望值，不得只测几个代表样例。
 
 ### 1.3 合法跳转例子
 
@@ -176,7 +177,7 @@ archived   已归档放弃（终态，6A 新增）
   - 已活动关联到**另一决策** → **409 `event_already_linked`**；
   - 不做跨决策拆单，不做一条事件分摊给多条决策。
 - 关联允许的状态：**仅 `accepted` 与 `executed`**。在 `proposed` / `deferred` / `dismissed` / `reviewed` / `archived` 关联或解绑 → **409 `illegal_state_for_link`**。
-- `decision_links.security_event_id` 为 `ON DELETE RESTRICT` 外键：**删除仍被活动关联引用的证券事件必须先解绑**，否则整笔写入拒绝 → **409 `linked_event_missing`**（由仓储在写入前显式检查并给出稳定码，不得让 SQLite 外键错误冒充 500）。
+- `decision_links.security_event_id` 为 `ON DELETE RESTRICT` 外键，且解绑是软删除（关联行保留、外键引用随之保留）：**曾被任何关联行（活动或已解绑）引用过的证券事件一律不可物理删除**；全量写入省略该行 → 整体拒绝 **409 `linked_event_missing`**（由仓储在写入前显式检查全部关联行并给出稳定码，不得让 SQLite 外键错误冒充 500）。2026-09-29 勘误：原稿「删除仍被活动关联引用的事件必须先解绑」与 `RESTRICT` 语义矛盾——解绑后行仍在，删除依旧被拒。从未被关联过的事件不受本条约束（沿用 Phase 4C 既有行为）。
 - 未知事件 → **422 `unknown_security_event`**；解绑一条非活动关联 → **409 `link_not_active`**；解绑必须带 `note`。
 
 ### 3.3 金额、进度与偏差
@@ -202,6 +203,7 @@ archived   已归档放弃（终态，6A 新增）
 
 - 解绑 = 把 `decision_links` 行标记 `unlinked_on` + `unlink_note`（必填），**不删除行、不追加第二条状态事件**；历史由关联行自身保留（"追加更正而非擦除"的落地形式）。
 - 解绑后该事件可重新关联到任意决策（部分唯一索引只约束活动行）。
+- 解绑不删除关联行，外键引用随之保留——**解绑不会使证券事件变得可删除**（§3.2）。
 - 解绑后决策的 `state` **不变**；若解绑导致活动关联归零且决策仍在 `accepted`，决策照常可归档（L5）或继续接受新关联。
 - `reviewed` 之后任何关联 / 解绑请求 → 409 `illegal_state_for_link`（复盘不可静默改变）。
 
@@ -303,8 +305,11 @@ archived   已归档放弃（终态，6A 新增）
 ```text
 cashReconciled = !overview.freshness.balanceStale
 available       = (overview.canAdvise === true) && cashReconciled
-reason          = cashReconciled ? 'valuation_not_formal' : 'cash_not_reconciled'
+reason          = available ? null
+                  : (cashReconciled ? 'valuation_not_formal' : 'cash_not_reconciled')
 ```
+
+- `available === true` 时 `reason` 恒为 `null`（§4.2 示例即此情形）。2026-09-29 勘误：原公式缺 `available` 判定，会把可比快照也写成 `valuation_not_formal`。
 
 - `available === false` → `netWorthMinor` / `investableTotalMinor` / `classes` **全部为 `null`**，`reason` 与 `blockers` 解释原因；**任何情况下都不输出伪 0、伪收益**。
 - `reason` 词表冻结为两个值：`cash_not_reconciled`、`valuation_not_formal`；`blockers` 沿用 `computeOverview` 的既有码（`quote_missing` / `quote_stale` / `fx_stale` / `fx_missing` / `classification_unconfirmed` / `balance_stale` / `close_incomplete` …），**不另造第二套 blocker 码**。
@@ -316,7 +321,7 @@ reason          = cashReconciled ? 'valuation_not_formal' : 'cash_not_reconciled
 每次读取（列表、详情、`/state`、备份恢复）必须复核，任一条不过即 fail closed：
 
 1. `sha256(snapshot_json) === snapshot_hash`；
-2. 事件序列完整：`seq` 从 1 连续递增、首条 `from_state = 'proposed'`、每条 `from_state` = 上一条 `to_state`、末条 `to_state = decisions.state`、`decisions.last_seq = max(seq)`；
+2. 事件序列完整：**`state = 'proposed'` 且 `last_seq = 0` 的零事件决策是合法空序列**（§1.3 两步式创建；尚无任何事件，也**没有任何快照**——快照随事件封存，此时详情 `snapshots` 各时点为 `null`）。其余情况必须有事件，且 `seq` 从 1 连续递增、首条 `from_state = 'proposed'`、每条 `from_state` = 上一条 `to_state`、末条 `to_state = decisions.state`、`decisions.last_seq = max(seq)`；
 3. `decision_events.actor = 'local-user'`、`from_state/to_state` 都在 §1.1 词表内；
 4. `decisions.recommendation_id` 指向的建议存在且记录复核通过（G5-R1 同口径）；
 5. 每条活动 `decision_links` 的 `security_event_id` 指向存在的 `buy` 事件。
@@ -390,7 +395,7 @@ CREATE UNIQUE INDEX uq_decision_links_active
 设计依据（写进迁移注释）：
 
 - `recommendation_id` 是 `ON DELETE RESTRICT` **活动外键**（与 `recommendations.assessment_id` 同口径）：有决策引用时建议删不掉。这与 `close_id` 的「审计引用不设外键」不同——因为建议与决策总是在同一个事务集合里被清空与重建，顺序可控（见 §6.4）。
-- `security_event_id` 同样 `RESTRICT`：**不允许存在指向已消失交易的活动关联**。
+- `security_event_id` 同样 `RESTRICT`：解绑是软删除，关联行与其外键引用都保留，**不允许存在指向已消失交易的关联行（活动或已解绑）**——因此曾被关联过的证券事件一律不可物理删除（§3.2，2026-09-29 勘误）。
 - `CHECK` 只挡结构（状态词表、actor、JSON 类型、seq 域）；逐字段语义、链式一致性与「快照被改」在仓储 / 领域唯一实现里复核（D-044 ③ 的同一取舍）。
 - `decisions` 不存 `reason_code` / `note` / `actor`：这些只在事件上，读取按 `last_seq` 取，避免两份可分叉的真相。列表需要时用 `seq = last_seq` 的 join。
 - **旧库前向迁移后三张表为空，不伪造任何历史决策**（与 v8 / v10 同口径）。
@@ -415,7 +420,7 @@ reviewed_with_drift       executed → reviewed 且六类金额或比例与执�
 reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 ```
 
-`reason_code` 由**服务端**根据动作与计算结果得出，客户端不可指定；用户的自由文本理由走 `note`。
+`reason_code` 由**服务端**根据动作与计算结果得出，客户端不可指定；用户的自由文本理由走 `note`。两个归档理由的**可判定规则**（2026-09-29 补充，原稿未给出）：`no_trade` = 该决策自创建以来从未存在过任何 `decision_links` 行（活动与已解绑均为 0，即从未关联过买入）；`abandoned` = 曾有过关联行、后全部解绑再归档。判定只读关联历史，不由客户端提交；两种情形都要求活动关联 = 0（§3.5）。
 
 ### 6.4 写入顺序与全量写入
 
@@ -457,7 +462,7 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 | `link_not_active` | 409 | 解绑一条非活动关联 |
 | `illegal_state_for_link` | 409 | 在非 `accepted`/`executed` 状态关联或解绑 |
 | `invalid_link_target` | 409 | 关联非 `buy` 事件 |
-| `linked_event_missing` | 409 | 全量写入删除了仍被活动关联引用的事件 |
+| `linked_event_missing` | 409 | 全量写入删除（省略）了曾被任何关联行（活动或已解绑）引用的事件，或写入的关联指向不存在的事件 |
 | `idempotency_conflict` | 409 | 同 `Idempotency-Key` 不同请求体（沿用） |
 | `unknown_recommendation` | 422 | 载荷中的 `recommendationId` 不存在 |
 | `unknown_security_event` | 422 | 载荷中的 `securityEventId` 不存在 |
@@ -653,7 +658,7 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 |---|---|---|
 | 1 | 正式建议 `rec-A`（2,000.00 CNY → `broad_equity`，映射 `VOO`） | 存在、`status=formal` |
 | 2 | `POST /decisions` `intent=accepted` + note | `dec-A` accepted，1 事件，决策时点快照 `available:true` |
-| 3 | 新建 1 笔 `buy`（10 × 100.00 CNY，fee 5.00）→ `POST .../links` | 活动关联 1，进度 100% |
+| 3 | 新建 1 笔 `buy`（20 × 100.00 CNY，fee 5.00）→ `POST .../links` | 活动关联 1，进度 100%（本金 2,000.00 = 建议金额；2026-09-29 勘误：原稿 10 × 100.00 与建议 2,000.00 不符） |
 | 4 | 核对现金余额（消除 `balance_stale`） | `cashReconciled:true` |
 | 5 | `POST .../events` `toState=executed`，`diff=0` | `reason=executed_as_planned`，执行时点快照封存 |
 | 6 | `POST .../events` `toState=reviewed` + note | `reason=reviewed_*`，复盘时点快照封存，三快照齐全 |
@@ -671,7 +676,7 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 
 ### 10.2 反向清单（每条都必须有独立用例）
 
-1. §1.2 的 **44 个有序对全遍历**（6 合法 / 38 非法）；
+1. §1.2 的 **49 个有序对全遍历**（6 合法 / 43 非法，含自转移）；
 2. `intent` 取 `executed` / `reviewed` / `archived` / `proposed` → 409，且**不创建决策行**；
 3. estimate 建议创建 → `recommendation_not_formal`；
 4. 未知 `recommendationId` → `unknown_recommendation`；未知 `securityEventId` → `unknown_security_event`；
@@ -689,12 +694,12 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 16. 制造 `seq` 断链、`decisions.state` ≠ 末事件 `to_state`、`actor ≠ local-user` → `invalid_decision_record`；
 17. 恢复**缺三键的旧 JSON 备份** → 决策为空历史，不从活库保留、不伪造；
 18. **普通五键保存** → 三集合保留（G5C-1 同类回归）；显式 `decisions: []` → 清空；非数组 → 400；
-19. 全量写入删除被活动关联引用的 `security_event` → `linked_event_missing` 整体回滚；
+19. 全量写入删除**曾被任何关联行（活动或已解绑）引用**的 `security_event` → `linked_event_missing` 整体回滚；软解绑后再删同样拒绝；
 20. 缺汇率的关联 → executed 走 `executed_deviation` + `fxUnavailable` 非空，**不按 1:1 兜底**；
 21. 现金未核对 → 复盘快照 `available:false` + `reason=cash_not_reconciled`，数字字段全 `null`；
 22. 缺报价 / 过期价格 / 分类未确认 → `available:false` + `valuation_not_formal` + 既有 blockers；
 23. 0 投资池 → `available:true`、`pctBps/band/deviationBps = null`、金额为 0，**不算不可比**；
-24. 0 元建议 → `accepted` → `archived`（`no_trade`），**不存在任何证券交易**，不进复盘历史；
+24. 0 元建议 → `accepted` → `archived`（从未关联过事件 → `no_trade`），**不存在任何证券交易**，不进复盘历史；曾有关联、全部解绑后归档 → `abandoned`（§6.3 判定规则）；
 25. 月度归属：月底边界（本地 10-31 vs UTC 11-01）、回填交易日早于操作时间、跨月事件、空月份；
 26. 迁移：v10 → v11 空表；v11 库二次迁移幂等；迁移中途失败整体回滚；
 27. 备份结构：缺表 / 缺必需索引 / 缺必需列 / **部分唯一索引被换成普通索引** → 拒绝恢复且活库不变；

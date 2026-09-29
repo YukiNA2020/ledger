@@ -1,8 +1,13 @@
 # 变更日志
 
+## 2026-09-29 6A 契约复核勘误（产品版本不变）
+
+- 独立复核发现并修正冻结契约的六处实现口径冲突（不改四条已确认产品口径；明细见 `PHASE6_CONTRACT.md` 头部与 DECISIONS D-057 勘误）：①状态矩阵计数为完整 7×7 = 49 个有序对（合法 6 / 非法 43，含自转移），原稿 44/38 有误；②`RESTRICT` 外键 + 软删除解绑下，曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 本金修正为 20 × 100.00 = 2,000.00；④归档理由 `no_trade` / `abandoned` 补按关联历史的可判定规则；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥快照 `reason` 公式补 `available` 判定。计数与语义同步 ACCEPTANCE / ROADMAP / README / NEXT_AGENT / ARCHITECTURE / PHASE6_BREAKDOWN / DECISIONS。
+- 零代码改动，全量 `node --test` **648/648**；6A 勘误后维持通过，交 6B。
+
 ## 2026-09-28 Phase 6A 规则与契约冻结（产品版本不变）
 
-- 新建 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（13 节，6B～6F 的唯一规则来源）：7 状态 × 6 = 44 个有序对状态机（新增终态 `archived`，合法 6 / 非法 38）、buy-only 交易关联与分批/偏差/纠错口径、决策/执行/复盘三时点快照结构与完整性复核、迁移 v11 与备份/回滚方案、F-A/F-B 两套正向闭环与 28 条反向 fixture 清单、6B 必须显式更新的守卫测试清单；拆解提出的 8 条歧义全部裁定，未决项 0（D-057）。
+- 新建 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（13 节，6B～6F 的唯一规则来源）：7 状态完整矩阵 49 个有序对状态机（新增终态 `archived`，合法 6 / 非法 43，含自转移）、buy-only 交易关联与分批/偏差/纠错口径、决策/执行/复盘三时点快照结构与完整性复核、迁移 v11 与备份/回滚方案、F-A/F-B 两套正向闭环与 28 条反向 fixture 清单、6B 必须显式更新的守卫测试清单；拆解提出的 8 条歧义全部裁定，未决项 0（D-057）。
 - 同步 PRODUCT §9、DECISIONS（新增 D-057）、ARCHITECTURE（6A 契约增量、§5.3 三表冻结、§5.5 不变量、§5.6 API 面）、ACCEPTANCE §8（S6.1～S6.5）、ROADMAP（当前阶段 → 6B）、README / NEXT_AGENT / AGENTS / PHASE6_BREAKDOWN / 本文件。
 - 零业务代码、零迁移、零页面、零数据文件；版本保持 `2.4.23-ui-polish`、schema v10，全量 `node --test` **648/648** 无回归。G5-R4 仍安排在 6E-3，是 6F 最终验收门禁。
 

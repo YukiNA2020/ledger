@@ -400,11 +400,11 @@ Phase 4 拆成 4A–4E。**每次执行任务只领取一个子阶段**；当前
 
 目标：完成个人决策闭环。
 
-状态：**6A 已完成（2026-09-28，零代码，交付 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)）；6B～6F 未实施**。详细任务、验收、交接指令见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md)。
+状态：**6A 已完成（2026-09-28 冻结，2026-09-29 复核勘误后通过；零代码，交付 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)）；6B～6F 未实施**。详细任务、验收、交接指令见 [PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md)。
 
 | 顺序 | 子阶段 | 退出条件 | 状态 |
 |---|---|---|---|
-| 6A | 规则与契约 | 状态、关联、复盘口径及迁移方案明确，无规则歧义 | ✅ **2026-09-28**：`PHASE6_CONTRACT.md` 冻结 44 有序对状态机（含新终态 `archived`）、buy-only 关联、三时点快照、v11/备份/回滚、F-A/F-B 正向与 28 条反向清单、§11 守卫测试清单；PRODUCT / DECISIONS(D-057) / ARCHITECTURE / ACCEPTANCE / ROADMAP / README / NEXT_AGENT / AGENTS / CHANGELOG / 本表同步；**零业务代码、零迁移、零页面**，基线仍 `2.4.23-ui-polish` / v10 |
+| 6A | 规则与契约 | 状态、关联、复盘口径及迁移方案明确，无规则歧义 | ✅ **2026-09-28**（09-29 复核勘误后通过）：`PHASE6_CONTRACT.md` 冻结 49 有序对状态机（含新终态 `archived`，合法 6 / 非法 43）、buy-only 关联、三时点快照、v11/备份/回滚、F-A/F-B 正向与 28 条反向清单、§11 守卫测试清单；PRODUCT / DECISIONS(D-057) / ARCHITECTURE / ACCEPTANCE / ROADMAP / README / NEXT_AGENT / AGENTS / CHANGELOG / 本表同步；**零业务代码、零迁移、零页面**，基线仍 `2.4.23-ui-polish` / v10 |
 | 6B | 状态机、事件、存储与 API | 合法/非法跳转、事务、幂等、迁移和恢复通过 | 未开始（**下一入口**） |
 | 6C | 接受、暂缓、忽略与待执行页面 | 三类决定真实可用，刷新一致，失败不假成功 | 未开始 |
 | 6D | 实际交易关联与执行 | 复用证券事件，无重复入账，分批与偏差可追溯 | 未开始 |
