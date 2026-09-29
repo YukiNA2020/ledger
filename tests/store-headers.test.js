@@ -235,3 +235,75 @@ test('saveAll 用单次 PUT 请求服务端原子保留未显式集合，显式�
     Store.resetDetection();
   }
 });
+
+/* ------------------------- Phase 6C：决策 API 封装契约 -------------------------
+ * 页面只呈现服务端状态（拆解 §5），封装层必须把请求送到契约约定的路径、
+ * 带上事件端点必需的 Idempotency-Key（事件端点没有自然幂等，契约 §8.6），
+ * 并在服务不可达时显式失败 —— 「读取失败」绝不能被包装成空列表冒充「没有决策」。 */
+test('6C 决策封装：路径与查询参数、事件端点幂等键、列表/详情只读不带令牌', async () => {
+  Store.resetDetection();
+  calls.length = 0;
+  try {
+    await Store.listDecisions({ state: 'accepted', month: '2026-10' });
+    let c = lastCall();
+    assert.strictEqual(c.init.method, 'GET');
+    assert.ok(c.url.endsWith('/api/v1/decisions?state=accepted&month=2026-10'), '过滤参数必须进查询串');
+    assert.ok(headerKeys(c.init).indexOf('x-ledger-token') === -1, '读列表不带令牌');
+
+    await Store.decisionDetail('dec-9a8b7c6d5e4f3021');
+    c = lastCall();
+    assert.ok(c.url.endsWith('/api/v1/decisions/dec-9a8b7c6d5e4f3021'), '详情走路径参数');
+    assert.strictEqual(c.init.method, 'GET');
+
+    await Store.createDecision(
+      { recommendationId: 'rec-3f2a9c1b7d4e5f60', intent: 'accepted', note: '按建议执行' },
+      { idempotencyKey: 'dec-key-1' }
+    );
+    c = lastCall();
+    assert.strictEqual(c.init.method, 'POST');
+    assert.ok(c.url.endsWith('/api/v1/decisions'), '创建走集合路径');
+    assert.strictEqual(c.init.headers['Idempotency-Key'], 'dec-key-1', '创建必须透传幂等键');
+    assert.strictEqual(c.init.headers['X-Ledger-Token'], TOKEN, '写入必须带会话令牌');
+    assert.deepStrictEqual(JSON.parse(c.init.body),
+      { recommendationId: 'rec-3f2a9c1b7d4e5f60', intent: 'accepted', note: '按建议执行' },
+      '载荷按契约 §8.1 原样提交（页面不预判门禁）');
+
+    await Store.appendDecisionEvent('dec-9a8b7c6d5e4f3021', { toState: 'executed', note: '偏差说明' },
+      { idempotencyKey: 'dev-key-1' });
+    c = lastCall();
+    assert.ok(c.url.endsWith('/api/v1/decisions/dec-9a8b7c6d5e4f3021/events'), '事件走子资源路径');
+    assert.strictEqual(c.init.headers['Idempotency-Key'], 'dev-key-1',
+      '事件端点没有自然幂等，页面必须带 Idempotency-Key（双击保护的服务端兜底）');
+  } finally {
+    Store.resetDetection();
+  }
+});
+
+test('6C 决策读取在服务不可达时显式失败，不冒充空列表', async () => {
+  const origFetch = globalThis.fetch;
+  Store.resetDetection();
+  try {
+    // 无令牌（file:// 直开）→ 本地模式：listDecisions / decisionDetail 必须抛错，
+    // 让页面显示「读取失败 + 重试」，而不是把「读不到」渲染成「还没有决策」。
+    const originalQuery = globalThis.document.querySelector;
+    globalThis.document.querySelector = () => null;
+    globalThis.fetch = () => { throw new Error('本地模式不应发请求'); };
+    Store.resetDetection();
+    await assert.rejects(() => Store.listDecisions(), (err) => err.code === 'unreachable');
+    await assert.rejects(() => Store.decisionDetail('dec-9a8b7c6d5e4f3021'), /本地服务未运行/);
+    globalThis.document.querySelector = originalQuery;
+
+    // API 模式下写封装在服务不可达后进入只读降级：写入被显式拒绝（requireWriteMode 口径）
+    globalThis.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+    Store.resetDetection();
+    await Store.listDecisions().catch(() => null); // 触发探测失败 → 降级只读
+    await assert.rejects(
+      () => Store.createDecision({ recommendationId: 'rec-x' }, { idempotencyKey: 'k' }),
+      /只读模式/
+    );
+    assert.strictEqual(Store.info().readonly, true);
+  } finally {
+    globalThis.fetch = origFetch;
+    Store.resetDetection();
+  }
+});

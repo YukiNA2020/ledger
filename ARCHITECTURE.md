@@ -1,8 +1,22 @@
 # Ledger 架构设计
 
+## 2026-09-29 Phase 6C 决策页面
+
+当前 `2.4.25-phase6c-fix1` / schema v11（**零迁移**：只新增前端与封装层，不改 6B 的表、API 与状态机）。前端新增第 18 条路由 `decisions`（侧栏「决策空间」分组与资产决策台首页各一个入口），只读服务端结果，不重算建议金额、状态或门禁。
+
+- `js/store.js` 决策封装：`listDecisions(filters)`（过滤进查询串、读取不带会话令牌）、`decisionDetail(id)`、`createDecision(payload, {idempotencyKey})`、`appendDecisionEvent(id, payload, {idempotencyKey})`（写入带 `X-Ledger-Token` 与 `Idempotency-Key`；事件端点无自然幂等，靠键防双击）。服务不可达时显式抛错，**不把失败包装成空列表**。
+- `js/app.js` 页面状态：`decItems / decTotal / decInvalidCount / decLoaded / decLoading / decError / decRequest / decStateFilter / decDetail / decDetailError / decDetailSeq / decSheetRec / decNoteDraft / decBusy / decSubmitError / decSubmitSeq`。渲染顺序为「服务不可达提示 → 读取失败 → 首帧读取中 → 已读到的清单」，**读取失败优先于读取中**，避免失败落回空态冒充「还没有决策」；重新读取期间在清单标题旁显示 `data-dec-reloading`，不清空旧列表。
+- 慢响应守卫：读取用 `decRequest`、提交用 `decSubmitSeq`、详情读取用 `decDetailSeq` 单调序号，序号不一致的响应直接丢弃，晚到的旧读取不得覆盖已读到的新状态；详情根节点与读取中 / 失败体均标 `data-dec-detail-id`，便于断言当前展示的是哪一条（拆解 §5「防慢响应」）。`decDetailSeq` 是 2026-09-29 用户报出缺陷的补口：此前详情无守卫，先开 A 再开 B 时 A 的慢响应会把弹层覆盖回 A，弹层关闭后晚到还会重弹。
+- 两类弹层：决定弹层（`dec:open` / `dec:submit`，含来源、判定日、解释、失效提示、必填理由与三意图按钮）与详情弹层（`dec:detail`，原建议、理由、事件时间线、时点快照折叠入口）。均走既有 `openSheet`，窄屏按钮换行不横向溢出。
+- 样式新增 `.dec-chip / .dec-card / .dec-snap` 与 `[data-dec-entry]`、`[data-decide-sheet]`、`[data-dec-detail]` 的换行规则；`sw.js` 缓存键同步为 `ledger-v2.4.25-phase6c-fix1`（fix1 为 2026-09-29 详情慢响应缺陷补口后的递增，静态资源缓存优先，必须换键才触达已装旧 `js/app.js` 的机器）。
+
+## 2026-09-29 Phase 6B 实现与二次复测补口
+
+当前 `2.4.24-phase6b` / schema v11。决策列表按行复核并以 `invalidCount` 留痕，详情对所请求记录返回 400；`GET /state` 是全量事实出口，必须先复核全部决策、事件与关联行，任一无效即 400 `invalid_decision_record`，不返回部分状态。v11 SQLite 候选备份在切换前使用同一复核，校验 `snapshot_json` **原始字节**的 SHA-256、canonicalJson、事件链、建议引用及活动 buy 关联；损坏候选拒绝且活库不变。恢复有效备份时先保存损坏活库的取证快照，但该快照不能作为有效恢复候选。测试见 `tests/server-phase6.test.js` 6B-27/28，全量 677/677。
+
 ## 2026-09-23 当前实现增量
 
-当前 `2.4.23-ui-polish` / schema v10，Phase 5（排除 G5-R4）限定范围复验通过。以下旧日期截面不代表当前缺失功能。
+当时 `2.4.23-ui-polish` / schema v10，Phase 5（排除 G5-R4）限定范围复验通过。以下旧日期截面不代表当前缺失功能。
 
 - `server/recommendations.js`：纯计算编排，复用 Domain 的估值、偏离、分配、映射、正式门禁。无外部依赖，不访问网络、数据库或隐式时钟。
 - `recommendations.gate_json.capture`：封存完整计算输入，算法版本 `cash-reallocation-v1`；与原始月结快照并存。`input_hash` 识别全部输入，`payload_hash` 识别结果记录；读取进行结构校验、重放与月结快照引用核对。历史旧记录缺 capture 时保留但标记未验证。
@@ -166,14 +180,14 @@ Phase 2 起，前端所有持久化读写必须经 `js/store.js` 门面，禁止
 
 ### 5.3 结账与决策
 
-Phase 6 的 `decisions` / `decision_events` / `decision_links` 及相关接口由 6A 于 2026-09-28 冻结为契约，见 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（D-057）；**6B 按该契约建表，不得另改字段**。不得把目标当成已有 schema，也不得另建一份可变建议金额作为事实源。
+Phase 6 的 `decisions` / `decision_events` / `decision_links` 及相关接口由 6A 冻结为契约，见 [PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（D-057）；**6B 已按该契约建表并迁移至 v11**。不得另建一份可变建议金额作为事实源。
 
 - `monthly_closes(id, month, status, completed_at, data_cutoff)`。
 - `snapshots(id, close_id?, captured_at, snapshot_type, payload_hash)`。
 - `risk_assessments(id, rule_version, answers_json, capacity_score, willingness_score, capacity_level, willingness_level, risk_ceiling, ceiling_source, hard_caps_json, explain_codes_json, assessed_at, expiry, reason, created_at)`：迁移 v8；一行一次评估，只追加不覆盖；读取与恢复按原始答案及当时规则版本重算核对。
 - `allocation_targets(id, template_version, rule_version, level, classes_json, assessment_id, assessed_at, assessment_expiry, effective_from, created_at)`：迁移 **v9**（5C，D-048）；一行一个目标版本，**只追加不回写**，自然键 `(assessment_id, template_version, effective_from)` 唯一索引兜底；`level` 与六类 `minBps/targetBps/maxBps` 全部由服务端按「该评估的 `ceiling` + 5A 冻结模板」派生后封存，并记住所引用的评估（`assessment_id` 为 `ON DELETE RESTRICT`）。两条读取路径都按「模板版本 + 等级 + 所引用评估」重算核对。
 - `approved_instruments(id, asset_class, instrument_id, position, created_at, updated_at)`：迁移 **v9**（5C）；「资产类别 → 用户认可标的」白名单，一行一条，`position` 是用户给的类别内优先级。`UNIQUE(instrument_id)`（一个标的只属一个类别）与 `UNIQUE(asset_class, position)` 由显式唯一索引承载；`instrument_id` 为 `ON DELETE RESTRICT`，删除标的必须先显式解除用户映射。**只有用户判断写入本表**：行情与目录 provider 的刷新/确认路径不触碰这里任何一列。引用完整性在读取时判定（标的缺失 / 分类回到 suggested / 类别不一致 → 保留原行并给出 `issues`）。
-- `decisions(id, recommendation_id, state, last_seq, created_at, updated_at)`：迁移 **v11**（6A 契约，尚未实现）；一行一条决策，`recommendation_id` **UNIQUE** 且 `ON DELETE RESTRICT`（一条建议最多一条决策），`state ∈ proposed/accepted/deferred/dismissed/executed/reviewed/archived`。**不复制建议金额与理由**：金额读建议记录，理由 / actor / 快照只在事件上，避免两份可分叉的真相。
+- `decisions(id, recommendation_id, state, last_seq, created_at, updated_at)`：迁移 **v11**（6B 已实现）；一行一条决策，`recommendation_id` **UNIQUE** 且 `ON DELETE RESTRICT`（一条建议最多一条决策），`state ∈ proposed/accepted/deferred/dismissed/executed/reviewed/archived`。**不复制建议金额与理由**：金额读建议记录，理由 / actor / 快照只在事件上，避免两份可分叉的真相。
 - `decision_events(id, decision_id, seq, from_state, to_state, reason_code, note, occurred_at, recorded_at, actor, snapshot_json, snapshot_hash, payload_hash)`：迁移 **v11**；一行一次状态跳转，`UNIQUE(decision_id, seq)`（seq 每条决策内从 1 连续递增），`occurred_at` 是**本地日**事件月归属键，`recorded_at` 是 ISO 时刻，`actor` 恒为 `local-user`，`snapshot_json` 为 `canonicalJson` 且 `snapshot_hash = SHA-256` 原文；读取时哈希与 `seq` 链式一致性同时复核，任一失败即 `invalid_decision_record`（fail closed，不"修好"返回）。
 - `decision_links(id, decision_id, security_event_id, linked_on, linked_at, note, unlinked_on, unlinked_at, unlink_note)`：迁移 **v11**；**软删除**关联行，`unlinked_on IS NULL` 表示活动；`security_event_id ON DELETE RESTRICT`，部分唯一索引 `uq_decision_links_active(security_event_id) WHERE unlinked_on IS NULL` 保证一条证券事件同时只属一条决策（可解绑后重挂）。只允许 `buy` 事件，只允许在 `accepted`/`executed` 状态关联。
 
@@ -227,7 +241,7 @@ POST   /api/v1/decisions
   # 6A 契约，6B 实现：键白名单 recommendationId / intent / note；intent ∈ accepted|deferred|dismissed
   #   → 409 illegal_transition、recommendation_not_formal、recommendation_stale；422 unknown_recommendation
 POST   /api/v1/decisions/{id}/events
-  # 现为 501 not_implemented；6B 实现真实行为（键 toState / note）
+  # 6B 已实现真实行为（键 toState / note）；非法跳转 409，事件与状态同事务提交
 POST   /api/v1/decisions/{id}/links
   # 6D：只接受 buy；409 event_already_linked / illegal_state_for_link / invalid_link_target；422 unknown_security_event
 POST   /api/v1/decisions/{id}/links/unlink

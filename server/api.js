@@ -441,8 +441,12 @@ function createHandler(ctx) {
   };
 
   api['GET /api/v1/state'] = (req, res) => {
-    const state = R.readState(ctx.db);
-    sendJson(res, 200, state, { 'X-Ledger-Schema': String(migrations.currentVersion(ctx.db)) });
+    try {
+      const state = R.readState(ctx.db);
+      sendJson(res, 200, state, { 'X-Ledger-Schema': String(migrations.currentVersion(ctx.db)) });
+    } catch (err) {
+      return upsertFailDispatcher(err, res);
+    }
   };
 
   api['PUT /api/v1/state'] = async (req, res) => {

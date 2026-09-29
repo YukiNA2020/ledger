@@ -2262,8 +2262,14 @@ function validateDecisionWithIntegrity(db, decision, events, links, validRecomme
   const chain = Domain.validateDecisionEventChain(decision, events);
   if (!chain.ok) return chain;
   for (const event of chain.events) {
+    // 哈希绑定的是 snapshot_json 的原始 UTF-8 字节。仅把 JSON 解析后重新 canonicalize
+    // 会放过空白/键序被改动的原文，/state 和备份恢复都不能接受这种篡改（契约 §4.2/§4.5）。
+    const stored = get(db, 'SELECT snapshot_json FROM decision_events WHERE id = ?', [event.id]);
+    if (!stored || stored.snapshot_json !== canonicalJson(event.snapshot)) {
+      return { ok: false, error: { code: 'invalid_decision_record', detail: '快照原文不是封存的 canonicalJson：' + event.id } };
+    }
     if (Domain.DECISION_HASH_RE.test(event.snapshotHash) !== true ||
-        decisionSnapshotHash(event.snapshot) !== event.snapshotHash) {
+        sha256Hex(stored.snapshot_json) !== event.snapshotHash) {
       return { ok: false, error: { code: 'invalid_decision_record', detail: '快照原文与封存哈希不一致：' + event.id } };
     }
     if (decisionEventPayloadHash(event) !== event.payloadHash) {
@@ -2309,6 +2315,31 @@ function readValidatedDecisions(db) {
     out.push(checked);
   });
   return { items: out, invalidCount: invalidCount, total: decisions.length };
+}
+
+// /state 与备份是全量事实入口：一条坏决策、无法解析的事件/关联或孤儿行都必须
+// 整体拒绝，不能像列表视图一样只排除坏行并返回其余数据（契约 §4.5）。
+function assertDecisionHistoryValid(db) {
+  let view;
+  try {
+    view = readValidatedDecisions(db);
+  } catch (err) {
+    throw Object.assign(new Error('决策历史无法复核：' + (err && err.message ? err.message : String(err))), {
+      code: 'invalid_decision_record'
+    });
+  }
+  const count = (table) => get(db, 'SELECT COUNT(*) AS n FROM ' + table).n;
+  const decisionCount = count('decisions');
+  const eventCount = count('decision_events');
+  const linkCount = count('decision_links');
+  const validEvents = view.items.reduce((n, item) => n + item.events.length, 0);
+  const validLinks = view.items.reduce((n, item) => n + item.links.length, 0);
+  if (view.invalidCount || view.total !== decisionCount || view.items.length !== decisionCount ||
+      validEvents !== eventCount || validLinks !== linkCount) {
+    throw Object.assign(new Error('决策历史复核失败：存在无效决策、事件或关联行'), {
+      code: 'invalid_decision_record'
+    });
+  }
 }
 
 // 全量写入（PUT /state / JSON 恢复）：三集合逐条复核，任一条非法整体回滚，绝不静默丢行。
@@ -2486,7 +2517,10 @@ function normalizeAssets(raw, explicitlyProvided) {
 }
 
 // 读取全量状态，形状与前端 DB.loadRaw() 完全一致
-function readState(db) {
+function readState(db, options) {
+  // 决策列表与详情有各自的逐行降级规则：列表排除坏行并计 invalidCount，详情只验证
+  // 所请求的行。只有这些已验证的只读视图可跳过全库闸门；/state 一律严格复核。
+  if (!(options && options.decisionView === true)) assertDecisionHistoryValid(db);
   const blob = readTxnsBlob(db);
   return {
     accounts: readAccounts(db),
@@ -3302,6 +3336,7 @@ module.exports = {
   updateDecisionForRow,
   writeDecisions,
   readValidatedDecisions,
+  assertDecisionHistoryValid,
   validateDecisionWithIntegrity,
   decisionSnapshotHash,
   decisionEventPayloadHash

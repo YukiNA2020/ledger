@@ -42,7 +42,9 @@ try:
         report["checks"] = page.locator("#results li").all_text_contents()
         print(report["summary"], flush=True)
         assert report["result"] == "pass", report["checks"]
-        assert len(report["checks"]) == 34
+        # Phase5 复验原本 34 项；Phase 6C 追加 2 项「决策与待执行」浏览器接线检查（36 项）：
+        # 6C 决定/清单/详情/门禁/慢响应，以及详情弹层慢响应不覆盖后打开的另一条。
+        assert len(report["checks"]) == 36
         assert not report["externalRequests"]
         assert not report["pageErrors"]
 
@@ -55,7 +57,13 @@ try:
         page.wait_for_selector('[data-advice-result][data-advice-status="formal"]')
         before = page.locator('[data-advice-result]').inner_text()
         for count in (1, 0):
-            page.locator('[data-action="map:remove"][data-cls="broad_equity"]').first.click()
+            # 目标页异步重绘会替换同一按钮；从当前 DOM 取元素触发真实委托点击，
+            # 避免 Playwright 等旧节点稳定时无限重试 detached 元素。
+            page.evaluate("""() => {
+                const button = document.querySelector('[data-action="map:remove"][data-cls="broad_equity"]');
+                if (!button) throw new Error('缺少宽基映射移除按钮');
+                button.click();
+            }""")
             page.wait_for_function("n => document.querySelectorAll('[data-action=\"map:remove\"][data-cls=\"broad_equity\"]').length === n", arg=count)
         mapping_probe = page.evaluate("""async () => {
             const current = await Store.allocationCurrent();
@@ -66,7 +74,7 @@ try:
         mapping_probe["unchangedAfterRevocation"] = mapping_probe["adviceText"] == before
         report["mappingRevocationProbe"] = mapping_probe
         print('Mapping revocation probe: ' + json.dumps({k:v for k,v in mapping_probe.items() if k != 'adviceText'}, ensure_ascii=False), flush=True)
-        page.locator('[data-advice-result]').screenshot(path=str(OUT / f"revoked-mapping-{port}.png"))
+        page.screenshot(path=str(OUT / f"revoked-mapping-{port}.png"))
 
         # A real API update followed by the product's refresh button.
         report["staleUpdateStatus"] = page.evaluate("""async () => {

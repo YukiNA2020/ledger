@@ -577,6 +577,59 @@
     });
   }
 
+  /* ------------------------- Phase 6C：决策与待执行（D-057） -------------------------
+   * 页面只呈现服务端状态、金额与门禁（拆解 §5）；状态转移的合法性、接受门禁与快照
+   * 全部由服务端唯一实现，这里不做任何本地判定。列表/详情在服务不可达时显式抛错：
+   * 「读取失败」绝不能冒充「还没有决策」（空态与失败是两件事）。
+   * 事件端点没有自然幂等（同载荷第二次即非法跳转），页面必须带 Idempotency-Key（契约 §8.6）。 */
+  function listDecisions(params) {
+    var p = params || {};
+    var q = [];
+    if (p.state) q.push('state=' + encodeURIComponent(p.state));
+    if (p.month) q.push('month=' + encodeURIComponent(p.month));
+    if (p.recommendationId) q.push('recommendationId=' + encodeURIComponent(p.recommendationId));
+    if (p.from) q.push('from=' + encodeURIComponent(p.from));
+    if (p.to) q.push('to=' + encodeURIComponent(p.to));
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        var err = new Error('本地服务未运行，无法读取决策');
+        err.code = 'unreachable';
+        throw err;
+      }
+      return apiFetch('/decisions' + (q.length ? '?' + q.join('&') : ''), { token: false });
+    });
+  }
+
+  function decisionDetail(id) {
+    return detect().then(function (current) {
+      if (current === MODE_LOCAL) {
+        var err = new Error('本地服务未运行，无法读取决策详情');
+        err.code = 'unreachable';
+        throw err;
+      }
+      return apiFetch('/decisions/' + encodeURIComponent(id), { token: false });
+    });
+  }
+
+  // 创建决策（intent 缺省 = 两步式 proposed；页面一步式给出 accepted/deferred/dismissed + note）。
+  function createDecision(payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/decisions', { method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey });
+    });
+  }
+
+  // 追加状态事件（accepted → executed/archived、executed → reviewed 属 6D/6E 入口；
+  // 6C 页面只在两步式场景需要它，封装先行以复用同一幂等纪律）。
+  function appendDecisionEvent(decisionId, payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/decisions/' + encodeURIComponent(decisionId) + '/events', {
+        method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
   return {
     MODE_UNKNOWN: MODE_UNKNOWN,
     MODE_API: MODE_API,
@@ -615,6 +668,10 @@
     setApprovedInstruments: setApprovedInstruments,
     createRecommendation: createRecommendation,
     listRecommendations: listRecommendations,
+    listDecisions: listDecisions,
+    decisionDetail: decisionDetail,
+    createDecision: createDecision,
+    appendDecisionEvent: appendDecisionEvent,
     COMPANION_KEYS: COMPANION_KEYS
   };
 });

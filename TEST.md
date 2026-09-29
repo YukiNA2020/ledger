@@ -6,7 +6,12 @@
 
 ## 当前结论
 
-2026-09-29 Phase 6B `2.4.24-phase6b`：决策状态机、事件与存储（D-057 契约落地）。全量 `node --test` **675/675**（648 基线 + 新增 `tests/domain-phase6.test.js` 10 项 + `tests/server-phase6.test.js` 16 项 + 新增 Phase 6 段落范围守卫 1 项）。要点：
+2026-09-29 Phase 6C `2.4.25-phase6c-fix2`：**全量 `node --test` 679/679**（6B 基线 677 + 6C 新增 2 项 `tests/store-headers.test.js` 决策封装契约）；**浏览器 wiring 36 项 × 2 轮全绿**（19041、19047，均为隔离临时库 + 干净 Chromium profile；19047 由 `browser-review.py` 跑出，含撤销映射 / 行情过期 / 断网知识卡三项审计探针，`externalRequests=[]`、`pageErrors=[]`、`auditPassed=true`）；**三档宽度与状态 64 项**（18 路由 × 1440/1100/390 的 54 项 + 决定弹层与详情弹层各 3 档共 6 项 + 读取中 / 读取失败 / 重试后空态 / 接受成功 4 项状态）全部通过。`node --check` 与 `git diff --check` 通过。证据与复跑脚本见 `docs/evidence/phase6-6c-20260929/`（`run_wiring_6c.py`、`run_width_6c.py`、`wiring-run-*.json`、`width-result.json`、截图），浏览器审计证据见 `docs/evidence/phase5-review-20260927/browser-19047.json`。`browser-review.py` 的数量契约已按拆解 §9 由 34 同步为 36（原 34 项语义与断言全部保留）。6C 覆盖要点：
+
+- 第 35 项 wiring 检查覆盖：接受 / 暂缓 / 忽略三类决定真实可用且刷新后与服务端一致；重复点击与晚到响应不重复创建（`Idempotency-Key`）；失效建议接受被拒、估算建议不可进入决定；读取中（首帧与重新读取）、读取失败（HTTP 500 → 显式失败卡 + 重试，不冒充空态）、重试恢复空态；慢响应的旧读取不覆盖已读到的新状态；详情含原建议、理由、时间线与快照入口。
+- 第 36 项 wiring 检查覆盖（用户报出的缺陷及 fix2 补口）：详情弹层 `openDecisionDetail` 慢响应 —— 先开 A 再开 B、A 的响应最后返回时，弹层不得被覆盖回 A；读取中途关闭弹层，晚到的详情不得重新弹出；关闭 A 后立即打开「新增账户」弹层，A 的晚到响应也不得覆盖它。`state.decDetailSeq` 在打开详情与关闭弹层时递增，旧响应直接丢弃。
+- 注意测试口径：模拟「读取失败」必须返回 HTTP 500，不能让 `fetch` 网络层 reject——后者会触发 `markUnreachable()` 降级为本地模式，测到的是另一个分支。
+- 2026-09-29 Phase 6B `2.4.24-phase6b` 二次复测补口（历史截面）：隔离虚构数据复现 `/state` 泄露坏快照与恢复接受坏备份；补入 6B-27/28 反例后定向 **18/18**、全量 `node --test` **677/677**。`/state` 现在对整库决策历史 fail closed（400 `invalid_decision_record`，不返回数据）；列表仍按行排除并计 `invalidCount`，详情仍为 400。v11 候选备份在切换前复核快照 JSON 原文字节哈希、事件链、建议引用和活动关联；损坏候选返回 `restore_failed`，活库不变。有效备份可恢复损坏活库，恢复前保留的取证快照仍被普通备份校验拒绝。此前 675/675 是补口前基线，不能证明这两条路径。原 6B 覆盖要点：
 
 - **49 个有序对数据驱动全遍历**（契约 §1.2）：合法 6 恰好追加 1 条事件；非法 43 全部 409 `illegal_transition` 且状态、事件数、关联数逐项不变（事务整体回滚）。
 - 创建门禁实测：estimate → `recommendation_not_formal`、未知建议 → 422 `unknown_recommendation`、intent 白名单（executed/reviewed/archived/proposed → 409 且零落库）、派生键载荷 400、note 必填、同建议重复创建 `created:false`。
@@ -19,7 +24,7 @@
 - 守卫测试按契约 §11 逐条更新（5A-18 → v11、server-api / server-phase3 的 501 → 真实路由行为、server-phase5d 表结构断言、5D-24 边界下移 + 新增 Phase 6 段落守卫、store-headers 九伴随、server-migration v11 结构与空表）。
 - **三项隔离反例驱动修复**（6B-24～26，复核发现）：①损坏（封存哈希不一致）的建议不能创建**任何**决策——创建校验改用与建议列表完全同一份读取视图结果，不再只做形状复核；②活动关联指向的事件被篡改为非 buy 时，**列表排除该行并计入 invalidCount**（§4.5 第 5 条并入共享读取复核），不再整页失败，详情保持 400；③日期区间 from/to 改为**逐事件** occurred_at 判断，中间事件日的决策不再被漏掉。
 - F-B 正向闭环按契约原样重写（6B-16）：5,000 元建议、10 月 CNY 20 × 100.00、11 月 HKD 30 × 100.00 × 汇率 0.9 = 2,700、本金合计 4,700.00、diff −300.00、`eventMonths = ["2026-10","2026-11"]`、清空到空库后恢复逐字段一致；缺汇率 null 语义独立成 6B-23。
-- 本轮未改任何页面行为（`js/app.js` 仅版本号），浏览器 wiring（34 项）留待 6C 页面交付时一并运行；`node --check` 与 `git diff --check` 通过。
+- 本轮未改任何页面行为（`js/app.js` 仅版本号），浏览器 wiring（34 项）留待 6C 页面交付时一并运行（已于 6C 执行，现为 36 项 × 2 轮）；`node --check` 与 `git diff --check` 通过。
 
 2026-09-28 UI 细节修复 `2.4.23-ui-polish`：全量 **648/648**，浏览器 **34/34**；1440/1100/390px 的 17 个页面无装饰表情、无横向溢出，月份标题无裁切且前后切换正常；分类/账户/筛选弹层通过，分类编辑保存保留原有图标字段。证据与可复跑脚本见 `docs/evidence/ui-polish-20260928/`。
 

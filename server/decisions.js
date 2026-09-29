@@ -465,7 +465,7 @@ function decisionListItem(db, entry, recMap, view, assetsSig, securityEvents, fx
 // 契约 §8.3：列表 = 有效决策（复核失败行计入 invalidCount，不冒充可用），过滤参数互为与关系，
 // 排序 updatedAt 降序 → id 升序（与数据库行序无关）。
 function decisionListResponse(db, query, ctx) {
-  const state = R.readState(db);
+  const state = R.readState(db, { decisionView: true });
   const today = ctx.today;
   const overview = Domain.computeOverview(state.assets, { now: today, settings: state.settings || {} });
   const view = buildTargetsView(db, state, today, overview);
@@ -551,7 +551,7 @@ function decisionDetailResponse(db, decisionId, ctx) {
     decisionFail('invalid_decision_record', '决策复核失败：' + checked.error.detail);
   }
 
-  const state = R.readState(db);
+  const state = R.readState(db, { decisionView: true });
   const today = ctx.today;
   const overview = Domain.computeOverview(state.assets, { now: today, settings: state.settings || {} });
   const view = buildTargetsView(db, state, today, overview);

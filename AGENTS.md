@@ -16,7 +16,7 @@
 
 `Ledger_Plan.md`、`Ledger_PRD.md`、`Ledger_Implementation_Roadmap.md`、`STATUS.md` 和 `docs/stages/` 是 v1/v2 历史资料。内容冲突时，以本文件及上述 v3 文档为准。
 
-当前代码实现至 v3 Phase 5（`2.4.23-ui-polish` / schema v10），桌面天空蓝与细节优化已获用户认可。Phase 5 排除 G5-R4 的限定范围复验通过，原完整验收仍待真人计时。**Phase 6A 已于 2026-09-29 二次复测修正后完成：规则与契约冻结在 `PHASE6_CONTRACT.md`（D-057），零业务代码、零迁移、零页面；下一位 agent 只领取 6B，照契约实现、不得就地改规则。G5-R4 安排到 6E-3，不阻塞前半程，但必须在 6F 最终验收前通过。** 详见 `PHASE6_CONTRACT.md`、`PHASE6_BREAKDOWN.md`、`PHASE5_REVIEW.md` §9～§10 与 `NEXT_AGENT.md`。开始任务前在 `ROADMAP.md` 找到唯一当前阶段，只实现该子阶段交付物，不把规划误写成已实现。
+当前代码实现至 v3 Phase 6C（`2.4.25-phase6c-fix2` / schema v11），桌面天空蓝与细节优化已获用户认可。Phase 5 排除 G5-R4 的限定范围复验通过，原完整验收仍待真人计时。**Phase 6A 契约冻结在 `PHASE6_CONTRACT.md`（D-057）；6B 状态机、事件、存储与 API 已于 2026-09-29 二次复测补口后通过；6C 决定与待执行页面已于 2026-09-29 完成，全量测试 679/679、浏览器 wiring 36 项 × 2 轮、18 路由 × 3 宽度通过。下一位 agent 只领取 6D，复用 6B 服务端 API 与 6C 页面资产，不得就地改契约规则。G5-R4 安排到 6E-3，不阻塞前半程，但必须在 6F 最终验收前通过。** 详见 `PHASE6_CONTRACT.md`、`PHASE6_BREAKDOWN.md`、`PHASE5_REVIEW.md` §9～§10 与 `NEXT_AGENT.md`。开始任务前在 `ROADMAP.md` 找到唯一当前阶段，只实现该子阶段交付物，不把规划误写成已实现。
 
 ## 产品范围
 

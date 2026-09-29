@@ -10,7 +10,7 @@
  *   - §6.4 全量写入：伴随集合 6 → 9（缺键清空 / preserve 保留 / 显式空集合清空 / 非数组拒绝）、
  *     引用完整性、删除被关联引用的事件 → linked_event_missing、活动关联唯一；
  *   - §4.5 读取复核：篡改快照原文 / seq 断链 / 状态与事件链不一致 → invalidCount 留痕、
- *     详情 400 invalid_decision_record，活库不变；
+ *     详情与 /state 400 invalid_decision_record；损坏候选备份在切换前拒止、活库不变；
  *   - §9 / §10 F-A / F-B：两套闭环 fixture（单笔同月无偏差、分批跨月有偏差 + 备份恢复往返）、
  *     月度归属（本地事件月）、迁移 v10→v11 空表、备份结构校验（部分唯一索引对称拒止）。
  * 全部离线：注入 today / nowIso，零真实网络，不读取私人账本。
@@ -1071,6 +1071,89 @@ test('6B-26 日期区间按逐事件判断（复核反例）：中间事件日�
     assert.deepStrictEqual(none.items, [], '区间外为空');
     const oct = (await get(srv.port, '/api/v1/decisions?month=2026-10')).json;
     assert.strictEqual(oct.items.length, 1, '月度过滤同样按事件月命中');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6B-27 篡改快照在 /state 与备份恢复前拒止；有效备份仍可恢复损坏活库', async () => {
+  const ctx = setup('ledger-p6q-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const decisionId = (await post(srv.port, '/api/v1/decisions', {
+      recommendationId: rec.id, intent: 'accepted', note: '恢复校验反例'
+    })).json.decision.id;
+    const valid = await post(srv.port, '/api/v1/backups', {});
+    assert.strictEqual(valid.status, 201, JSON.stringify(valid.json));
+    const validName = valid.json.backup.name;
+    const validPath = path.join(ctx.paths.backupDir, validName);
+
+    // 候选备份结构仍完整，唯独封存快照内容被改：必须在校验阶段拒绝，活库不切换。
+    const tamperedName = 'ledger-phase6b-corrupt-candidate.db';
+    const tamperedPath = path.join(ctx.paths.backupDir, tamperedName);
+    fs.copyFileSync(validPath, tamperedPath);
+    const DatabaseSync = require('node:sqlite').DatabaseSync;
+    const candidate = new DatabaseSync(tamperedPath);
+    candidate.prepare("UPDATE decision_events SET snapshot_json = json_set(snapshot_json, '$.netWorthMinor', 1)").run();
+    candidate.close();
+    const check = B.validateBackupFile(tamperedPath);
+    assert.strictEqual(check.ok, false, '快照篡改的 v11 备份不得通过候选校验');
+    assert.match(check.reason, /决策历史复核失败/);
+    const rejected = await post(srv.port, '/api/v1/restores', { file: tamperedName });
+    assert.strictEqual(rejected.status, 409, JSON.stringify(rejected.json));
+    assert.strictEqual(rejected.json.error.code, 'restore_failed');
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions/' + decisionId)).status, 200,
+      '候选失败不能破坏原来的有效活库');
+
+    // 活库被同样篡改：列表可显式留痕，但 /state 必须整份拒绝，不能泄露坏快照。
+    const live = new DatabaseSync(ctx.paths.dbFile);
+    live.prepare("UPDATE decision_events SET snapshot_json = json_set(snapshot_json, '$.netWorthMinor', 1)").run();
+    live.close();
+    const list = (await get(srv.port, '/api/v1/decisions')).json;
+    assert.strictEqual(list.invalidCount, 1);
+    const detail = await get(srv.port, '/api/v1/decisions/' + decisionId);
+    assert.strictEqual(detail.status, 400);
+    assert.strictEqual(detail.json.error.code, 'invalid_decision_record');
+    const state = await get(srv.port, '/api/v1/state');
+    assert.strictEqual(state.status, 400, JSON.stringify(state.json));
+    assert.strictEqual(state.json.error.code, 'invalid_decision_record');
+    assert.strictEqual(state.json.decisionEvents, undefined, '无效快照不能进入 /state 响应');
+
+    // 恢复有效备份时仍保存旧库的取证快照；该快照自身不能冒充有效候选。
+    const restored = await post(srv.port, '/api/v1/restores', { file: validName });
+    assert.strictEqual(restored.status, 200, JSON.stringify(restored.json));
+    assert.strictEqual((await get(srv.port, '/api/v1/state')).status, 200);
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions/' + decisionId)).status, 200);
+    const forensic = path.join(ctx.paths.backupDir, restored.json.preRestoreBackup);
+    assert.strictEqual(B.validateBackupFile(forensic).ok, false, '恢复前损坏快照只供取证，不得当作有效备份');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6B-28 快照 JSON 原文字节被改但解析值不变时，同样不得通过读取和备份校验', async () => {
+  const ctx = setup('ledger-p6r-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const decisionId = (await post(srv.port, '/api/v1/decisions', {
+      recommendationId: rec.id, intent: 'accepted', note: '原文字节反例'
+    })).json.decision.id;
+    const DatabaseSync = require('node:sqlite').DatabaseSync;
+    const raw = new DatabaseSync(ctx.paths.dbFile);
+    const original = raw.prepare('SELECT snapshot_json FROM decision_events WHERE decision_id = ?').get(decisionId).snapshot_json;
+    raw.prepare('UPDATE decision_events SET snapshot_json = ? WHERE decision_id = ?').run(' ' + original, decisionId);
+    raw.close();
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.invalidCount, 1);
+    assert.strictEqual((await get(srv.port, '/api/v1/state')).status, 400);
+    assert.throws(() => R.readState(ctx.db), (err) => err.code === 'invalid_decision_record');
+    const backup = await post(srv.port, '/api/v1/backups', {});
+    assert.strictEqual(backup.status, 503, '创建备份也不能认证被改动的快照原文');
   } finally {
     await srv.close();
     ctx.close();

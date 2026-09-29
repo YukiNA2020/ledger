@@ -565,3 +565,18 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]), select, tex
   .dash-chip { white-space: normal; line-height: 1.5; }
   .stat-cards .sc { flex-basis: calc(50% - 10px); }
 }
+
+/* Phase 6C：决策与待执行。状态角标按内容定宽；长理由、长月份与长 id 换行不挤压按钮。 */
+.dec-chip { margin-left: auto; white-space: nowrap; color: var(--ink); background: rgba(255,255,255,.8);
+  border: 1px solid #cadfe9; border-radius: 999px; padding: 2px 10px; }
+.dec-card .row { align-items: flex-start; }
+.dec-card [data-dec-note] { line-height: 1.7; overflow-wrap: anywhere; }
+.dec-card .small { overflow-wrap: anywhere; }
+.dec-snap { padding: 12px 14px; }
+.dec-snap summary { cursor: pointer; }
+.dec-snap .db-item { overflow-wrap: anywhere; }
+.card .row > .dec-chip { flex-shrink: 0; }
+/* 决定入口与决定弹层的按钮行：按钮本身 nowrap 不压缩，窄屏必须换行而不是横向溢出。 */
+[data-dec-entry] { flex-wrap: wrap; gap: 6px 10px; }
+[data-decide-sheet] .row { flex-wrap: wrap; gap: 8px; }
+[data-dec-detail] .small, [data-dec-detail] .db-item { overflow-wrap: anywhere; }

@@ -1749,9 +1749,13 @@
       else equal(alloc.broad_equity.instruments.length, 0);
       assert(viewText.indexOf(Core.fmtMoney(res.roundingNote.allocatedTotalMinor)) >= 0,
         '页面显示的分配合计必须来自服务端产物');
+      // 阶段守卫随阶段显式推进（契约 §11，6C）：建议详情现在提供「进入决定（接受 / 暂缓 / 忽略）」；
+      // 执行类动作仍属 6D、复盘属 6E，本页不得出现，入口也只能指向决策创建而非状态跳步。
       assert(!Array.from(document.querySelectorAll('#view button, #view a')).some(function (el) {
-        return /接受|已执行|暂缓/.test(el.textContent);
-      }), '5D 页面不得出现 Phase 6 的决策动作');
+        return /已执行|确认执行|复盘/.test(el.textContent);
+      }), '5D/6C 页面不得出现执行与复盘动作（属 6D/6E）');
+      assert(document.querySelector('#view [data-action="dec:open"]'),
+        '6C：正式建议详情提供进入决定入口');
 
       // 5E-3 建议解释：只搬运服务端 explainCodes / roundingNote / categoryAllocations / todos
       var advEl = document.querySelector('#view [data-advice-result]');
@@ -3269,6 +3273,469 @@
         broadEquityDeviationBps: broadApi.deviationBps,
         adviceAllocatedBroadMinor: byCls.broad_equity.allocatedMinor
       }));
+    });
+
+    // C14 Phase 6C：接受 / 暂缓 / 忽略与待执行清单（真实点击 + 服务端状态核对）
+    await check('6C 决策：三类决定真实可用且刷新一致；估算不可决策、失效接受被拒、失败不假成功', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      var today = Domain.localTodayISO();
+      var ty = Number(today.slice(0, 4)), tm = Number(today.slice(5, 7));
+      var monthEnd = today.slice(0, 8) + String(new Date(Date.UTC(ty, tm, 0)).getUTCDate()).padStart(2, '0');
+      var quoteDates = Array.from(new Set([today, monthEnd]));
+      function quoteRows(ins, price, currency) {
+        return quoteDates.map(function (d) {
+          return { instrumentId: ins, priceMinor: price, currency: currency, priceDate: d, provider: 'manual', status: 'ok' };
+        });
+      }
+      var CAP = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'capacity'; });
+      var WIL = Domain.RISK_QUESTIONS.filter(function (q) { return q.kind === 'willingness'; });
+
+      async function putState(st) {
+        return fetch('/api/v1/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify({ state: st })
+        });
+      }
+      async function apiPost(path, body) {
+        return fetch('/api/v1/' + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H },
+          body: JSON.stringify(body)
+        }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); });
+      }
+      // 「现金高配 + 宽基 / 主题低配」的干净事实（当天数据 → 正式口径）
+      function c6Assets() {
+        var a = Domain.emptyAssets();
+        a.assetAccounts = [
+          { id: 'c6-acc-cash', name: '投资现金户', kind: 'deposit', pool: 'investable', institution: 'C6' },
+          { id: 'c6-acc-broker', name: '券商户', kind: 'broker', pool: 'investable', institution: 'C6' },
+          { id: 'c6-acc-safe', name: '应急金', kind: 'deposit', pool: 'safety', institution: 'C6' }
+        ];
+        a.assetUnits = [
+          { id: 'c6-u-cny', accountId: 'c6-acc-cash', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' },
+          { id: 'c6-u-safe', accountId: 'c6-acc-safe', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' }
+        ];
+        a.instruments = [
+          { id: 'c6-ins-bond', symbol: 'C6BND', exchange: 'NASDAQ', currency: 'USD', name: '债基', instrumentType: 'etf', assetClass: 'fixed_income', exposureMarket: 'US', classificationStatus: 'confirmed' },
+          { id: 'c6-ins-voo', symbol: 'C6VOO', exchange: 'SSE', currency: 'CNY', name: '宽基A', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' },
+          { id: 'c6-ins-thm', symbol: 'C6THM', exchange: 'SSE', currency: 'CNY', name: '主题', instrumentType: 'fund', assetClass: 'theme_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' }
+        ];
+        a.holdings = [
+          { id: 'c6-h-bond', accountId: 'c6-acc-broker', instrumentId: 'c6-ins-bond', quantity: '5000', costMinor: 5000000, asOf: today },
+          { id: 'c6-h-voo', accountId: 'c6-acc-broker', instrumentId: 'c6-ins-voo', quantity: '50000', costMinor: 5000000, asOf: today },
+          { id: 'c6-h-thm', accountId: 'c6-acc-broker', instrumentId: 'c6-ins-thm', quantity: '70000', costMinor: 7000000, asOf: today }
+        ];
+        a.quotes = quoteRows('c6-ins-bond', 1000, 'USD')
+          .concat(quoteRows('c6-ins-voo', 100, 'CNY'))
+          .concat(quoteRows('c6-ins-thm', 100, 'CNY'));
+        a.fxRates = quoteDates.map(function (d) {
+          return { base: 'USD', quote: 'CNY', rateDecimal: '7.0000', rateDate: d, provider: 'manual', status: 'ok' };
+        });
+        return a;
+      }
+      async function seed() {
+        var base = await apiState();
+        var seeded = Object.assign({}, base, {
+          accounts: [], categories: [], txns: [], settings: {}, assets: c6Assets(),
+          riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: [],
+          decisions: [], decisionEvents: [], decisionLinks: []
+        });
+        equal((await putState(seeded)).status, 200, '6C 前置状态写入');
+        var closed = await apiPost('monthly-closes', { month: today.slice(0, 7) });
+        equal(closed.json.close.status, 'formal', '前置：当天数据能正式结账');
+        var answers = [];
+        CAP.forEach(function (q, i) { answers.push({ questionId: q.id, optionId: q.options.filter(function (o) { return o.score === [1, 1, 1, 2, 2][i]; })[0].id }); });
+        WIL.forEach(function (q, i) { answers.push({ questionId: q.id, optionId: q.options.filter(function (o) { return o.score === [2, 2, 1, 1][i]; })[0].id }); });
+        equal((await apiPost('risk-assessments', { answers: answers, assessedAt: today, reason: 'initial' })).status, 201, '前置：评估落库');
+        equal((await apiPost('targets', {})).status, 201, '前置：目标版本生成');
+        equal((await apiPost('approved-instruments', { assetClass: 'broad_equity', instrumentIds: ['c6-ins-voo'] })).status, 200, '前置：宽基认可标的');
+      }
+      async function runAdvice(amount) {
+        clickAction('[data-action="nav:home"]');
+        await waitFor(function () { return document.querySelector('#view [data-action="nav:targets"]'); }, 8000, '决策台目标入口');
+        clickAction('[data-action="nav:targets"]');
+        await waitFor(function () { return document.querySelector('#view [data-action="target:reload"]'); }, 8000, '目标页重新读取入口');
+        clickAction('#view [data-action="target:reload"]');
+        await waitFor(function () { return document.querySelector('#view [data-action="advice:run"]'); }, 8000, '建议入口');
+        // 此前检查可能在内存里留着同金额的旧建议：以「本次新生成的建议 id」为准，
+        // 防止把旧块当成新产物、把已删除的旧建议 id 提交给决策接口。
+        var before = await Store.listRecommendations();
+        var beforeIds = {};
+        (before.items || []).forEach(function (r) { beforeIds[r.id] = 1; });
+        var amountInput = document.querySelector('#view [data-input="advice:amount"]');
+        amountInput.value = String(amount);
+        amountInput.dispatchEvent(new Event('input', { bubbles: true }));
+        clickAction('#view [data-action="advice:run"]');
+        // 自愈：页面偶发重渲染竞态可能吞掉一次输入或点击；金额不生效就重填再点
+        //（生成进行中按钮 disabled，不会双发）。
+        var recId = await waitFor(async function () {
+          var listed = await Store.listRecommendations();
+          var fresh = (listed.items || []).filter(function (r) {
+            return !beforeIds[r.id] && r.requestedNewFundsMinor === amount * 100;
+          });
+          if (fresh.length) return fresh[0].id;
+          var inp = document.querySelector('#view [data-input="advice:amount"]');
+          var btn = document.querySelector('#view [data-action="advice:run"]');
+          if (inp && btn && !btn.disabled) {
+            if (inp.value !== String(amount)) {
+              inp.value = String(amount);
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            if (inp.value === String(amount)) btn.click();
+          }
+          return null;
+        }, 15000, amount + ' 元建议落库');
+        await waitFor(function () {
+          var v = document.querySelector('#view [data-advice-trace-versions]');
+          var b = document.querySelector('#view [data-advice-result]');
+          return v && b && v.getAttribute('data-rec-id') === recId &&
+            b.getAttribute('data-advice-allocated') === String(amount * 100);
+        }, 8000, amount + ' 元建议结果显示（新建议 id）');
+        return document.querySelector('#view [data-advice-result]');
+      }
+      async function decide(intent, note) {
+        clickAction('#view [data-action="dec:open"]');
+        await waitFor(function () { return document.querySelector('#dec-note'); }, 8000, '决定弹层');
+        var box = document.querySelector('#dec-note');
+        box.value = note;
+        box.dispatchEvent(new Event('input', { bubbles: true }));
+        clickAction('#sheet [data-action="dec:submit"][data-intent="' + intent + '"]');
+        await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); }, 8000, '决定提交完成');
+      }
+
+      // ① 前置事实链
+      await seed();
+
+      // ② 核对中 → 读取失败 → 初始空态三态分别呈现：读不到绝不能冒充「还没有决策」
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:decisions"]'); }, 8000, '决策台决策入口');
+      var origDecFetch = window.fetch;
+      var holdDecisions = [];
+      window.fetch = function (url, init) {
+        // 只扣住决策列表读取；返回 500（HTTP 层失败）而不是网络层 reject，
+        // 否则 Store 会按「服务不可达」降级只读，测到的就是另一个分支了。
+        if (/\/api\/v1\/decisions(\?|$)/.test(String(url))) {
+          return new Promise(function (res) {
+            holdDecisions.push(function () {
+              res(new Response(
+                JSON.stringify({ error: { code: 'internal_error', message: '模拟服务端读取失败', retryable: true } }),
+                { status: 500, headers: { 'Content-Type': 'application/json' } }));
+            });
+          });
+        }
+        return origDecFetch(url, init);
+      };
+      try {
+        clickAction('[data-action="nav:decisions"]');
+        // 路由与读取都是异步的；前面的检查已经访问过目标页，decLoaded 可能已是 true，
+        // 所以既可能是首帧读取中卡片，也可能要靠「重新读取」再发起一次强制读取。
+        await waitFor(function () {
+          return document.querySelector('#view [data-dec-loading]') ||
+            document.querySelector('#view [data-action="dec:reload"]');
+        }, 8000, '决策页给出读取入口');
+        if (!holdDecisions.length && document.querySelector('#view [data-action="dec:reload"]')) {
+          clickAction('#view [data-action="dec:reload"]');
+        }
+        await waitFor(function () { return holdDecisions.length === 1; }, 8000, '决策读取请求已发出并被扣住');
+        assert(
+          document.querySelector('#view [data-dec-loading]') ||
+          document.querySelector('#view [data-dec-reloading]'),
+          '核对中：读取状态可见');
+        assert(!document.querySelector('#view [data-dec-error]'), '读取中不得先显示失败');
+        holdDecisions[0]();
+        await waitFor(function () { return document.querySelector('#view [data-dec-error]'); }, 8000, '读取失败显式呈现');
+        assert(/决策读取失败/.test(document.querySelector('#view').textContent), '失败卡说明读取失败');
+        assert(!document.querySelector('#view [data-dec-empty]'), '读取失败不得冒充「还没有决策」');
+        assert(document.querySelector('#view [data-dec-error] [data-action="dec:reload"]'), '失败卡给出重试入口');
+      } finally {
+        window.fetch = origDecFetch;
+      }
+      clickAction('#view [data-dec-error] [data-action="dec:reload"]');
+      await waitFor(function () { return document.querySelector('#view [data-dec-empty]'); }, 8000, '重试后读到初始空态');
+      assert(/还没有任何决策记录/.test(document.querySelector('#view').textContent), '历史空态');
+
+      // ③ 接受：缺理由被拦（不产生决策）→ 填理由后接受 → 防重复点击只产生一条
+      var block2000 = await runAdvice(2000);
+      assert(block2000.getAttribute('data-advice-status') === 'formal', '前置建议必须是正式口径');
+      clickAction('#view [data-action="dec:open"]');
+      await waitFor(function () { return document.querySelector('#dec-note'); }, 8000, '决定弹层（理由为空）');
+      clickAction('#sheet [data-action="dec:submit"][data-intent="accepted"]');
+      await new Promise(function (r) { setTimeout(r, 300); });
+      assert(document.querySelector('#dec-note'), '缺理由时不提交，弹层保持打开');
+      var listed0 = await Store.listDecisions();
+      equal(listed0.total, 0, '缺理由提交不产生决策');
+      var noteBox = document.querySelector('#dec-note');
+      noteBox.value = '按建议分两笔执行';
+      noteBox.dispatchEvent(new Event('input', { bubbles: true }));
+      var acceptBtn = document.querySelector('#sheet [data-action="dec:submit"][data-intent="accepted"]');
+      acceptBtn.click();
+      await waitFor(function () {
+        var b = document.querySelector('#sheet [data-action="dec:submit"]');
+        return !b || b.disabled;
+      }, 3000, '提交中按钮禁用（防重复点击）');
+      await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); }, 8000, '接受完成');
+      var decs1 = await Store.listDecisions();
+      equal(decs1.total, 1, '接受只产生一条决策（重复点击被拦）');
+      var acc = decs1.items[0];
+      equal(acc.state, 'accepted', 'intent=accepted → accepted');
+      equal(acc.reasonCode, 'agree', '服务端理由码 agree');
+      equal(acc.note, '按建议分两笔执行');
+      equal(acc.execution.linkedCount, 0, '尚无关联');
+      equal(acc.execution.remainingMinor, 200000, '无关联时剩余 = 建议金额（契约 §3.3）');
+      equal(acc.eventMonths.join(','), today.slice(0, 7), '决策月按本地事件月归属');
+
+      // ④ 待执行清单呈现 + 重新读取后状态一致（刷新核对）
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () {
+        var card = document.querySelector('#view .dec-card[data-dec-state="accepted"]');
+        return card && /2,000\.00 CNY/.test(card.textContent) && /按建议分两笔执行/.test(card.textContent);
+      }, 8000, '待执行清单卡片');
+      clickAction('#view [data-action="dec:reload"]');
+      await waitFor(function () {
+        var card = document.querySelector('#view .dec-card[data-dec-state="accepted"]');
+        return card && card.getAttribute('data-dec-id') === acc.id;
+      }, 8000, '重新读取后清单一致');
+
+      // ④b 慢响应守卫：在途读取晚到时，不得覆盖用户已经看到的新状态（拆解 §5）
+      var origSlowFetch = window.fetch;
+      var heldSlow = null;
+      var holdOnce = false;
+      window.fetch = function (url, init) {
+        if (holdOnce && /\/api\/v1\/decisions(\?|$)/.test(String(url))) {
+          holdOnce = false;
+          return new Promise(function (res) { heldSlow = res; });
+        }
+        return origSlowFetch(url, init);
+      };
+      try {
+        holdOnce = true;
+        clickAction('#view [data-action="dec:reload"]');          // 在途读取：被扣住
+        await waitFor(function () { return heldSlow; }, 8000, '慢响应读取已发出并被扣住');
+        clickAction('#view [data-action="dec:reload"]');          // 更新的读取：真实完成
+        await waitFor(function () {
+          var card = document.querySelector('#view .dec-card[data-dec-state="accepted"]');
+          return card && card.getAttribute('data-dec-id') === acc.id;
+        }, 8000, '更新的读取先完成');
+        // 晚到的旧响应返回空清单：必须被丢弃，不得顶掉已读到的状态
+        heldSlow(new Response(
+          JSON.stringify({ ok: true, items: [], total: 0, invalidCount: 0, states: [], months: [] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        await new Promise(function (r) { setTimeout(r, 300); });
+        var lateCard = document.querySelector('#view .dec-card[data-dec-state="accepted"]');
+        assert(lateCard && lateCard.getAttribute('data-dec-id') === acc.id,
+          '晚到的旧读取不得覆盖已读到的状态');
+        assert(!document.querySelector('#view [data-dec-empty]'), '晚到的空清单不得冒充「还没有决策」');
+      } finally {
+        window.fetch = origSlowFetch;
+      }
+
+      // ⑤ 详情：状态、理由、时间线与快照入口全部来自服务端
+      clickAction('#view .dec-card[data-dec-state="accepted"] [data-action="dec:detail"]');
+      await waitFor(function () { return document.querySelector('#sheet [data-dec-detail]'); }, 8000, '决策详情');
+      var detailText = document.querySelector('#sheet').textContent;
+      assert(/已接受 · 待执行/.test(detailText), '详情显示服务端状态');
+      assert(/同意按建议执行/.test(detailText), '详情显示服务端理由码');
+      equal(document.querySelectorAll('#sheet [data-tl="state"]').length, 1, '时间线恰好一条状态事件');
+      assert(document.querySelector('#sheet [data-dec-snap="决策时点快照"]'), '决策时点快照入口存在');
+      // 结构断言而非文本断言：长理由末尾的「执行」可能与下一节标题拼出「执行时点快照」字样
+      assert(!document.querySelector('#sheet [data-dec-snap="执行时点快照"]') &&
+        !document.querySelector('#sheet [data-dec-snap="复盘时点快照"]') &&
+        !document.querySelector('#sheet [data-dec-snap="归档快照"]'),
+        '尚未执行 / 复盘 / 归档：只渲染决策时点快照');
+      clickAction('#sheet .close');
+
+      // ⑥ 暂缓与忽略：进历史、不混入待执行清单
+      await runAdvice(3000);
+      await decide('deferred', '本月资金另有用途，等待下月再评估是否按建议执行');
+      var decs2 = await Store.listDecisions();
+      equal(decs2.total, 2, '暂缓追加一条决策');
+      await runAdvice(1000);
+      await decide('dismissed', '额度太小，不值得单独执行');
+      var decs3 = await Store.listDecisions();
+      equal(decs3.total, 3, '忽略追加一条决策');
+      var states = {};
+      decs3.items.forEach(function (d) { states[d.state] = (states[d.state] || 0) + 1; });
+      equal(states.accepted, 1, '待执行仍只有 1 条');
+      equal(states.deferred, 1, '暂缓 1 条');
+      equal(states.dismissed, 1, '忽略 1 条');
+      // 长理由在卡片上完整呈现（长文本不挤压按钮由三档宽度检查兜底）；先回到决策历史页
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () { return document.querySelector('#view [data-change="dec:filter"]'); }, 8000, '决策历史页');
+      var pageText = document.querySelector('#view').textContent;
+      assert(/等待下月再评估是否按建议执行/.test(pageText), '暂缓理由进入历史');
+      // 状态筛选：只看已暂缓（待执行清单的 accepted 卡片仍在上方，不混入历史筛选结果）
+      var filter = document.querySelector('#view [data-change="dec:filter"]');
+      filter.value = 'deferred';
+      filter.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(function () {
+        var cards = document.querySelectorAll('#view .dec-card');
+        var deferredCards = Array.prototype.filter.call(cards, function (c) {
+          return c.getAttribute('data-dec-state') === 'deferred';
+        });
+        return cards.length === 2 && deferredCards.length === 1;
+      }, 8000, '历史筛选已暂缓（待执行清单不受筛选影响）');
+      filter.value = '';
+      filter.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // ⑦ 估算建议不可决策：不出现决定入口，只有显式说明（契约 §2.1）
+      var est = await apiState();
+      // voo 两行报价分别改为 6 / 7 个自然日前：门禁取「最近一条」行情判定新鲜度，
+      // 只改今天那行会让月末行（未来日期）继续冒充最新价。两行日期不同避免撞 uq_quotes_dedupe。
+      var staleD = new Date(Date.UTC(ty, tm - 1, Number(today.slice(8, 10))));
+      staleD.setUTCDate(staleD.getUTCDate() - 6);
+      var staleDay = staleD.toISOString().slice(0, 10);
+      staleD.setUTCDate(staleD.getUTCDate() - 1);
+      var staleDay2 = staleD.toISOString().slice(0, 10);
+      est.assets.quotes = est.assets.quotes.map(function (q) {
+        if (q.instrumentId !== 'c6-ins-voo') return q;
+        return Object.assign({}, q, { priceDate: q.priceDate === today ? staleDay : staleDay2 });
+      });
+      equal((await putState(est)).status, 200, '行情过期状态写入');
+      var estBlock = await runAdvice(500);
+      equal(estBlock.getAttribute('data-advice-status'), 'estimate', '行情过期后只给估算建议');
+      assert(estBlock.querySelector('[data-dec-estimate-note]'), '估算建议显示不可决策说明');
+      assert(!estBlock.querySelector('[data-action="dec:open"]'), '估算建议不提供决定入口');
+
+      // ⑧ 失效正式建议：接受被服务端拒绝（409），失败不假成功；暂缓仍可记录
+      var fresh = await apiState();
+      fresh.assets.quotes = quoteRows('c6-ins-bond', 1000, 'USD')
+        .concat(quoteRows('c6-ins-voo', 100, 'CNY'))
+        .concat(quoteRows('c6-ins-thm', 100, 'CNY'));
+      equal((await putState(fresh)).status, 200, '行情恢复写入');
+      var block4000 = await runAdvice(4000);
+      equal(block4000.getAttribute('data-advice-status'), 'formal', '行情恢复后重新拿到正式建议');
+      // 改写事实（余额变化）：让这条正式建议失效（assets_changed），页面只重新同步事实视图，
+      // 不重新生成建议 —— 新输入会得到新建议（新 inputHash），就不是「同一条失效建议」了。
+      var changed = await apiState();
+      changed.assets.assetUnits = changed.assets.assetUnits.map(function (u) {
+        return u.id === 'c6-u-cny' ? Object.assign({}, u, { balanceMinor: 45000000 }) : u;
+      });
+      equal((await putState(changed)).status, 200, '事实变化写入');
+      clickAction('[data-action="nav:home"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="nav:targets"]'); }, 8000, '决策台目标入口（失效步）');
+      clickAction('[data-action="nav:targets"]');
+      await waitFor(function () { return document.querySelector('#view [data-action="target:reload"]'); }, 8000, '目标页重新读取入口（失效步）');
+      clickAction('#view [data-action="target:reload"]');
+      await waitFor(function () {
+        var b = document.querySelector('#view [data-advice-result]');
+        return b && b.getAttribute('data-advice-status') === 'stale';
+      }, 8000, '建议显示为历史（已失效）');
+      var staleRecId = document.querySelector('#view [data-advice-result] [data-action="dec:open"]').getAttribute('data-rec-id');
+      clickAction('#view [data-action="dec:open"]');
+      await waitFor(function () {
+        var s = document.querySelector('#sheet [data-decide-sheet]');
+        return s && /已失效/.test(s.textContent);
+      }, 8000, '决定弹层预告接受会被拒绝');
+      var sb = document.querySelector('#dec-note');
+      sb.value = '明知失效仍尝试接受（反例）';
+      sb.dispatchEvent(new Event('input', { bubbles: true }));
+      clickAction('#sheet [data-action="dec:submit"][data-intent="accepted"]');
+      await waitFor(function () { return document.querySelector('#sheet [data-dec-error]'); }, 8000, '服务端拒绝显示在弹层内');
+      assert(/建议已失效/.test(document.querySelector('#sheet [data-dec-error]').textContent),
+        '错误信息说明失效原因（recommendation_stale）');
+      var decs4 = await Store.listDecisions();
+      equal(decs4.total, 3, '被拒后决策总数不变（失败不假成功）');
+      // 同一条失效建议：暂缓不做时效重核，仍然可记录
+      var sb2 = document.querySelector('#dec-note');
+      sb2.value = '建议已失效，先暂缓；事实变化后重新生成再决定';
+      sb2.dispatchEvent(new Event('input', { bubbles: true }));
+      clickAction('#sheet [data-action="dec:submit"][data-intent="deferred"]');
+      await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); }, 8000, '失效建议暂缓成功');
+      var decs5 = await Store.listDecisions();
+      equal(decs5.total, 4, '暂缓追加成功');
+      var deferredStale = decs5.items.filter(function (d) { return d.state === 'deferred'; });
+      equal(deferredStale.length, 2, '暂缓共 2 条（含失效建议那条）');
+      // 失效建议的决策卡片显示失效角标（服务端 adviceStaleReasons）
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-dec-stale]');
+      }, 8000, '失效角标出现在历史卡片');
+      assert(document.querySelector('#view [data-dec-stale]').textContent.indexOf('原建议已失效') >= 0,
+        '失效角标文案明确');
+    });
+
+    // ⑨ 详情弹层慢响应（独立检查项）：先开 A 再开 B，A 的响应最后返回不得把 B 覆盖回 A；
+    //    弹层已关闭时，晚到的详情也不得重新弹出（拆解 §5「慢响应不能覆盖新状态」）。
+    await check('6C 决策：详情弹层慢响应不覆盖后打开的另一条，关闭后晚到不重弹', async function () {
+      var all = await Store.listDecisions();
+      var itemA = all.items.filter(function (d) { return d.state === 'accepted'; })[0];
+      var itemB = all.items.filter(function (d) { return d.state === 'deferred'; })[0];
+      assert(itemA && itemB, '前置：已有一条接受与一条暂缓决策');
+      assert(itemA.id !== itemB.id && itemA.note !== itemB.note, 'A 与 B 必须是两条不同决策');
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () {
+        return document.querySelector('#view .dec-card[data-dec-id="' + itemA.id + '"]') &&
+          document.querySelector('#view .dec-card[data-dec-id="' + itemB.id + '"]');
+      }, 8000, '决策页同时存在 A 与 B 卡片');
+
+      var holdA = [];
+      var origFetch = window.fetch;
+      window.fetch = function (url, init) {
+        if (String(url).indexOf('/api/v1/decisions/' + itemA.id) !== -1) {
+          // 请求照常发出，响应到手后先扣住，用来制造「A 最后返回」
+          return origFetch(url, init).then(function (res) {
+            return new Promise(function (resolve) { holdA.push(function () { resolve(res); }); });
+          });
+        }
+        return origFetch(url, init);
+      };
+      try {
+        clickAction('#view .dec-card[data-dec-id="' + itemA.id + '"] [data-action="dec:detail"]');
+        await waitFor(function () {
+          var l = document.querySelector('#sheet [data-dec-detail-loading]');
+          return l && l.getAttribute('data-dec-detail-id') === itemA.id;
+        }, 8000, 'A 详情读取中');
+        await waitFor(function () { return holdA.length === 1; }, 8000, 'A 详情响应已扣住');
+        clickAction('#view .dec-card[data-dec-id="' + itemB.id + '"] [data-action="dec:detail"]');
+        await waitFor(function () {
+          var d = document.querySelector('#sheet [data-dec-detail]');
+          return d && d.getAttribute('data-dec-detail-id') === itemB.id;
+        }, 8000, 'B 详情先渲染');
+        assert(!document.querySelector('#sheet [data-dec-detail-id="' + itemA.id + '"]'),
+          '打开 B 后弹层里没有 A');
+        holdA[0]();                                               // A 晚到
+        await new Promise(function (r) { setTimeout(r, 300); });
+        assert(!document.querySelector('#sheet [data-dec-detail-id="' + itemA.id + '"]'),
+          '晚到的 A 不得把弹层里的 B 覆盖回 A');
+        assert(document.querySelector('#sheet [data-dec-detail]').getAttribute('data-dec-detail-id') === itemB.id,
+          '弹层仍显示后打开的 B');
+        assert(itemB.note && document.querySelector('#sheet').textContent.indexOf(itemB.note) !== -1,
+          '弹层内容仍是 B 的理由，没有被 A 的内容顶掉');
+
+        // 关闭后再打开 A，读取中途关闭：晚到的详情不得把弹层重新弹出
+        clickAction('#sheet .close');
+        await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); },
+          8000, '关闭详情');
+        clickAction('#view .dec-card[data-dec-id="' + itemA.id + '"] [data-action="dec:detail"]');
+        await waitFor(function () { return holdA.length === 2; }, 8000, '再次读取 A 已扣住');
+        clickAction('#sheet .close');
+        await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); },
+          8000, '读取中途关闭弹层');
+        holdA[1]();
+        await new Promise(function (r) { setTimeout(r, 300); });
+        assert(document.querySelector('#sheet-mask').classList.contains('hidden'),
+          '关闭后晚到的详情不得重新弹出');
+
+        // 关闭详情后换到另一类弹层：旧详情不能利用新弹层的可见状态覆盖它。
+        clickAction('#view .dec-card[data-dec-id="' + itemA.id + '"] [data-action="dec:detail"]');
+        await waitFor(function () { return holdA.length === 3; }, 8000, '第三次读取 A 已扣住');
+        clickAction('#sheet .close');
+        clickAction('[data-action="nav:assets"]');
+        await waitFor(function () { return document.querySelector('#view [data-action="asset:acc"]'); },
+          8000, '资产页新增账户入口');
+        clickAction('#view [data-action="asset:acc"]');
+        assert(document.querySelector('#sheet .sheet-title').textContent.indexOf('新增账户') !== -1,
+          '另一类弹层已经打开');
+        holdA[2]();
+        await new Promise(function (r) { setTimeout(r, 300); });
+        assert(document.querySelector('#sheet .sheet-title').textContent.indexOf('新增账户') !== -1,
+          '晚到的详情不得覆盖新打开的账户弹层');
+        assert(!document.querySelector('#sheet [data-dec-detail]'), '账户弹层内不得出现旧决策详情');
+        clickAction('#sheet .close');
+      } finally {
+        window.fetch = origFetch;
+      }
     });
 
     render();

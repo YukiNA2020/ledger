@@ -23,6 +23,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const dbm = require('./db');
+const repository = require('./repository');
 const { LATEST_VERSION, migrate, currentVersion } = require('./migrations');
 const { BACKUP_KEEP } = require('./config');
 
@@ -310,7 +311,8 @@ function removeSidecars(file) {
 // 校验一个候选备份文件：能打开、结构完整、必需表齐备、schema 版本已知
 // 校验必须无副作用：只清理"因本次打开而新出现"的同伴文件，绝不删除调用前就存在的文件
 // （例如活跃数据库真实的 -wal）。
-function validateBackupFile(file) {
+function validateBackupFile(file, options) {
+  const opts = options || {};
   if (!fs.existsSync(file)) return { ok: false, reason: '文件不存在' };
   const sidecars = [file + '-wal', file + '-shm', file + '-journal'];
   const preexisting = sidecars.filter((f) => fs.existsSync(f));
@@ -371,6 +373,16 @@ function validateBackupFile(file) {
     for (const col of requiredColumnsFor(version)) {
       if (dbm.columnNames(db, col.table).indexOf(col.name) === -1) {
         return { ok: false, reason: '缺少必需列：' + col.table + '.' + col.name };
+      }
+    }
+    // 结构完整不代表决策历史可信：候选库必须在切换前经过与列表/详情同一份
+    // 事件链、原文哈希、建议引用与活动 buy 关联复核（契约 §4.5 / §9）。
+    // 唯一例外是恢复前保存旧活库的取证快照；它不被当作可恢复候选。
+    if (version >= 11 && !opts.preserveInvalidDecisionHistory) {
+      try {
+        repository.assertDecisionHistoryValid(db);
+      } catch (err) {
+        return { ok: false, reason: '决策历史复核失败：' + (err && err.message ? err.message : String(err)) };
       }
     }
     return { ok: true, schemaVersion: version };
@@ -450,7 +462,9 @@ async function createBackup(db, paths, options) {
 
   snapshotTo(db, tmpPath);
 
-  const check = validateBackupFile(tmpPath);
+  const check = validateBackupFile(tmpPath, {
+    preserveInvalidDecisionHistory: opts.preserveInvalidDecisionHistory === true
+  });
   if (!check.ok) {
     try {
       fs.unlinkSync(tmpPath);
@@ -532,7 +546,11 @@ async function restoreBackup(db, paths, backupPath, options) {
   // 1) 恢复前先备份当前数据库
   let preRestore = null;
   try {
-    preRestore = await createBackup(db, paths, { now: now, reason: 'pre-restore', keep: opts.keep });
+    // 活库可能恰因决策快照被篡改而需要恢复。恢复前仍须保留旧库取证快照，
+    // 但该快照不能因此获得「可恢复候选」资格；正常校验始终拒绝它。
+    preRestore = await createBackup(db, paths, {
+      now: now, reason: 'pre-restore', keep: opts.keep, preserveInvalidDecisionHistory: true
+    });
   } catch (err) {
     return {
       ok: false,
