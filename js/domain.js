@@ -3882,6 +3882,9 @@
 
   var DECISION_REQUEST_KEYS = deepFreezeRisk(['recommendationId', 'intent', 'note']);
   var DECISION_EVENT_REQUEST_KEYS = deepFreezeRisk(['toState', 'note']);
+  // 契约 §8.5（6D）：关联 = securityEventId + 可选 note；解绑 = linkId + 必填 note。
+  var DECISION_LINK_REQUEST_KEYS = deepFreezeRisk(['securityEventId', 'note']);
+  var DECISION_UNLINK_REQUEST_KEYS = deepFreezeRisk(['linkId', 'note']);
   // 契约 §6.2：服务端派生字段（camelCase 载荷名）。出现在任何决策载荷里即 400 invalid_decision_payload。
   var DECISION_SERVER_GENERATED_KEYS = deepFreezeRisk([
     'id', 'seq', 'state', 'reasonCode', 'occurredAt', 'recordedAt', 'actor',
@@ -3909,6 +3912,12 @@
   var DECISION_SNAPSHOT_BLOCKER_KEYS = deepFreezeRisk(['code', 'detail']);
   var DECISION_EXECUTION_KEYS = deepFreezeRisk(['linkedCount', 'linkedPrincipalCnyMinor', 'linkedFeeCnyMinor', 'remainingMinor', 'fxUnavailable']);
   var DECISION_SNAPSHOT_BANDS = deepFreezeRisk(['below_min', 'within', 'above_max']);
+  // 契约 §4.3（6E 补充）：复盘对照行 / 时点 cell 的键白名单。cell 键集恒定；行键集恒定。
+  var DECISION_COMPARISON_CELL_KEYS = deepFreezeRisk(['valueMinor', 'pctBps', 'deviationBps', 'band']);
+  var DECISION_COMPARISON_ROW_KEYS = deepFreezeRisk([
+    'assetClass', 'targetBps', 'decision', 'executed', 'review', 'deltaValueMinor', 'deltaPctBps'
+  ]);
+  var DECISION_COMPARISON_TIMEPOINT_KEYS = deepFreezeRisk(['present', 'available', 'reason', 'blockers']);
   var DECISION_ID_RE = /^dec-[0-9a-f]{16}$/;
   var DECISION_EVENT_ID_RE = /^dev-[0-9a-f]{16}$/;
   var DECISION_LINK_ID_RE = /^lnk-[0-9a-f]{16}$/;
@@ -3997,6 +4006,37 @@
     var note = normalizeDecisionNote(payload.note);
     if (!note.ok) return decisionFail('invalid_decision_payload', 'note 必须是不超过 ' + DECISION_NOTE_MAX_CHARS + ' 字符的字符串');
     return { ok: true, value: { toState: payload.toState, note: note.note } };
+  }
+
+  // 契约 §8.5（6D）：关联请求键白名单 securityEventId（必填）/ note（可选）。
+  // 派生键（linkedOn / linkedAt / id…）不在白名单 → 400 invalid_decision_payload（§6.2）。
+  function validateDecisionLinkRequest(payload) {
+    if (!hasExactRiskKeys(payload, DECISION_LINK_REQUEST_KEYS, ['securityEventId'])) {
+      return decisionFail('invalid_decision_payload', '关联请求键白名单：securityEventId（必填）、note（可选）');
+    }
+    var securityEventId = typeof payload.securityEventId === 'string' ? payload.securityEventId.trim() : '';
+    if (!securityEventId || securityEventId.length > 64) {
+      return decisionFail('invalid_decision_payload', 'securityEventId 必须是非空字符串');
+    }
+    var note = normalizeDecisionNote(payload.note);
+    if (!note.ok) return decisionFail('invalid_decision_payload', 'note 必须是不超过 ' + DECISION_NOTE_MAX_CHARS + ' 字符的字符串');
+    return { ok: true, value: { securityEventId: securityEventId, note: note.note } };
+  }
+
+  // 契约 §8.5 / §3.4（6D）：解绑请求键白名单 linkId（必填）+ note（必填的解绑理由）。
+  // linkId 形状不合法 → 400；形状合法但查无此行（或不属于本决策）→ 422 unknown_decision_link（由服务端判定）。
+  function validateDecisionUnlinkRequest(payload) {
+    if (!hasExactRiskKeys(payload, DECISION_UNLINK_REQUEST_KEYS, ['linkId', 'note'])) {
+      return decisionFail('invalid_decision_payload', '解绑请求键白名单：linkId（必填）、note（必填的解绑理由）');
+    }
+    var linkId = typeof payload.linkId === 'string' ? payload.linkId.trim() : '';
+    if (!linkId || !DECISION_LINK_ID_RE.test(linkId)) {
+      return decisionFail('invalid_decision_payload', 'linkId 必须是 lnk-<16hex> 形状的关联行 id');
+    }
+    var note = normalizeDecisionNote(payload.note);
+    if (!note.ok) return decisionFail('invalid_decision_payload', 'note 必须是不超过 ' + DECISION_NOTE_MAX_CHARS + ' 字符的字符串');
+    if (!note.note) return decisionFail('invalid_decision_payload', '解绑必须填写理由 note');
+    return { ok: true, value: { linkId: linkId, note: note.note } };
   }
 
   function validateDecisionRecord(decision) {
@@ -4248,6 +4288,167 @@
     return { ok: true, drift: canonicalJson(a.record.classes) !== canonicalJson(b.record.classes) };
   }
 
+  // 契约 §4.3（6E 补充）：六类配置对照 = 三时点封存快照的横向派生表，纯函数、不改封存事实。
+  //   - 时点 cell：快照缺失或 available=false → null；可比时取封存 classes 行原值（页面不换算）；
+  //     0 投资池（pctBps=null）仍是可比快照，cell 保留金额、比例与区间字段为 null；
+  //   - comparable = 三快照齐全且全部 available；false 时所有 cell 与 delta 一律 null（不出伪 0），
+  //     不可比原因看 timepoints（present:false 或 reason + blockers 原样搬运）；
+  //   - delta 只在 comparable=true 时输出：review − decision；参照目标恒为 targetRef 历史版本，
+  //     targetBps 取该行任一可比时点的封存值（三时点恒同，不一致即记录损坏）。
+  // 输入快照形状不合法 → ok:false（服务端对详情整体 fail closed）。
+  function decisionReviewComparison(decisionSnapshot, executedSnapshot, reviewedSnapshot) {
+    var points = { decision: decisionSnapshot, executed: executedSnapshot, reviewed: reviewedSnapshot };
+    var order = ['decision', 'executed', 'reviewed'];
+    var timepoints = {};
+    var comparable = true;
+    for (var i = 0; i < order.length; i++) {
+      var snap = points[order[i]];
+      var present = !!snap;
+      var available = false;
+      var reason = null;
+      var blockers = [];
+      if (present) {
+        var shape = validateDecisionSnapshotShape(snap);
+        if (!shape.ok) return shape;
+        available = snap.available === true;
+        reason = snap.available ? null : (snap.reason || null);
+        blockers = (copyRiskDenseDataArray(snap.blockers) || []).map(function (b) {
+          return { code: b && b.code == null ? null : b.code, detail: b && b.detail == null ? '' : b.detail };
+        });
+      }
+      if (!present || !available) comparable = false;
+      timepoints[order[i]] = { present: present, available: available, reason: reason, blockers: blockers };
+    }
+    var classesByPoint = {};
+    var targetBpsByClass = {};
+    for (var p = 0; p < order.length; p++) {
+      var s = points[order[p]];
+      classesByPoint[order[p]] = null;
+      if (s && s.available === true) {
+        var map = {};
+        for (var ci = 0; ci < s.classes.length; ci++) map[s.classes[ci].assetClass] = s.classes[ci];
+        classesByPoint[order[p]] = map;
+        for (var ri = 0; ri < RISK_CLASSES.length; ri++) {
+          var cls = RISK_CLASSES[ri];
+          var row = map[cls];
+          if (!row) return decisionFail('invalid_decision_record', '可比快照缺少类别行：' + cls);
+          if (targetBpsByClass[cls] == null) targetBpsByClass[cls] = row.targetBps;
+          else if (targetBpsByClass[cls] !== row.targetBps) {
+            return decisionFail('invalid_decision_record', '同一 targetRef 下三时点 targetBps 不一致：' + cls);
+          }
+        }
+      }
+    }
+    var cellOf = function (snap, row) {
+      if (!snap || snap.available !== true) return null;
+      return {
+        valueMinor: row.valueMinor,
+        pctBps: row.pctBps,
+        deviationBps: row.deviationBps,
+        band: row.band
+      };
+    };
+    var rows = [];
+    for (var k = 0; k < RISK_CLASSES.length; k++) {
+      var className = RISK_CLASSES[k];
+      var dRow = classesByPoint.decision ? classesByPoint.decision[className] : null;
+      var xRow = classesByPoint.executed ? classesByPoint.executed[className] : null;
+      var vRow = classesByPoint.reviewed ? classesByPoint.reviewed[className] : null;
+      var dCell = comparable ? cellOf(points.decision, dRow) : null;
+      var xCell = comparable ? cellOf(points.executed, xRow) : null;
+      var vCell = comparable ? cellOf(points.reviewed, vRow) : null;
+      var deltaValue = comparable && dCell && vCell ? vCell.valueMinor - dCell.valueMinor : null;
+      var deltaPct = comparable && dCell && vCell && dCell.pctBps != null && vCell.pctBps != null
+        ? vCell.pctBps - dCell.pctBps : null;
+      rows.push({
+        assetClass: className,
+        targetBps: comparable ? (targetBpsByClass[className] == null ? null : targetBpsByClass[className]) : null,
+        decision: dCell,
+        executed: xCell,
+        review: vCell,
+        deltaValueMinor: deltaValue,
+        deltaPctBps: deltaPct
+      });
+    }
+    return {
+      ok: true,
+      value: {
+        comparable: comparable,
+        timepoints: timepoints,
+        rows: rows
+      }
+    };
+  }
+
+  // 对照结果的形状自检（读取复核用）：键白名单 + comparable 与 null 的一致性。
+  function validateDecisionComparisonShape(comparison) {
+    if (!hasExactRiskKeys(comparison, ['comparable', 'timepoints', 'rows'], ['comparable', 'timepoints', 'rows'])) {
+      return decisionFail('invalid_decision_record', '对照对象键集必须为 comparable/timepoints/rows');
+    }
+    if (typeof comparison.comparable !== 'boolean') {
+      return decisionFail('invalid_decision_record', '对照 comparable 必须是布尔值');
+    }
+    var tpKeys = ['decision', 'executed', 'reviewed'];
+    for (var i = 0; i < tpKeys.length; i++) {
+      var tp = comparison.timepoints && comparison.timepoints[tpKeys[i]];
+      if (!hasExactRiskKeys(tp, DECISION_COMPARISON_TIMEPOINT_KEYS, DECISION_COMPARISON_TIMEPOINT_KEYS) ||
+          typeof tp.present !== 'boolean' || typeof tp.available !== 'boolean') {
+        return decisionFail('invalid_decision_record', '对照时点键集或布尔域不合法：' + tpKeys[i]);
+      }
+      if (tp.reason !== null && DECISION_SNAPSHOT_REASON_CODES.indexOf(tp.reason) === -1) {
+        return decisionFail('invalid_decision_record', '对照时点 reason 不在冻结词表内：' + tpKeys[i]);
+      }
+      if (!copyRiskDenseDataArray(tp.blockers)) {
+        return decisionFail('invalid_decision_record', '对照时点 blockers 必须是数组：' + tpKeys[i]);
+      }
+    }
+    if (!copyRiskDenseDataArray(comparison.rows) || comparison.rows.length !== RISK_CLASSES.length) {
+      return decisionFail('invalid_decision_record', '对照 rows 必须恰好覆盖六个资产类别');
+    }
+    for (var r = 0; r < comparison.rows.length; r++) {
+      var row = comparison.rows[r];
+      if (!hasExactRiskKeys(row, DECISION_COMPARISON_ROW_KEYS, DECISION_COMPARISON_ROW_KEYS) ||
+          row.assetClass !== RISK_CLASSES[r]) {
+        return decisionFail('invalid_decision_record', '对照行键集或类别序不合法');
+      }
+      var cells = [row.decision, row.executed, row.review];
+      for (var c = 0; c < cells.length; c++) {
+        var cell = cells[c];
+        if (cell === null) continue;
+        if (!hasExactRiskKeys(cell, DECISION_COMPARISON_CELL_KEYS, DECISION_COMPARISON_CELL_KEYS)) {
+          return decisionFail('invalid_decision_record', '对照 cell 键集不合法');
+        }
+        if (!Number.isSafeInteger(cell.valueMinor) || cell.valueMinor < 0) {
+          return decisionFail('invalid_decision_record', '对照 cell 金额必须是非负安全整数');
+        }
+        var ratioOk = function (v) { return v === null || Number.isSafeInteger(v); };
+        if (!ratioOk(cell.pctBps) || !ratioOk(cell.deviationBps) ||
+            (cell.band !== null && DECISION_SNAPSHOT_BANDS.indexOf(cell.band) === -1)) {
+          return decisionFail('invalid_decision_record', '对照 cell 比例 / 区间字段不合法');
+        }
+      }
+      if (comparison.comparable) {
+        if (!row.decision || !row.executed || !row.review ||
+            !Number.isSafeInteger(row.deltaValueMinor) ||
+            row.deltaValueMinor !== row.review.valueMinor - row.decision.valueMinor) {
+          return decisionFail('invalid_decision_record', '可比对照必须给出三时点 cell 且 delta 可复算');
+        }
+        if (row.deltaPctBps !== null && !Number.isSafeInteger(row.deltaPctBps)) {
+          return decisionFail('invalid_decision_record', '对照 deltaPctBps 必须是安全整数或 null');
+        }
+        if ((row.decision.pctBps != null && row.review.pctBps != null) !== (row.deltaPctBps !== null)) {
+          return decisionFail('invalid_decision_record', 'deltaPctBps 为 null 必须且只能因两端比例不可用');
+        }
+      } else {
+        if (row.decision !== null || row.executed !== null || row.review !== null ||
+            row.deltaValueMinor !== null || row.deltaPctBps !== null) {
+          return decisionFail('invalid_decision_record', '不可比对照不得携带任何数字（不出伪 0）');
+        }
+      }
+    }
+    return { ok: true, record: comparison };
+  }
+
   // 只读契约快照：词表与白名单的可写深拷贝 + 有序对计数（7×7 = 49，合法 6 / 非法 43）。
   function decisionPhase6Contract() {
     return {
@@ -4265,6 +4466,9 @@
       linkRecordKeys: DECISION_LINK_RECORD_KEYS.slice(),
       snapshotKeys: DECISION_SNAPSHOT_KEYS.slice(),
       executionKeys: DECISION_EXECUTION_KEYS.slice(),
+      comparisonCellKeys: DECISION_COMPARISON_CELL_KEYS.slice(),
+      comparisonRowKeys: DECISION_COMPARISON_ROW_KEYS.slice(),
+      comparisonTimepointKeys: DECISION_COMPARISON_TIMEPOINT_KEYS.slice(),
       actor: DECISION_ACTOR,
       snapshotSchemaVersion: DECISION_SNAPSHOT_SCHEMA_VERSION,
       noteMaxChars: DECISION_NOTE_MAX_CHARS,
@@ -4434,11 +4638,15 @@
     DECISION_RECORD_KEYS: DECISION_RECORD_KEYS,
     DECISION_EVENT_RECORD_KEYS: DECISION_EVENT_RECORD_KEYS,
     DECISION_LINK_RECORD_KEYS: DECISION_LINK_RECORD_KEYS,
+    DECISION_LINK_REQUEST_KEYS: DECISION_LINK_REQUEST_KEYS,
+    DECISION_UNLINK_REQUEST_KEYS: DECISION_UNLINK_REQUEST_KEYS,
     DECISION_SNAPSHOT_KEYS: DECISION_SNAPSHOT_KEYS,
     DECISION_EXECUTION_KEYS: DECISION_EXECUTION_KEYS,
     isLegalDecisionTransition: isLegalDecisionTransition,
     validateDecisionRequest: validateDecisionRequest,
     validateDecisionEventRequest: validateDecisionEventRequest,
+    validateDecisionLinkRequest: validateDecisionLinkRequest,
+    validateDecisionUnlinkRequest: validateDecisionUnlinkRequest,
     validateDecisionRecord: validateDecisionRecord,
     validateDecisionEventRecord: validateDecisionEventRecord,
     validateDecisionLinkRecord: validateDecisionLinkRecord,
@@ -4447,6 +4655,11 @@
     deriveArchiveReason: deriveArchiveReason,
     decisionSnapshotGate: decisionSnapshotGate,
     decisionReviewDrift: decisionReviewDrift,
+    decisionReviewComparison: decisionReviewComparison,
+    validateDecisionComparisonShape: validateDecisionComparisonShape,
+    DECISION_COMPARISON_CELL_KEYS: DECISION_COMPARISON_CELL_KEYS,
+    DECISION_COMPARISON_ROW_KEYS: DECISION_COMPARISON_ROW_KEYS,
+    DECISION_COMPARISON_TIMEPOINT_KEYS: DECISION_COMPARISON_TIMEPOINT_KEYS,
     decisionPhase6Contract: decisionPhase6Contract,
     localTodayISO: localTodayISO
   };

@@ -42,9 +42,10 @@ try:
         report["checks"] = page.locator("#results li").all_text_contents()
         print(report["summary"], flush=True)
         assert report["result"] == "pass", report["checks"]
-        # Phase5 复验原本 34 项；Phase 6C 追加 2 项「决策与待执行」浏览器接线检查（36 项）：
-        # 6C 决定/清单/详情/门禁/慢响应，以及详情弹层慢响应不覆盖后打开的另一条。
-        assert len(report["checks"]) == 36
+        # Phase5 复验原本 34 项；Phase 6C 追加 2 项（36 项）；Phase 6D 再追加 1 项
+        # 「关联 / 解绑 / 归档门禁 / 确认执行完成全走服务端」（37 项）；Phase 6E 再追加 1 项
+        # 「记录复盘 / 复盘只读 / 配置变化对照 / 月度历史」（38 项）。原断言一条未删。
+        assert len(report["checks"]) == 38
         assert not report["externalRequests"]
         assert not report["pageErrors"]
 

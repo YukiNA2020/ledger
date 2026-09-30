@@ -8,7 +8,7 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.4.25-phase6c-fix2';
+  var APP_VERSION = '2.4.26-phase6e';
   // 追加式事实集合的键名只有一份定义（Store 导出），页面不另列一套（D-025）。
   var COMPANION_KEYS = Store.COMPANION_KEYS;
 
@@ -61,10 +61,18 @@
     decItems: [], decTotal: 0, decInvalidCount: 0,
     decLoaded: false, decLoading: false, decError: '', decRequest: 0,
     decStateFilter: '',
+    // Phase 6E：月度历史。decMonths = 服务端列表聚合的状态事件月（YYYY-MM）；月份与状态
+    // 筛选互为与关系，翻月与返回不清空（数据在本地已读集合上过滤，不重新请求）。
+    decMonths: [], decMonthFilter: '',
     decDetail: null, decDetailError: '', decDetailSeq: 0,
     decSheetRec: null,          // 决定弹层当前对应的服务端建议记录（含 result）
     decNoteDraft: '',           // 决定理由草稿：弹层重绘（如失败回显）不丢用户已打的字
     decBusy: false, decSubmitError: '', decSubmitSeq: 0,
+    // Phase 6D：实际交易关联与执行确认。decLinkEvents = 详情弹层里可选的买入事件（服务端
+    // /security-events），decLinkPending = 「新增交易后按 id 关联」的待关联决策，
+    // decActionBusy = 关联 / 解绑 / 状态推进的防重复点击门闩，decActionError 就地显示。
+    decLinkEvents: null, decLinkEventsError: '', decLinkPending: null,
+    decActionBusy: false,
     // 追加式事实集合：null = 内存无副本（保存时由门面按服务端现值补回）；
     // 只有「从备份恢复」会临时给出整份集合作为覆盖写入。
     riskAssessments: null, allocationTargets: null, approvedInstruments: null,
@@ -1363,6 +1371,7 @@
       state.decItems = (r && r.items) || [];
       state.decTotal = (r && r.total) || 0;
       state.decInvalidCount = (r && r.invalidCount) || 0;
+      state.decMonths = (r && r.months) || [];
       state.decLoaded = true;
       state.decLoading = false;
       state.decError = '';
@@ -1466,15 +1475,33 @@
           return '<option value="' + st + '"' + (state.decStateFilter === st ? ' selected' : '') + '>' +
             esc(DECISION_STATE_LABELS[st] || st) + '（' + n + '）</option>';
         }).join('') + '</select></div>';
-      var rows = state.decStateFilter
-        ? state.decItems.filter(function (d) { return d.state === state.decStateFilter; })
-        : state.decItems;
+      // 6E-2 月度历史：月份 = 服务端按状态事件操作时间聚合的 eventMonths（契约 §5），
+      // 与状态筛选互为与关系；空月份不会出现在选项里，选不出条目时显示空态不报错。
+      html += '<div class="row" style="margin-top:6px">' +
+        '<select class="grow" data-change="dec:month" aria-label="按月份筛选历史决策（状态事件操作时间）">' +
+        '<option value="">全部月份（' + (state.decMonths || []).length + ' 个月）</option>' +
+        (state.decMonths || []).map(function (m) {
+          var n = state.decItems.filter(function (d) {
+            return (d.eventMonths || []).indexOf(m) !== -1;
+          }).length;
+          return '<option value="' + esc(m) + '"' + (state.decMonthFilter === m ? ' selected' : '') + '>' +
+            esc(m) + '（' + n + '）</option>';
+        }).join('') + '</select></div>' +
+        '<div class="small muted" style="margin-top:4px">月份按状态事件的<b>操作时间</b>归属，' +
+        '不是证券交易日；关联交易的交易日与操作时间在决策详情里分列标注。</div>';
+      var rows = state.decItems;
+      if (state.decStateFilter) {
+        rows = rows.filter(function (d) { return d.state === state.decStateFilter; });
+      }
+      if (state.decMonthFilter) {
+        rows = rows.filter(function (d) { return (d.eventMonths || []).indexOf(state.decMonthFilter) !== -1; });
+      }
       html += rows.length
         ? rows.map(decisionCard).join('')
-        : '<div class="card"><div class="small muted">该筛选下暂无决策。</div></div>';
+        : '<div class="card" data-dec-month-empty><div class="small muted">该筛选下暂无决策。</div></div>';
     }
-    html += '<div class="small muted" style="margin-top:10px">实际交易关联与「确认执行完成」属于后续执行功能；' +
-      '本页只呈现事实进度，不提供跳步按钮。</div>';
+    html += '<div class="small muted" style="margin-top:10px">实际交易关联与「确认执行完成」在决策详情里完成：' +
+      '关联只引用既有证券事件，不重复记账；状态推进一律由服务端判定，本页不提供跳步按钮。</div>';
     return html;
   }
 
@@ -1512,6 +1539,84 @@
     return html;
   }
 
+  // 6E-2 复盘对照区（契约 §4.3）：三时点封存快照的六类横向对照，全部搬运服务端 comparison
+  // 值，页面不换算。可比 → 每类一张小卡（决策 / 执行 / 复盘三行 + 变化量）；不可比 →
+  // 按时点给出原因，不输出任何部分数字；复盘时点未封存 → 提示复盘入口，不渲染空表。
+  // 文案铁律（契约 §4.3）：只写「配置变化对照」，禁止「建议收益 / 跑赢目标 / 赚了」。
+  function decisionComparisonHtml(cmp, decisionState) {
+    if (!cmp) {
+      return '<div class="small muted" style="margin-top:6px">三时点配置变化对照属于复盘功能；' +
+        '快照是当时事实的一次性封存。</div>';
+    }
+    var tp = cmp.timepoints || {};
+    var tpLabel = { decision: '决策时点', executed: '执行时点', reviewed: '复盘时点' };
+    var html = '<div class="sec-head" style="margin-top:10px"><b>配置变化对照（非收益）</b></div>';
+    if (!tp.reviewed || !tp.reviewed.present) {
+      html += '<div class="small muted" style="margin-top:4px" data-dec-comparison-pending>' +
+        (tp.executed && tp.executed.present
+          ? '已封存执行时点，复盘时点尚未封存：在上方「执行确认」里记录复盘后，' +
+            '这里显示决策 / 执行 / 复盘三时点的配置变化对照。'
+          : '复盘对照未开始：接受并关联实际交易、确认执行完成后再记录复盘；' +
+            '复盘时点封存后这里显示三时点对照。') + '</div>';
+      return html;
+    }
+    if (!cmp.comparable) {
+      html += '<div class="small warn-text" style="margin-top:4px" data-dec-comparison-incomparable>' +
+        '复盘对照不可比：存在不可比的时点快照，按口径不输出任何数字，也不伪造 0；' +
+        '各时点封存的事实见下方时点快照。不可比原因：</div>';
+      ['decision', 'executed', 'reviewed'].forEach(function (k) {
+        var t = tp[k] || {};
+        if (t.present && !t.available) {
+          html += '<div class="small warn-text" data-dec-comparison-reason="' + esc(k) + '">' +
+            '· ' + esc(tpLabel[k]) + '：' +
+            esc(DECISION_SNAPSHOT_REASON_LABELS[t.reason] || t.reason || '不可比');
+          if ((t.blockers || []).length) {
+            html += '（' + t.blockers.map(function (b) { return esc(blockerText(b)); }).join('；') + '）';
+          }
+          html += '</div>';
+        } else if (!t.present) {
+          html += '<div class="small muted" data-dec-comparison-reason="' + esc(k) + '">· ' +
+            esc(tpLabel[k]) + '：快照未封存</div>';
+        }
+      });
+      return html;
+    }
+    html += '<div class="small muted" style="margin-top:2px">参照目标为决策引用的<b>历史目标版本</b>' +
+      '（targetRef），不是当前生效目标；比例相对该版本的区间中值。</div>' +
+      '<div data-dec-comparison>';
+    (cmp.rows || []).forEach(function (row) {
+      var cellLine = function (label, cell) {
+        if (!cell) return '<div class="small muted" data-cmp-cell="' + label + '">· ' + label + '：不可比</div>';
+        return '<div class="small" data-cmp-cell="' + label + '">· ' + label + '：' +
+          Core.fmtMoney(cell.valueMinor) +
+          (cell.pctBps == null ? ' · 比例不可用' : ' · ' + bpsText(cell.pctBps)) +
+          (cell.band ? ' · ' + esc(BAND_LABELS[cell.band] || cell.band) : '') + '</div>';
+      };
+      var delta = '';
+      if (row.deltaValueMinor != null) {
+        delta = (row.deltaValueMinor > 0 ? '+' : '') + Core.fmtMoney(row.deltaValueMinor) + ' CNY';
+        if (row.deltaPctBps != null) {
+          delta += '（' + (row.deltaPctBps > 0 ? '+' : '') + bpsText(row.deltaPctBps) + '）';
+        }
+      } else {
+        delta = '不可判定';
+      }
+      html += '<div class="db-item" data-cmp-class="' + esc(row.assetClass) + '">' +
+        '<div class="row"><b>' + esc(RISK_CLASS_LABELS[row.assetClass] || row.assetClass) + '</b>' +
+        '<span class="small muted" style="margin-left:auto">参照目标 ' +
+        (row.targetBps == null ? '—' : bpsText(row.targetBps)) + '</span></div>' +
+        cellLine('决策时点', row.decision) +
+        cellLine('执行时点', row.executed) +
+        cellLine('复盘时点', row.review) +
+        '<div class="small" data-cmp-delta>变化（复盘 − 决策）：' + esc(delta) + '</div>' +
+        '</div>';
+    });
+    html += '</div>' +
+      '<div class="small muted" style="margin-top:4px">本对照是配置事实的变化，不是收益归因，' +
+      '也不构成任何回报判断。</div>';
+    return html;
+  }
+
   function decisionDetailHtml(r) {
     var d = r.decision;
     var rec = r.recommendation || {};
@@ -1534,7 +1639,11 @@
       ((exec.fxUnavailable || []).length
         ? ' · 缺汇率事件 ' + exec.fxUnavailable.map(function (id) { return esc(String(id).slice(0, 12)) + '…'; }).join('、')
         : '') + '</div>';
-    html += '<div class="sec-head" style="margin-top:10px"><b>时间线</b></div><div class="db-list" data-dec-timeline>';
+    html += decisionLinksHtml(r);
+    html += decisionActionHtml(r);
+    html += '<div class="sec-head" style="margin-top:10px"><b>时间线</b></div>' +
+      '<div class="small muted">状态事件与关联 / 解绑按<b>操作时间</b>升序；关联交易的<b>交易日</b>见上方关联明细，两者分列不混用。</div>' +
+      '<div class="db-list" data-dec-timeline>';
     if (!(r.timeline || []).length) {
       html += '<div class="db-item">· 尚无状态事件（待决定）</div>';
     }
@@ -1560,9 +1669,268 @@
       (decisionSnapshotHtml('执行时点快照', snaps.executed)) +
       (decisionSnapshotHtml('复盘时点快照', snaps.reviewed)) +
       (decisionSnapshotHtml('归档快照', snaps.archived)) +
-      '<div class="small muted" style="margin-top:6px">三时点配置变化对照属于复盘功能；快照是当时事实的一次性封存。</div>' +
       '</div>';
+    html += decisionComparisonHtml(r.comparison, d.state);
     return html;
+  }
+
+  /* ================= Phase 6D：实际交易关联与执行确认（契约 §3 / §8.5） =================
+     页面只搬运服务端的 links / execution：关联、解绑、状态推进都是服务端命令，
+     页面不折算进度、不预判门禁（是否需要偏差理由、是否允许归档一律由服务端判定）。 */
+
+  function decisionLinkable(st) { return st === 'accepted' || st === 'executed'; }
+
+  function decisionMaps() {
+    var a = Domain.normalizeAssets(state.assets || {});
+    var inst = {}, acc = {};
+    (a.instruments || []).forEach(function (x) { inst[x.id] = x; });
+    (a.assetAccounts || []).forEach(function (x) { acc[x.id] = x; });
+    return { inst: inst, acc: acc };
+  }
+
+  // 关联行文案：事件事实与标的 / 账户标签都来自服务端载荷，页面只做显示拼接。
+  function decisionLinkLabel(l) {
+    var ev = l.event || {};
+    var text;
+    if (ev.eventType === 'buy' || ev.eventType === 'sell') {
+      text = (ev.eventType === 'buy' ? '买入 ' : '卖出 ') + esc(ev.quantity || '') +
+        (ev.priceMinor != null ? ' × ' + Core.fmtMoney(ev.priceMinor) + ' ' + esc(ev.currency || 'CNY') : '');
+    } else {
+      text = esc(EVENT_TYPE_LABELS[ev.eventType] || ev.eventType || '未知事件');
+    }
+    var m = decisionMaps();
+    var ins = m.inst[ev.instrumentId] || {};
+    var acc = m.acc[ev.accountId] || {};
+    return {
+      text: text,
+      // 时间口径（契约 §5）：证券事件的发生日是「交易日」，关联 / 解绑日期是「操作时间」，
+      // 两者分开标注，不混用。
+      meta: (ev.occurredAt ? '交易日 ' + esc(ev.occurredAt) : '') +
+        (ins.symbol ? ' · ' + esc(ins.symbol) : '') +
+        (acc.name ? ' · ' + esc(acc.name) : ''),
+      id: esc(l.id),
+      securityEventId: esc(l.securityEventId)
+    };
+  }
+
+  // 关联清单：活动行给出解绑入口（理由必填），解绑行只读展示，历史不被抹掉。
+  function decisionLinksHtml(r) {
+    var d = r.decision;
+    var links = r.links || [];
+    var canAct = decisionLinkable(d.state);
+    var busy = state.decActionBusy;
+    var activeSev = links.filter(function (l) { return l.unlinkedOn == null; })
+      .map(function (l) { return l.securityEventId; });
+    var html = '<div class="sec-head" style="margin-top:10px"><b>实际交易关联</b>' +
+      '<span class="small muted">只引用既有证券事件，不复制交易、不写记账流水、不改现金余额</span></div>' +
+      '<div class="db-list" data-dec-links>';
+    if (!links.length) html += '<div class="db-item" data-dec-links-empty>· 还没有关联任何实际交易</div>';
+    var unIdx = 0;
+    links.forEach(function (l) {
+      var info = decisionLinkLabel(l);
+      var active = l.unlinkedOn == null;
+      html += '<div class="db-item" data-dec-link="' + info.id + '" data-dec-link-state="' +
+        (active ? 'active' : 'unlinked') + '">' +
+        '<div class="row"><span class="small' + (active ? '' : ' muted') + '">' + info.text + '</span>' +
+        '<span class="small muted" style="margin-left:auto">' + info.meta + '</span></div>' +
+        '<div class="small muted">交易 ' + esc(String(l.securityEventId || '').slice(0, 14)) + '… · ' +
+        (active ? '关联操作时间 ' + esc(l.linkedOn || '') : '解除操作时间 ' + esc(l.unlinkedOn || '')) +
+        (l.note ? ' · 说明：' + esc(l.note) : '') +
+        (!active && l.unlinkNote ? ' · 理由：' + esc(l.unlinkNote) : '') + '</div>' +
+        (active && canAct
+          ? '<div class="row" style="gap:6px;margin-top:6px">' +
+            '<input id="dec-unlink-' + unIdx + '" data-unlink-note data-link-id="' + info.id +
+            '" maxlength="2000" class="grow" placeholder="解绑理由（必填）" aria-label="解绑理由">' +
+            '<button class="btn small" data-action="dec:unlink" data-id="' + info.id + '"' +
+            (busy ? ' disabled' : '') + '>解除关联</button></div>'
+          : '') +
+        '</div>';
+      if (active) unIdx++;
+    });
+    html += '</div>';
+    if (!canAct) {
+      return html + '<div class="small muted" style="margin-top:6px">当前状态（' +
+        esc(DECISION_STATE_LABELS[d.state] || d.state) + '）只读，不能关联或解绑。</div>';
+    }
+    // 可关联候选 = 服务端返回的买入事件里尚未被本决策占用的那些；
+    // 是否已被别的决策占用由服务端判定，重复占用时如实显示 409 说明，页面不预判。
+    var pool = ((state.decLinkEvents && state.decLinkEvents.items) || [])
+      .filter(function (e) { return e.eventType === 'buy' && activeSev.indexOf(e.id) === -1; });
+    html += '<div class="row" style="gap:8px;margin-top:8px">' +
+      '<input id="dec-link-note" class="grow" maxlength="2000" placeholder="关联说明（可选，如「第一批买入」）"' +
+      ' aria-label="关联说明"' + (busy ? ' disabled' : '') + '></div>' +
+      '<div class="row" style="gap:8px;margin-top:6px">' +
+      '<select id="dec-link-pick" class="grow" aria-label="选择要关联的买入事件">' +
+      (pool.length
+        ? pool.map(function (e) {
+            var info = decisionLinkLabel({ securityEventId: e.id, event: e, linkedOn: e.occurredAt });
+            return '<option value="' + esc(e.id) + '">' + info.text + ' · ' + info.meta + '</option>';
+          }).join('')
+        : '<option value="">没有可关联的买入事件</option>') +
+      '</select>' +
+      '<button class="btn small primary" data-action="dec:link"' +
+      ((pool.length && !busy) ? '' : ' disabled') + '>关联这笔</button></div>' +
+      '<div class="row" style="gap:8px;margin-top:6px">' +
+      '<button class="btn small ghost" data-action="dec:newtrade"' + (busy ? ' disabled' : '') +
+      '>新增买入并关联</button>' +
+      '<span class="small muted">新增交易复用「持仓与证券事件」原录入入口，保存后按 id 关联</span></div>';
+    if (state.decLinkEventsError) {
+      html += '<div class="small warn-text" style="margin-top:6px" data-dec-link-events-error>买入事件读取失败：' +
+        esc(state.decLinkEventsError) + '，上方候选可能不完整；关联结果仍以服务端校验为准。</div>';
+    }
+    return html;
+  }
+
+  // 执行确认 / 复盘入口（契约 §1.3 L4/L5/L6）：accepted → executed 要求活动关联 ≥1
+  // （有偏差必须填说明），accepted → archived 要求活动关联 = 0，executed → reviewed 复盘
+  // 理由必填。页面不预判门禁结果，失败就地显示服务端原因；复盘后一切只读。
+  function decisionActionHtml(r) {
+    var d = r.decision;
+    if (!decisionLinkable(d.state)) return '';
+    var busy = state.decActionBusy;
+    var html = '<div class="sec-head" style="margin-top:10px"><b>执行确认</b></div>' +
+      '<div class="small muted" data-dec-action-hint>' +
+      (d.state === 'accepted'
+        ? '关联实际买入后确认执行完成；放弃执行前须先把活动关联全部解绑。原建议金额不会被改写。'
+        : '已执行：仍可补记或解绑实际交易；核对无误后记录复盘（理由必填）。复盘是终态，' +
+          '封存复盘快照后这条决策一切只读，之后改行情 / 目标 / 资产都不会改变已封存的事实。') + '</div>' +
+      '<div class="small warn-text" data-dec-action-error hidden></div>';
+    if (d.state === 'executed') {
+      html += '<div class="row" style="gap:8px;margin-top:8px">' +
+        '<input id="dec-review-note" class="grow" maxlength="2000" placeholder="复盘理由（必填：对照结果与下一步）"' +
+        ' aria-label="复盘理由"' + (busy ? ' disabled' : '') + '>' +
+        '<button class="btn small primary" data-action="dec:event" data-to="reviewed"' +
+        (busy ? ' disabled' : '') + '>记录复盘</button></div>';
+      return html;
+    }
+    html += '<div class="row" style="gap:8px;margin-top:8px">' +
+      '<input id="dec-exec-note" class="grow" maxlength="2000" placeholder="执行说明（有偏差时必填）"' +
+      ' aria-label="执行说明"' + (busy ? ' disabled' : '') + '>' +
+      '<button class="btn small primary" data-action="dec:event" data-to="executed"' +
+      (busy ? ' disabled' : '') + '>确认执行完成</button>' +
+      '<button class="btn small" data-action="dec:event" data-to="archived"' +
+      (busy ? ' disabled' : '') + '>放弃执行并归档</button></div>';
+    return html;
+  }
+
+  function decisionSheetId() {
+    var d = document.querySelector('#sheet [data-dec-detail]');
+    return d ? d.getAttribute('data-dec-detail-id') : '';
+  }
+
+  function decActionFail(msg) {
+    var box = document.querySelector('#sheet [data-dec-action-error]');
+    if (box) { box.textContent = msg; box.hidden = false; }
+    toast(msg, 'err');
+  }
+  function decActionClearError() {
+    var box = document.querySelector('#sheet [data-dec-action-error]');
+    if (box) { box.textContent = ''; box.hidden = true; }
+  }
+  function setDecActionBusy(on) {
+    state.decActionBusy = !!on;
+    $all('#sheet button[data-action^="dec:"]').forEach(function (b) { b.disabled = !!on; });
+  }
+
+  // 关联 / 解绑 / 状态推进成功后就地重读详情（弹层保持打开，序号照旧防晚到覆盖）；
+  // 失败保持弹层与用户已输入的内容，只就地显示错误 —— 失败绝不显示成功。
+  function reloadDecisionDetail(id) {
+    var seq = ++state.decDetailSeq;
+    if ($('#sheet-mask').classList.contains('hidden')) { state.decActionBusy = false; return Promise.resolve(); }
+    return Promise.all([Store.decisionDetail(id), Store.listSecurityEvents()]).then(function (rs) {
+      if (seq !== state.decDetailSeq) return;
+      if ($('#sheet-mask').classList.contains('hidden')) return;
+      state.decDetail = rs[0];
+      state.decLinkEvents = rs[1];
+      state.decLinkEventsError = '';
+      state.decActionBusy = false;
+      openSheet('决策详情', decisionDetailHtml(rs[0]));
+      ensureDecisionsLoaded(true); // 卡片上的执行进度同步刷新
+    }).catch(function (e) {
+      if (seq !== state.decDetailSeq) return;
+      state.decActionBusy = false;
+      decActionFail('详情刷新失败：' + ((e && e.message) || '未知错误') +
+        '；请关闭弹层后重新打开核对，关联结果以服务端为准。');
+    });
+  }
+
+  function decisionLinkAction() {
+    var id = decisionSheetId();
+    if (!id || state.decActionBusy) return;
+    var pick = document.getElementById('dec-link-pick');
+    var sevId = pick ? pick.value : '';
+    if (!sevId) { toast('没有可关联的买入事件', 'warn'); return; }
+    var noteEl = document.getElementById('dec-link-note');
+    var note = noteEl ? String(noteEl.value || '').trim() : '';
+    var payload = { securityEventId: sevId };
+    if (note) payload.note = note;
+    setDecActionBusy(true);
+    decActionClearError();
+    Store.createDecisionLink(id, payload, { idempotencyKey: Core.newId('lnk') })
+      .then(function (r) {
+        toast(r && r.created === false ? '这笔交易已关联过，未重复占用' : '已关联实际交易', 'ok');
+        return reloadDecisionDetail(id);
+      })
+      .catch(function (e) {
+        setDecActionBusy(false);
+        decActionFail('关联失败：' + ((e && e.message) || '未知错误') +
+          '。交易事实没有被复制，可重新选择后重试。');
+      });
+  }
+
+  function decisionUnlinkAction(el) {
+    var id = decisionSheetId();
+    if (!id || state.decActionBusy) return;
+    var linkId = el.getAttribute('data-id');
+    var input = document.querySelector('#sheet input[data-link-id="' + linkId + '"]');
+    var note = input ? String(input.value || '').trim() : '';
+    if (!note) { toast('解绑必须填写理由', 'warn'); return; }
+    setDecActionBusy(true);
+    decActionClearError();
+    Store.unlinkDecisionLink(id, { linkId: linkId, note: note }, { idempotencyKey: Core.newId('lnk') })
+      .then(function () { toast('已解除关联', 'ok'); return reloadDecisionDetail(id); })
+      .catch(function (e) {
+        setDecActionBusy(false);
+        decActionFail('解绑失败：' + ((e && e.message) || '未知错误') + '。该关联保持原样。');
+      });
+  }
+
+  function decisionEventAction(el) {
+    var id = decisionSheetId();
+    if (!id || state.decActionBusy) return;
+    var to = el.getAttribute('data-to');
+    // executed 与 archived 的说明各用独立输入框；reviewed 的理由在复盘输入框里
+    var noteEl = document.getElementById(to === 'reviewed' ? 'dec-review-note' : 'dec-exec-note');
+    var note = noteEl ? String(noteEl.value || '').trim() : '';
+    if ((to === 'archived' || to === 'reviewed') && !note) {
+      toast(to === 'reviewed' ? '复盘必须填写理由' : '归档必须填写理由', 'warn');
+      return;
+    }
+    var payload = { toState: to };
+    if (note) payload.note = note;
+    setDecActionBusy(true);
+    decActionClearError();
+    Store.appendDecisionEvent(id, payload, { idempotencyKey: Core.newId('deve') })
+      .then(function (r) {
+        var st = (r && r.decision && r.decision.state) || to;
+        toast('已记录状态：' + (DECISION_STATE_LABELS[st] || st), 'ok');
+        return reloadDecisionDetail(id);
+      })
+      .catch(function (e) {
+        setDecActionBusy(false);
+        decActionFail('状态没有推进：' + ((e && e.message) || '未知错误') + '。决策仍保持原状态。');
+      });
+  }
+
+  // 新增交易后按 id 关联：关掉详情 → 回到资产页 → 复用原证券事件录入弹层；
+  // 关联在 holding:saveEvent 保存成功后按返回的事件 id 继续（失败不重建交易）。
+  function decisionNewTradeAction() {
+    var id = decisionSheetId();
+    if (!id) return;
+    closeSheet();
+    state.decLinkPending = id;
+    nav('assets');
+    holdingEventSheet();
   }
 
   function openDecisionDetail(id) {
@@ -1573,11 +1941,21 @@
     var seq = ++state.decDetailSeq;
     openSheet('决策详情', '<div class="small muted" data-dec-detail-loading data-dec-detail-id="' +
       esc(id) + '">决策详情读取中…</div>');
-    Store.decisionDetail(id).then(function (r) {
+    // 6D：详情与「可关联的买入事件」一起读，二者都到手才渲染，避免弹层半路重排；
+    // 买入事件读失败不阻断详情（关联区如实标注候选可能不完整）。
+    var eventsReq = Store.listSecurityEvents().then(function (r) {
+      state.decLinkEventsError = '';
+      return r;
+    }).catch(function (e) {
+      state.decLinkEventsError = (e && e.message) || '读取失败';
+      return { items: [] };
+    });
+    Promise.all([Store.decisionDetail(id), eventsReq]).then(function (rs) {
       if (seq !== state.decDetailSeq) return; // 已有更新的详情请求（或用户已打开另一条）
       if ($('#sheet-mask').classList.contains('hidden')) return; // 已关闭：不强行弹回脸上
-      state.decDetail = r;
-      openSheet('决策详情', decisionDetailHtml(r));
+      state.decDetail = rs[0];
+      state.decLinkEvents = rs[1];
+      openSheet('决策详情', decisionDetailHtml(rs[0]));
     }).catch(function (e) {
       if (seq !== state.decDetailSeq) return;
       if ($('#sheet-mask').classList.contains('hidden')) return;
@@ -1699,6 +2077,9 @@
   function closeSheet() {
     // 关闭详情即使马上打开别的弹层，旧请求也不能借新弹层的可见状态回填。
     state.decDetailSeq++;
+    // 6D：「新增交易并关联」的待关联意图随弹层关闭一起作废，避免之后的普通录入被误关联
+    state.decLinkPending = null;
+    state.decActionBusy = false;
     $('#sheet-mask').classList.add('hidden');
     $('#sheet').innerHTML = '';
   }
@@ -5228,6 +5609,11 @@
     'dec:submit': submitDecision,
     'dec:detail': function (el) { openDecisionDetail(el.dataset.id); },
     'dec:reload': function () { ensureDecisionsLoaded(true); },
+    // Phase 6D：关联 / 解绑 / 确认执行 / 归档都是服务端命令，失败在弹层里就地显示
+    'dec:link': function () { decisionLinkAction(); },
+    'dec:unlink': function (el) { decisionUnlinkAction(el); },
+    'dec:newtrade': function () { decisionNewTradeAction(); },
+    'dec:event': function (el) { decisionEventAction(el); },
     'map:add': function (el) {
       var cls = el.dataset.cls;
       var pick = document.querySelector('#map-pick-' + cls);
@@ -5607,10 +5993,37 @@
       // 追加式事实：带一次性幂等键防双击重复提交；真重放由服务端 duplicate_event 拒绝
       var idemKey = 'evt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
       Store.createResource('security-events', payload, { idempotencyKey: idemKey }).then(function (r) {
+        // 6D：从「新增买入并关联」进来时，交易保存成功后按返回的事件 id 继续关联。
+        // 先取再清 —— closeSheet 会清掉 pending，避免之后的普通录入被误关联。
+        var pending = state.decLinkPending;
+        state.decLinkPending = null;
         closeSheet();
         toast(r && r.warning ? '事件已记录（标的分类未确认，正式估值会被阻塞）' : '事件已记录');
-        return refreshAssets();
-      }).catch(resourceFail);
+        var done = refreshAssets();
+        if (!pending) return done;
+        var newId = (r && r.item && r.item.id) || '';
+        if (!newId) {
+          toast('交易已保存，但没有拿到事件 id，可在决策详情里手动关联（不会重建交易）', 'warn');
+          return done;
+        }
+        return done.then(function () {
+          return Store.createDecisionLink(pending, { securityEventId: newId, note: '新增交易后按 id 关联' },
+            { idempotencyKey: Core.newId('lnk') })
+            .then(function () {
+              toast('交易已记录并关联到该决策', 'ok');
+              ensureDecisionsLoaded(true);
+              if ($('#sheet-mask').classList.contains('hidden')) openDecisionDetail(pending);
+            })
+            .catch(function (e) {
+              // 交易已经落库，只有关联失败：明确说明可重试，且重试不重建交易
+              toast('交易已保存，但关联失败：' + ((e && e.message) || '未知错误') +
+                '。可在决策详情里重新关联，不会重建这笔交易。', 'err');
+            });
+        });
+      }).catch(function (e) {
+        state.decLinkPending = null; // 交易没保存：不要把待关联留给下一次录入
+        resourceFail(e);
+      });
     },
     /* ---------- Phase 4D：行情（手动补价）与汇率自动更新 ---------- */
 
@@ -6022,6 +6435,7 @@
     'wiz:transferTarget': function (el) { state.wiz.transferTarget = el.value || null; },
     // Phase 6C：历史决策的状态筛选（只改本地视图，列表数据全部已在服务端响应里）
     'dec:filter': function (el) { state.decStateFilter = el.value; render(); },
+    'dec:month': function (el) { state.decMonthFilter = el.value; render(); },
     'bm:col': function (el) {
       var w = state.wiz;
       w.customCols = w.customCols || {};

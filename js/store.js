@@ -612,6 +612,26 @@
   }
 
   // 创建决策（intent 缺省 = 两步式 proposed；页面一步式给出 accepted/deferred/dismissed + note）。
+  // 6D（契约 §8.5）：关联 / 解绑子资源。关联靠 (决策, 事件) 活动唯一做自然幂等
+  // （created:false），解绑没有自然幂等 —— 页面必须带 Idempotency-Key 防双击。
+  function createDecisionLink(decisionId, payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/decisions/' + encodeURIComponent(decisionId) + '/links', {
+        method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
+  function unlinkDecisionLink(decisionId, payload, options) {
+    var opts = options || {};
+    return requireWriteMode().then(function () {
+      return apiFetch('/decisions/' + encodeURIComponent(decisionId) + '/links/unlink', {
+        method: 'POST', body: payload, idempotencyKey: opts.idempotencyKey
+      });
+    });
+  }
+
   function createDecision(payload, options) {
     var opts = options || {};
     return requireWriteMode().then(function () {
@@ -672,6 +692,8 @@
     decisionDetail: decisionDetail,
     createDecision: createDecision,
     appendDecisionEvent: appendDecisionEvent,
+    createDecisionLink: createDecisionLink,
+    unlinkDecisionLink: unlinkDecisionLink,
     COMPANION_KEYS: COMPANION_KEYS
   };
 });

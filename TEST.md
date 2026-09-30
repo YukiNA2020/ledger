@@ -2,9 +2,21 @@
 
 > 文档用途：记录可复现的测试证据、覆盖范围、缺陷和发布判断。
 > 创建时间：2026-08-16
-> 最近更新：2026-09-29
+> 最近更新：2026-09-30
 
 ## 当前结论
+
+2026-09-30 Phase 6E `2.4.26-phase6e`：**全量 `node --test` 692/692**（6D 基线 686 + 6E 新增 6 项：`tests/server-phase6.test.js` 6E-01～6E-04 共 4 条、`tests/domain-phase6.test.js` 6E-11/6E-12 共 2 条）；**浏览器 wiring 38 项 × 3 轮全绿**（19212、19213、19214，均为隔离临时库 + 干净 Chromium profile）；**`browser-review.py` 38 项 pass**（19221，`externalRequests=[]`、`pageErrors=[]`，撤销映射 / 行情过期 / 断网知识卡三项审计探针通过）；**三档宽度与状态 71 项**（18 路由 × 1440/1100/390 的 54 项 + 决定弹层 / 详情弹层（无关联）/ 详情弹层（已关联）/ 复盘对照弹层各 3 档共 12 项 + 读取中 / 读取失败 / 重试后空态 / 接受成功 / 买入事件写入 5 项状态）全部通过。`node --check` 与 `git diff --check` 通过。证据与复跑脚本见 `docs/evidence/phase6-6e-20260930/`（`run_wiring_6e.py`、`run_width_6e.py`、`wiring-run-*.json`、`width-result.json`、截图），浏览器审计证据见 `docs/evidence/phase5-review-20260927/browser-19221.json`。`browser-review.py` 的数量契约已按拆解 §9 由 37 同步为 **38**（原 37 项语义与断言全部保留，仅新增 6E 一项检查的计数）。6E 覆盖要点：
+
+- 服务端 6E-01～6E-04：F-A 对照逐分核对（详情 `comparison` 三时点 cell 与封存快照逐字段一致、`deltaValueMinor` / `deltaPctBps` 逐 bps 可复算、现金 delta 恒 0 而买入类别 delta 非零、`targetBps` 取 targetRef 历史版本、reviewed 后关联 409 `illegal_state_for_link`）；执行后行情变化再复盘 → `reviewed_with_drift` 且 delta 与封存值一致；现金未核对（余额推上月，A-005 按月判定）→ 复盘照常封存 `available:false` + `cash_not_reconciled` + 既有 blockers，对照全表无数字而可比时点封存数字仍在快照区；删 VOO 报价 → `valuation_not_formal` + `quote_missing`；未执行决策 `comparison` 形状稳定（6 行、cell 全 null、timepoints `present:false`）；备份 → 清空 → 恢复后对照与详情逐字段一致；直接改库篡改复盘快照原文 → 详情 400 / 列表 `invalidCount=1`，有效备份可恢复。
+- 领域 6E-11/6E-12：手工三时点 fixture 逐分 / 逐 bps 核对；0 投资池（比例 null 不算不可比、金额照常、`deltaPctBps` null）；任一时点不可比 / 缺失 → 全表 cell 与 delta 全 null，`timepoints` 原样搬运 reason + blockers；输入快照形状坏 fail closed；同一 targetRef 下 `targetBps` 不一致拒止；`validateDecisionComparisonShape` 自检 comparable 与 null 的一致性（可比时 delta 必须可复算、不可比时不得携带任何数字）。
+- 第 38 项 wiring 检查：复盘理由为空被挡（状态不推进）、填理由后 chip `reviewed`、复盘时点快照封存、对照表恒 6 行且每行有变化量、标题「配置变化对照（非收益）」、弹层全文禁止「建议收益 / 跑赢目标 / 赚了」、reviewed 无关联选择器 / 解绑 / 状态推进入口、月份筛选选定月份与复位后决策均可见；原 6D 第 37 项收尾断言按拆解 §11 由「executed 不提供状态推进入口（复盘属 6E）」显式推进为「executed 仅提供复盘入口、无归档 / 重复执行入口」（注释写明原因，原语义未删）。
+
+2026-09-29 Phase 6D `2.4.25-phase6d`：**全量 `node --test` 686/686**（6C 基线 679 + 6D 新增 7 项：`tests/server-phase6.test.js` 6D-01～6D-05 共 5 条、`tests/domain-phase6.test.js` 6D-11/6D-12 共 2 条）；**浏览器 wiring 37 项 × 3 轮全绿**（19102、19103、19104，均为隔离临时库 + 干净 Chromium profile）；**`browser-review.py` 37 项 pass**（19121，`externalRequests=[]`、`pageErrors=[]`，撤销映射 / 行情过期 / 断网知识卡三项审计探针通过）；**三档宽度与状态 68 项**（18 路由 × 1440/1100/390 的 54 项 + 决定弹层 / 详情弹层（无关联）/ 详情弹层（已关联）各 3 档共 9 项 + 读取中 / 读取失败 / 重试后空态 / 接受成功 / 买入事件写入 5 项状态）全部通过。`node --check` 与 `git diff --check` 通过。证据与复跑脚本见 `docs/evidence/phase6-6d-20260929/`（`run_wiring_6d.py`、`run_width_6d.py`、`wiring-run-*.json`、`width-result.json`、截图），浏览器审计证据见 `docs/evidence/phase5-review-20260927/browser-19121.json`。`browser-review.py` 的数量契约已按拆解 §9 由 36 同步为 **37**（原 34 项语义与断言全部保留，仅新增 6D 一项检查的计数）。6D 覆盖要点：
+
+- 第 37 项 wiring 检查覆盖：从服务端 `/security-events` 关联既有买入 → 归档被 `has_linked_events` 拒绝 → 空理由解绑被挡 → 填理由解绑（软删除 1 行、事件数 / 状态 / 余额不变）→ 重新关联 → 填 note 确认执行（chip `executed` + 时点快照 + ≥2 条 `data-tl=link` 时间线）→ executed 后仍可解绑但不再显示执行/归档按钮；新增交易成功而关联失败不重建交易；关联/解绑/执行全走服务端，失败不假成功。
+- 服务端 6D-01～6D-05：关联 201 + 自然幂等 200（不产生状态事件、不复制证券事件、不写 `txns`、不改余额）；`unknown_decision` 404、`proposed/archived` 409 `illegal_state_for_link`、`invalid_link_target` 409、`unknown_security_event` 422、派生键/坏 note 400、`event_already_linked` 409；`Idempotency-Key` 回放 200 + `X-Ledger-Idempotent: replay`、冲突 409；解绑缺 note 400、形状非法 400、查无此行 422、张冠李戴 422、重复解绑 409 `link_not_active`、重关联换新 id 且历史行保留、archived 后解绑 409；分批两笔 → `deviation_note_required` **400** → `executed`，快照与详情关联 id 与端点返回一致。
+- 领域 6D-11/6D-12：关联 / 解绑请求键白名单、必填与形状、note 长度、`linkId` 形状（`lnk-<16hex>`）、派生键拒绝、常量冻结。
 
 2026-09-29 Phase 6C `2.4.25-phase6c-fix2`：**全量 `node --test` 679/679**（6B 基线 677 + 6C 新增 2 项 `tests/store-headers.test.js` 决策封装契约）；**浏览器 wiring 36 项 × 2 轮全绿**（19041、19047，均为隔离临时库 + 干净 Chromium profile；19047 由 `browser-review.py` 跑出，含撤销映射 / 行情过期 / 断网知识卡三项审计探针，`externalRequests=[]`、`pageErrors=[]`、`auditPassed=true`）；**三档宽度与状态 64 项**（18 路由 × 1440/1100/390 的 54 项 + 决定弹层与详情弹层各 3 档共 6 项 + 读取中 / 读取失败 / 重试后空态 / 接受成功 4 项状态）全部通过。`node --check` 与 `git diff --check` 通过。证据与复跑脚本见 `docs/evidence/phase6-6c-20260929/`（`run_wiring_6c.py`、`run_width_6c.py`、`wiring-run-*.json`、`width-result.json`、截图），浏览器审计证据见 `docs/evidence/phase5-review-20260927/browser-19047.json`。`browser-review.py` 的数量契约已按拆解 §9 由 34 同步为 36（原 34 项语义与断言全部保留）。6C 覆盖要点：
 

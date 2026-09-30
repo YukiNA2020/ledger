@@ -1159,3 +1159,586 @@ test('6B-28 快照 JSON 原文字节被改但解析值不变时，同样不得�
     ctx.close();
   }
 });
+
+/* ================= Phase 6D：关联实际交易与记录执行（契约 §3 / §7 / §8.5 / §10.2-8~14） ================= */
+
+// 6B 的关联是全量写入预置（当时没有 HTTP 入口）；6D 起关联 / 解绑走专用端点，这里统一用它造事实。
+async function newAcceptedDecision(port, facts, seed) {
+  const recRes = await post(port, '/api/v1/recommendations', recommendBody(facts, { newFundsMinor: NEW_FUNDS_MINOR + seed }));
+  assert.strictEqual(recRes.status, 201, JSON.stringify(recRes.json));
+  const res = await post(port, '/api/v1/decisions', {
+    recommendationId: recRes.json.recommendation.id, intent: 'accepted', note: '接受理由'
+  });
+  assert.ok(res.status === 201 || res.status === 200, JSON.stringify(res.json));
+  return res.json.decision;
+}
+
+async function seedBuy(port, id, over) {
+  const res = await putFullState(port, (st) => {
+    st.assets.securityEvents = (st.assets.securityEvents || []).concat([buyEvent(id, over)]);
+  });
+  assert.strictEqual(res.status, 200, JSON.stringify(res.json));
+}
+
+const SEV1 = 'sev-6d00000000000001';
+const SEV2 = 'sev-6d00000000000002';
+const SEV_SELL = 'sev-6d00000000000003';
+
+test('6D-01 关联正向：201 created → 自然幂等 200 created:false，执行汇总与详情一致，且不产生状态事件', async () => {
+  const ctx = setup('ledger-p6d1-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const decision = await newAcceptedDecision(srv.port, facts, 1);
+    await seedBuy(srv.port, SEV1);
+
+    const res = await post(srv.port, '/api/v1/decisions/' + decision.id + '/links',
+      { securityEventId: SEV1, note: '第一笔买入' });
+    assert.strictEqual(res.status, 201, JSON.stringify(res.json));
+    assert.strictEqual(res.json.created, true);
+    assert.match(res.json.link.id, /^lnk-[0-9a-f]{16}$/, '契约 §6.1：关联行 id = lnk-<16hex>');
+    assert.strictEqual(res.json.link.decisionId, decision.id);
+    assert.strictEqual(res.json.link.linkedOn, TODAY, 'linkedOn 由服务端生成');
+    assert.strictEqual(res.json.link.linkedAt, NOW_ISO, 'linkedAt 由服务端生成');
+    assert.strictEqual(res.json.link.unlinkedOn, null);
+    assert.strictEqual(res.json.link.note, '第一笔买入');
+    assert.strictEqual(res.json.links.length, 1, '响应直接带关联行（页面不再二次查事件）');
+    assert.strictEqual(res.json.links[0].event.eventType, 'buy');
+    assert.strictEqual(res.json.links[0].event.quantity, '20');
+    assert.strictEqual(res.json.execution.linkedCount, 1);
+    assert.strictEqual(res.json.execution.linkedPrincipalCnyMinor, 200000, '20 × 100.00 CNY = 2,000.00 本金');
+    assert.strictEqual(res.json.execution.linkedFeeCnyMinor, 500, '费用单列，不并入本金');
+
+    // 自然幂等：同一事件关联到同一条决策 → 200 created:false，同一条 link，不出现第二行
+    const again = await post(srv.port, '/api/v1/decisions/' + decision.id + '/links',
+      { securityEventId: SEV1, note: '第一笔买入' });
+    assert.strictEqual(again.status, 200, JSON.stringify(again.json));
+    assert.strictEqual(again.json.created, false);
+    assert.strictEqual(again.json.link.id, res.json.link.id);
+    assert.strictEqual(again.json.links.length, 1);
+
+    // 关联是关联层动作：不写状态事件、不改 decisions 行、不复制证券事件、不写 txns
+    const st = (await get(srv.port, '/api/v1/state')).json;
+    assert.strictEqual(st.decisionEvents.filter((e) => e.decisionId === decision.id).length, 1, '关联不得追加状态事件');
+    assert.strictEqual(st.decisions.filter((d) => d.id === decision.id)[0].state, 'accepted', '状态不变');
+    assert.strictEqual(st.decisionLinks.length, 1, '只有一条关联行');
+    assert.strictEqual(st.txns.length, 0, '关联不写 txns');
+    assert.strictEqual(st.assets.securityEvents.length, 1, '关联不复制证券事件');
+
+    // 详情与关联响应同一份计算
+    const detail = await get(srv.port, '/api/v1/decisions/' + decision.id);
+    assert.strictEqual(detail.status, 200, JSON.stringify(detail.json));
+    assert.strictEqual(detail.json.links.length, 1);
+    assert.strictEqual(detail.json.links[0].id, res.json.link.id);
+    assert.strictEqual(detail.json.execution.linkedPrincipalCnyMinor, 200000);
+    assert.strictEqual(res.json.execution.remainingMinor,
+      detail.json.recommendation.allocatedTotalMinor - 200000, '剩余 = 建议金额 − 关联本金（§3.3）');
+    assert.ok(detail.json.timeline.some((t) => t.kind === 'link' && t.action === 'link' && t.linkId === res.json.link.id),
+      '详情时间线要有关联记录');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6D-02 关联反例（契约 §10.2-8~10）：404 unknown_decision / 409 illegal_state_for_link、invalid_link_target / 422 unknown_security_event / 409 event_already_linked / 400 派生键', async () => {
+  const ctx = setup('ledger-p6d2-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const d1 = await newAcceptedDecision(srv.port, facts, 1);
+    const d2 = await newAcceptedDecision(srv.port, facts, 2);
+    const d3 = await newAcceptedDecision(srv.port, facts, 3);   // 保持 accepted，专供抢关联反例
+    const linkPath = (d) => '/api/v1/decisions/' + d.id + '/links';
+    await seedBuy(srv.port, SEV1);
+    await seedBuy(srv.port, SEV_SELL, { eventType: 'sell', quantity: '10' });
+
+    // 未知决策 → 404 unknown_decision（路径参数）
+    const unknown = await post(srv.port, '/api/v1/decisions/dec-0000000000000000/links', { securityEventId: SEV1 });
+    assert.strictEqual(unknown.status, 404, JSON.stringify(unknown.json));
+    assert.strictEqual(unknown.json.error.code, 'unknown_decision');
+
+    // 只有 accepted / executed 能关联：proposed 与 archived 都 409
+    const proposed = await post(srv.port, '/api/v1/recommendations', recommendBody(facts, { newFundsMinor: NEW_FUNDS_MINOR + 3 }));
+    const pDecision = (await post(srv.port, '/api/v1/decisions',
+      { recommendationId: proposed.json.recommendation.id })).json.decision;
+    const pRes = await post(srv.port, linkPath(pDecision), { securityEventId: SEV1 });
+    assert.strictEqual(pRes.status, 409, JSON.stringify(pRes.json));
+    assert.strictEqual(pRes.json.error.code, 'illegal_state_for_link');
+
+    const archived = await post(srv.port, '/api/v1/decisions/' + d2.id + '/events', { toState: 'archived', note: '放弃，无交易' });
+    assert.strictEqual(archived.status, 200, JSON.stringify(archived.json));
+    const aRes = await post(srv.port, linkPath(d2), { securityEventId: SEV1 });
+    assert.strictEqual(aRes.status, 409, JSON.stringify(aRes.json));
+    assert.strictEqual(aRes.json.error.code, 'illegal_state_for_link');
+
+    // 非 buy 事件 → 409 invalid_link_target（契约 §3.1：sell / dividend / fee 不参与本金）
+    const sellRes = await post(srv.port, linkPath(d1), { securityEventId: SEV_SELL });
+    assert.strictEqual(sellRes.status, 409, JSON.stringify(sellRes.json));
+    assert.strictEqual(sellRes.json.error.code, 'invalid_link_target');
+
+    // 载荷引用不存在的事件 → 422 unknown_security_event
+    const ghostRes = await post(srv.port, linkPath(d1), { securityEventId: 'sev-6ddeadbeefdeadbeef' });
+    assert.strictEqual(ghostRes.status, 422, JSON.stringify(ghostRes.json));
+    assert.strictEqual(ghostRes.json.error.code, 'unknown_security_event');
+
+    // 派生键 / 未知键 → 400 invalid_decision_payload（服务端生成的时间不得由客户端提交）
+    const derived = await post(srv.port, linkPath(d1),
+      { securityEventId: SEV1, linkedOn: TODAY, linkedAt: NOW_ISO, id: 'lnk-0000000000000000' });
+    assert.strictEqual(derived.status, 400, JSON.stringify(derived.json));
+    assert.strictEqual(derived.json.error.code, 'invalid_decision_payload');
+    const badNote = await post(srv.port, linkPath(d1), { securityEventId: SEV1, note: 42 });
+    assert.strictEqual(badNote.status, 400, JSON.stringify(badNote.json));
+    assert.strictEqual(badNote.json.error.code, 'invalid_decision_payload');
+
+    // 事件已活动关联到另一决策 → 409 event_already_linked
+    const first = await post(srv.port, linkPath(d1), { securityEventId: SEV1, note: '挂到 d1' });
+    assert.strictEqual(first.status, 201, JSON.stringify(first.json));
+    const steal = await post(srv.port, linkPath(d3), { securityEventId: SEV1 });
+    assert.strictEqual(steal.status, 409, JSON.stringify(steal.json));
+    assert.strictEqual(steal.json.error.code, 'event_already_linked');
+    const st = (await get(srv.port, '/api/v1/state')).json;
+    assert.strictEqual(st.decisionLinks.length, 1, '抢关联失败不得留下半条关联行');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6D-03 幂等键（契约 §8.6）：同 key 同载荷回放 200 replay，同 key 异载荷 409 idempotency_conflict', async () => {
+  const ctx = setup('ledger-p6d3-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const decision = await newAcceptedDecision(srv.port, facts, 1);
+    await seedBuy(srv.port, SEV1);
+    await seedBuy(srv.port, SEV2);
+    const body = { securityEventId: SEV1, note: '幂等关联' };
+    const first = await post(srv.port, '/api/v1/decisions/' + decision.id + '/links', body,
+      { headers: { 'Idempotency-Key': 'p6d-key-01' } });
+    assert.strictEqual(first.status, 201, JSON.stringify(first.json));
+
+    const replay = await post(srv.port, '/api/v1/decisions/' + decision.id + '/links', body,
+      { headers: { 'Idempotency-Key': 'p6d-key-01' } });
+    assert.strictEqual(replay.status, 200, JSON.stringify(replay.json));
+    assert.strictEqual(replay.headers['x-ledger-idempotent'], 'replay');
+    assert.strictEqual(replay.json.link.id, first.json.link.id);
+
+    const conflict = await post(srv.port, '/api/v1/decisions/' + decision.id + '/links',
+      { securityEventId: SEV2, note: '另一笔' }, { headers: { 'Idempotency-Key': 'p6d-key-01' } });
+    assert.strictEqual(conflict.status, 409, JSON.stringify(conflict.json));
+    assert.strictEqual(conflict.json.error.code, 'idempotency_conflict');
+    const st = (await get(srv.port, '/api/v1/state')).json;
+    assert.strictEqual(st.decisionLinks.length, 1, '幂等冲突不得写入第二条关联');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6D-04 解绑与重新关联（契约 §3.4 / §10.2-11、14）：软删除三列齐、422 unknown_decision_link、409 link_not_active、重关联换新 id', async () => {
+  const ctx = setup('ledger-p6d4-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const d1 = await newAcceptedDecision(srv.port, facts, 1);
+    const d2 = await newAcceptedDecision(srv.port, facts, 2);
+    await seedBuy(srv.port, SEV1);
+    const linkRes = await post(srv.port, '/api/v1/decisions/' + d1.id + '/links',
+      { securityEventId: SEV1, note: '先关联' });
+    assert.strictEqual(linkRes.status, 201, JSON.stringify(linkRes.json));
+    const linkId = linkRes.json.link.id;
+    const unlinkPath = (d) => '/api/v1/decisions/' + d.id + '/links/unlink';
+
+    // 解绑缺 note → 400（解绑必须写明理由）
+    const noNote = await post(srv.port, unlinkPath(d1), { linkId: linkId });
+    assert.strictEqual(noNote.status, 400, JSON.stringify(noNote.json));
+    assert.strictEqual(noNote.json.error.code, 'invalid_decision_payload');
+    const emptyNote = await post(srv.port, unlinkPath(d1), { linkId: linkId, note: '   ' });
+    assert.strictEqual(emptyNote.status, 400, JSON.stringify(emptyNote.json));
+
+    // 载荷引用：形状合法但查无此行 → 422 unknown_decision_link
+    const ghost = await post(srv.port, unlinkPath(d1), { linkId: 'lnk-ffffffffffffffff', note: '查无此行' });
+    assert.strictEqual(ghost.status, 422, JSON.stringify(ghost.json));
+    assert.strictEqual(ghost.json.error.code, 'unknown_decision_link');
+    // 形状不合法 → 400（形状可由客户端修正，语义引用才走 422）
+    const badShape = await post(srv.port, unlinkPath(d1), { linkId: 'nope', note: '形状错' });
+    assert.strictEqual(badShape.status, 400, JSON.stringify(badShape.json));
+    // 属于另一条决策的 linkId → 同样 422 unknown_decision_link（从本决策视角引用不到）
+    const cross = await post(srv.port, unlinkPath(d2), { linkId: linkId, note: '张冠李戴' });
+    assert.strictEqual(cross.status, 422, JSON.stringify(cross.json));
+    assert.strictEqual(cross.json.error.code, 'unknown_decision_link');
+
+    // 正常解绑：软删除三列同时给，状态与决策行不变
+    const un = await post(srv.port, unlinkPath(d1), { linkId: linkId, note: '选错了，重新关联' });
+    assert.strictEqual(un.status, 200, JSON.stringify(un.json));
+    assert.strictEqual(un.json.link.unlinkedOn, TODAY);
+    assert.strictEqual(un.json.link.unlinkedAt, NOW_ISO);
+    assert.strictEqual(un.json.link.unlinkNote, '选错了，重新关联');
+    assert.strictEqual(un.json.execution.linkedCount, 0, '解绑后活动关联归零，汇总同步');
+    assert.strictEqual(un.json.execution.linkedPrincipalCnyMinor, 0);
+    const st1 = (await get(srv.port, '/api/v1/state')).json;
+    assert.strictEqual(st1.decisionLinks.length, 1, '解绑是软删除，不删行');
+    assert.strictEqual(st1.decisions.filter((d) => d.id === d1.id)[0].state, 'accepted', '解绑不改状态');
+    assert.strictEqual(st1.decisionEvents.filter((e) => e.decisionId === d1.id).length, 1, '解绑不追加状态事件');
+
+    // 重复解绑 → 409 link_not_active
+    const again = await post(srv.port, unlinkPath(d1), { linkId: linkId, note: '再解一次' });
+    assert.strictEqual(again.status, 409, JSON.stringify(again.json));
+    assert.strictEqual(again.json.error.code, 'link_not_active');
+
+    // 解绑后同一事件可重新关联到同一决策，id 必须换新（历史行仍在）
+    const relink = await post(srv.port, '/api/v1/decisions/' + d1.id + '/links',
+      { securityEventId: SEV1, note: '重新挂上' });
+    assert.strictEqual(relink.status, 201, JSON.stringify(relink.json));
+    assert.notStrictEqual(relink.json.link.id, linkId, '解绑行仍占主键，重关联必须换新 id');
+    assert.strictEqual(relink.json.execution.linkedCount, 1);
+    const st2 = (await get(srv.port, '/api/v1/state')).json;
+    assert.strictEqual(st2.decisionLinks.length, 2, '历史解绑行 + 新活动行，追加更正而非擦除');
+    assert.strictEqual(st2.decisionLinks.filter((l) => l.unlinkedOn == null).length, 1, '活动关联仍然唯一');
+
+    // 解绑后可改挂到另一条决策
+    const move = await post(srv.port, unlinkPath(d1), { linkId: relink.json.link.id, note: '改挂 d2' });
+    assert.strictEqual(move.status, 200, JSON.stringify(move.json));
+    const toD2 = await post(srv.port, '/api/v1/decisions/' + d2.id + '/links',
+      { securityEventId: SEV1, note: '改挂到 d2' });
+    assert.strictEqual(toD2.status, 201, JSON.stringify(toD2.json));
+    assert.strictEqual(toD2.json.links.filter((l) => l.unlinkedOn == null).length, 1);
+
+    // archived 的决策不能解绑（状态门禁覆盖关联与解绑两侧）
+    const archived = await post(srv.port, '/api/v1/decisions/' + d1.id + '/events', { toState: 'archived', note: '放弃' });
+    assert.strictEqual(archived.status, 200, JSON.stringify(archived.json));
+    const late = await post(srv.port, unlinkPath(d1), { linkId: 'lnk-ffffffffffffffff', note: '晚到解绑' });
+    assert.strictEqual(late.status, 409, JSON.stringify(late.json));
+    assert.strictEqual(late.json.error.code, 'illegal_state_for_link');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6D-05 执行确认全走 HTTP：分批两笔关联 → 偏差必填理由 → executed 快照封存的关联 id 就是端点返回的 id', async () => {
+  const ctx = setup('ledger-p6d5-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const decision = await newAcceptedDecision(srv.port, facts, 1);
+    await seedBuy(srv.port, SEV1);
+    await seedBuy(srv.port, SEV2, { quantity: '10' });
+    const p1 = '/api/v1/decisions/' + decision.id;
+
+    const l1 = await post(srv.port, p1 + '/links', { securityEventId: SEV1, note: '第一批' });
+    assert.strictEqual(l1.status, 201, JSON.stringify(l1.json));
+    const l2 = await post(srv.port, p1 + '/links', { securityEventId: SEV2, note: '第二批' });
+    assert.strictEqual(l2.status, 201, JSON.stringify(l2.json));
+    assert.strictEqual(l1.json.execution.linkedCount, 1);
+    assert.strictEqual(l2.json.execution.linkedCount, 2, '进度按活动关联事实累加');
+    assert.strictEqual(l2.json.execution.linkedPrincipalCnyMinor, 300000, '20×100 + 10×100');
+    assert.notStrictEqual(l1.json.link.id, l2.json.link.id);
+
+    // 超买（本金 > 建议金额）→ executed 必须写明理由（契约 §10.2-13）
+    const noNote = await post(srv.port, p1 + '/events', { toState: 'executed' });
+    assert.strictEqual(noNote.status, 400, JSON.stringify(noNote.json));
+    assert.strictEqual(noNote.json.error.code, 'deviation_note_required');
+
+    const executed = await post(srv.port, p1 + '/events', { toState: 'executed', note: '分两笔买完，实际超买 999.99 元' });
+    assert.strictEqual(executed.status, 200, JSON.stringify(executed.json));
+    assert.strictEqual(executed.json.decision.state, 'executed');
+    assert.strictEqual(executed.json.events[1].reasonCode, 'executed_deviation');
+    const sealed = executed.json.events[1].snapshot.execution;
+    assert.strictEqual(sealed.linkedCount, 2);
+    assert.strictEqual(sealed.linkedPrincipalCnyMinor, 300000);
+    assert.deepStrictEqual(
+      (await get(srv.port, p1)).json.links.filter((l) => l.unlinkedOn == null).map((l) => l.id).sort(),
+      [l1.json.link.id, l2.json.link.id].sort(),
+      '快照与详情里的关联 id 就是端点返回的 id（不复制、不改写）'
+    );
+
+    // executed 状态仍可解绑（§3.2 允许 accepted / executed 两侧）
+    const un = await post(srv.port, p1 + '/links/unlink', { linkId: l2.json.link.id, note: '第二笔挂错账户，撤销' });
+    assert.strictEqual(un.status, 200, JSON.stringify(un.json));
+    assert.strictEqual(un.json.execution.linkedCount, 1);
+    assert.strictEqual(un.json.execution.linkedPrincipalCnyMinor, 200000);
+    assert.strictEqual((await get(srv.port, p1)).json.decision.state, 'executed', '解绑不回退状态');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+/* ================= Phase 6E｜复盘对照（契约 §4.3 6E 补充） ================= */
+
+// 把快照 classes 行转成对照 cell 形状（测试内独立重算期望值，不复用被测代码的中间结果）。
+function cellOf(clsRow) {
+  return {
+    valueMinor: clsRow.valueMinor, pctBps: clsRow.pctBps,
+    deviationBps: clsRow.deviationBps, band: clsRow.band
+  };
+}
+
+test('6E-01 F-A 复盘对照逐分核对：comparison 三时点 cell 与封存快照逐字段一致、delta 可复算、快照齐全', async () => {
+  const ctx = setup('ledger-p6g-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const accepted = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec.id, intent: 'accepted', note: '对照核对：按建议执行' });
+    const decisionId = accepted.json.decision.id;
+    // 非法跳步复述：accepted → reviewed 必须拒绝（矩阵 49 对的流程级复述）
+    const skip = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'reviewed', note: '跳步尝试' });
+    assert.strictEqual(skip.status, 409);
+    assert.strictEqual(skip.json.error.code, 'illegal_transition');
+
+    const linked = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([buyEvent('sev-6e01')]);
+      st.decisionLinks = (st.decisionLinks || []).concat([activeLink('sev-6e01', decisionId, 'sev-6e01')]);
+    });
+    assert.strictEqual(linked.status, 200, JSON.stringify(linked.json));
+    const executed = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'executed' });
+    assert.strictEqual(executed.status, 200, JSON.stringify(executed.json));
+    const reviewed = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'reviewed', note: '配置与执行时点一致，下月继续' });
+    assert.strictEqual(reviewed.status, 200);
+    assert.strictEqual(reviewed.json.events[2].reasonCode, 'reviewed_no_drift');
+
+    const detail = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    const cmp = detail.comparison;
+    assert.ok(cmp, '详情必须携带 comparison');
+    assert.strictEqual(cmp.comparable, true);
+    assert.strictEqual(cmp.rows.length, 6);
+    assert.deepStrictEqual(cmp.rows.map((r) => r.assetClass), Domain.RISK_CLASSES.slice());
+
+    // 逐分 / 逐 bps：每个时点 cell 与该时点封存 classes 行逐字段一致；delta 恰为 review − decision
+    const snapCls = {
+      decision: detail.snapshots.decision.classes,
+      executed: detail.snapshots.executed.classes,
+      review: detail.snapshots.reviewed.classes
+    };
+    Domain.RISK_CLASSES.forEach((cls, i) => {
+      const row = cmp.rows[i];
+      ['decision', 'executed', 'review'].forEach((pt) => {
+        assert.deepStrictEqual(row[pt], cellOf(snapCls[pt][i]),
+          cls + ' @ ' + pt + ' cell 必须与封存 classes 原值逐字段一致');
+      });
+      assert.strictEqual(row.deltaValueMinor,
+        detail.snapshots.reviewed.classes[i].valueMinor - detail.snapshots.decision.classes[i].valueMinor,
+        cls + ' deltaValueMinor 必须可复算');
+      assert.strictEqual(row.deltaPctBps,
+        detail.snapshots.reviewed.classes[i].pctBps - detail.snapshots.decision.classes[i].pctBps,
+        cls + ' deltaPctBps 必须逐 bps 可复算');
+      assert.strictEqual(row.targetBps, detail.snapshots.decision.classes[i].targetBps,
+        '参照目标恒为决策引用的历史版本');
+    });
+    // 变化量语义：买入发生在决策与复盘之间，证券类别的 delta 反映这笔事实变化；
+    // 现金不被证券事件改写（D-042 ④）→ 现金 delta 恒为 0。
+    const cashRow = cmp.rows[Domain.RISK_CLASSES.indexOf('cash')];
+    assert.strictEqual(cashRow.deltaValueMinor, 0, '现金金额在两个时点一致');
+    const equityRow = cmp.rows[Domain.RISK_CLASSES.indexOf('broad_equity')];
+    assert.notStrictEqual(equityRow.deltaValueMinor, 0, '买入后宽基金额必然变化（对照要展示的事实）');
+    ['decision', 'executed', 'reviewed'].forEach((k) => {
+      assert.deepStrictEqual(cmp.timepoints[k],
+        { present: true, available: true, reason: null, blockers: [] });
+    });
+    // reviewed 后关联 / 解绑一律拒绝（复盘不可静默改变）
+    const relink = await post(srv.port, '/api/v1/decisions/' + decisionId + '/links',
+      { securityEventId: 'sev-6e01' });
+    assert.strictEqual(relink.status, 409);
+    assert.strictEqual(relink.json.error.code, 'illegal_state_for_link');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6E-02 复盘漂移：执行后行情变化再复盘 → reviewed_with_drift，对照 delta 非零且与封存值一致', async () => {
+  const ctx = setup('ledger-p6h-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const accepted = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec.id, intent: 'accepted', note: '先执行，行情随后变化' });
+    const decisionId = accepted.json.decision.id;
+    const linked = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([buyEvent('sev-6e02', { quantity: '20', priceMinor: 10000 })]);
+      st.decisionLinks = (st.decisionLinks || []).concat([activeLink('sev-6e02', decisionId, 'sev-6e02')]);
+    });
+    assert.strictEqual(linked.status, 200, JSON.stringify(linked.json));
+    const executed = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'executed', note: '按建议金额执行' });
+    assert.strictEqual(executed.status, 200, JSON.stringify(executed.json));
+
+    // 执行后行情变化（100 → 110）：旧快照封存不变，复盘时点的估值按当时事实重算
+    const moved = await putFullState(srv.port, (st) => {
+      st.assets.quotes = st.assets.quotes.map((q) =>
+        q.instrumentId === 'ins-voo' && q.priceMinor === 100
+          ? Object.assign({}, q, { priceMinor: 110 }) : q);
+    });
+    assert.strictEqual(moved.status, 200, JSON.stringify(moved.json));
+    const reviewed = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'reviewed', note: '行情上涨后宽基占比上升，仍在区间内' });
+    assert.strictEqual(reviewed.status, 200);
+    assert.strictEqual(reviewed.json.events[2].reasonCode, 'reviewed_with_drift', '配置已变 → 有漂移');
+
+    const cmp = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json.comparison;
+    assert.strictEqual(cmp.comparable, true);
+    const changed = cmp.rows.filter((r) => r.deltaValueMinor !== 0 || r.deltaPctBps !== 0);
+    assert.ok(changed.length >= 1, '至少一个类别的 delta 非零');
+    const detail = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    cmp.rows.forEach((row, i) => {
+      assert.deepStrictEqual(row.decision, cellOf(detail.snapshots.decision.classes[i]));
+      assert.deepStrictEqual(row.review, cellOf(detail.snapshots.reviewed.classes[i]));
+      assert.strictEqual(row.deltaValueMinor,
+        detail.snapshots.reviewed.classes[i].valueMinor - detail.snapshots.decision.classes[i].valueMinor);
+    });
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6E-03 缺数据不出伪 0：现金未核对 / 估值不正式 → 复盘照常封存但对照不可比、全表无数字', async () => {
+  const ctx = setup('ledger-p6i-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const accepted = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec.id, intent: 'accepted', note: '执行后再看现金流' });
+    const decisionId = accepted.json.decision.id;
+    const linked = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([buyEvent('sev-6e03')]);
+      st.decisionLinks = (st.decisionLinks || []).concat([activeLink('sev-6e03', decisionId, 'sev-6e03')]);
+    });
+    assert.strictEqual(linked.status, 200, JSON.stringify(linked.json));
+    const executed = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'executed', note: '先执行' });
+    assert.strictEqual(executed.status, 200, JSON.stringify(executed.json));
+    assert.strictEqual(executed.json.events[1].snapshot.available, true, '执行时点可比');
+
+    // 复盘前买入未核对现金：把余额 asOf 推到上一个日历月（A-005 按月判定）→ balance_stale
+    const stale = await putFullState(srv.port, (st) => {
+      st.assets.assetUnits = st.assets.assetUnits.map((u) =>
+        Object.assign({}, u, { asOf: '2026-08-31' }));
+    });
+    assert.strictEqual(stale.status, 200, JSON.stringify(stale.json));
+    const reviewed = await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'reviewed', note: '现金还没核对，先封存复盘结论：晚点补核对' });
+    assert.strictEqual(reviewed.status, 200, '复盘本身不因缺数据被拒绝（§4.4）');
+    assert.strictEqual(reviewed.json.events[2].snapshot.available, false);
+    assert.strictEqual(reviewed.json.events[2].snapshot.reason, 'cash_not_reconciled');
+    assert.strictEqual(reviewed.json.events[2].snapshot.netWorthMinor, null, '不可比不得携带数字');
+
+    const detail = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    const cmp = detail.comparison;
+    assert.strictEqual(cmp.comparable, false);
+    assert.strictEqual(cmp.timepoints.reviewed.reason, 'cash_not_reconciled');
+    assert.ok(cmp.timepoints.reviewed.blockers.some((b) => b.code === 'balance_stale'),
+      'blockers 沿用 computeOverview 既有码');
+    assert.strictEqual(cmp.timepoints.executed.available, true, '执行时点当时可比，照实记录');
+    cmp.rows.forEach((row) => {
+      [row.decision, row.executed, row.review, row.deltaValueMinor, row.deltaPctBps].forEach((v) => {
+        assert.strictEqual(v, null, '不可比对照不得输出任何数字（不出伪 0）');
+      });
+    });
+    // 各可比时点的封存数字仍可在 snapshots 里看到（不丢事实）
+    assert.strictEqual(detail.snapshots.executed.classes.length, 6);
+    assert.strictEqual(detail.snapshots.executed.execution.linkedPrincipalCnyMinor, 200000);
+
+    // 估值不正式：先恢复余额核对，再建第二条决策；复盘前删掉 VOO 报价 → quote_missing
+    // → valuation_not_formal
+    const reconcile = await putFullState(srv.port, (st) => {
+      st.assets.assetUnits = st.assets.assetUnits.map((u) => Object.assign({}, u, { asOf: TODAY }));
+    });
+    assert.strictEqual(reconcile.status, 200, JSON.stringify(reconcile.json));
+    const rec2 = (await post(srv.port, '/api/v1/recommendations',
+      recommendBody(facts, { newFundsMinor: NEW_FUNDS_MINOR + 1000 }))).json.recommendation;
+    const acc2 = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec2.id, intent: 'accepted', note: '第二条用于估值门禁' });
+    const d2 = acc2.json.decision.id;
+    const linked2 = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([buyEvent('sev-6e03b')]);
+      st.decisionLinks = (st.decisionLinks || []).concat([activeLink('sev-6e03b', d2, 'sev-6e03b')]);
+    });
+    assert.strictEqual(linked2.status, 200, JSON.stringify(linked2.json));
+    const exec2 = await post(srv.port, '/api/v1/decisions/' + d2 + '/events', { toState: 'executed', note: '执行' });
+    assert.strictEqual(exec2.status, 200, JSON.stringify(exec2.json));
+    const noQuote = await putFullState(srv.port, (st) => {
+      st.assets.quotes = st.assets.quotes.filter((q) => !(q.instrumentId === 'ins-voo' && q.priceDate === TODAY));
+    });
+    assert.strictEqual(noQuote.status, 200, JSON.stringify(noQuote.json));
+    const rev2 = await post(srv.port, '/api/v1/decisions/' + d2 + '/events',
+      { toState: 'reviewed', note: '报价缺失也要能封存复盘结论' });
+    assert.strictEqual(rev2.status, 200);
+    assert.strictEqual(rev2.json.events[2].snapshot.reason, 'valuation_not_formal');
+    const cmp2 = (await get(srv.port, '/api/v1/decisions/' + d2)).json.comparison;
+    assert.strictEqual(cmp2.comparable, false);
+    assert.strictEqual(cmp2.timepoints.reviewed.reason, 'valuation_not_formal');
+    assert.ok(cmp2.timepoints.reviewed.blockers.some((b) => b.code === 'quote_missing'));
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6E-04 对照形状稳定与恢复重放：未执行决策 comparison 全 null；备份恢复后对照逐字段一致；复盘快照篡改被识别', async () => {
+  const ctx = setup('ledger-p6j-');
+  const srv = await startServer(ctx);
+  try {
+    // ① 未执行（accepted）：只有决策时点快照 → comparable=false、6 行、cell 全 null
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const accepted = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec.id, intent: 'accepted', note: '尚未执行' });
+    const decisionId = accepted.json.decision.id;
+    const early = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    assert.strictEqual(early.comparison.comparable, false);
+    assert.strictEqual(early.comparison.rows.length, 6);
+    assert.strictEqual(early.comparison.timepoints.decision.present, true);
+    assert.strictEqual(early.comparison.timepoints.decision.available, true);
+    assert.strictEqual(early.comparison.timepoints.executed.present, false);
+    early.comparison.rows.forEach((row) => {
+      assert.strictEqual(row.decision, null, '不可比对照不输出部分数字');
+      assert.strictEqual(row.deltaValueMinor, null);
+    });
+
+    // ② 走到 reviewed 并生成备份
+    const linked = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([buyEvent('sev-6e04')]);
+      st.decisionLinks = (st.decisionLinks || []).concat([activeLink('sev-6e04', decisionId, 'sev-6e04')]);
+    });
+    assert.strictEqual(linked.status, 200, JSON.stringify(linked.json));
+    await post(srv.port, '/api/v1/decisions/' + decisionId + '/events', { toState: 'executed' });
+    await post(srv.port, '/api/v1/decisions/' + decisionId + '/events',
+      { toState: 'reviewed', note: '恢复重放用' });
+    const before = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    assert.strictEqual(before.comparison.comparable, true);
+    const backup = await post(srv.port, '/api/v1/backups', {});
+    assert.strictEqual(backup.status, 201, JSON.stringify(backup.json));
+
+    // ③ 篡改复盘时点快照原文一个字节 → 列表 invalidCount 留痕、详情 400、活库不变
+    const DatabaseSync = require('node:sqlite').DatabaseSync;
+    const raw = new DatabaseSync(ctx.paths.dbFile);
+    raw.prepare("UPDATE decision_events SET snapshot_json = json_set(snapshot_json, '$.capturedAt', '2026-09-30T23:59:59.999Z') "
+      + "WHERE decision_id = ? AND to_state = 'reviewed'").run(decisionId);
+    raw.close();
+    const badDetail = await get(srv.port, '/api/v1/decisions/' + decisionId);
+    assert.strictEqual(badDetail.status, 400);
+    assert.strictEqual(badDetail.json.error.code, 'invalid_decision_record');
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.invalidCount, 1);
+
+    // ④ 恢复有效备份 → 对照、快照、事件、关联逐字段一致（重放一致）
+    const restore = await post(srv.port, '/api/v1/restores', { file: backup.json.backup.name });
+    assert.strictEqual(restore.status, 200, JSON.stringify(restore.json));
+    ctx.adopt(restore);
+    const after = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    assert.deepStrictEqual(after, before, '恢复后 comparison 与全部详情逐字段一致');
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.invalidCount, 0);
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});

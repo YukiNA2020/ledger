@@ -1,0 +1,351 @@
+{
+  "states": [
+    {
+      "state": "loading",
+      "pass": true
+    },
+    {
+      "state": "error",
+      "pass": true
+    },
+    {
+      "state": "empty-after-retry",
+      "pass": true
+    },
+    {
+      "state": "accepted",
+      "pass": true
+    },
+    {
+      "state": "buy-event-seeded",
+      "pass": true
+    }
+  ],
+  "pages": [
+    {
+      "width": 1440,
+      "route": "home",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "cashflow",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "add",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "list",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "stats",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "settings",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "import",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "accounts",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "categories",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "budget",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "health",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "reimburse",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "recurring",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "assets",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "close",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "risk",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "targets",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "decisions",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "targets",
+      "check": "decide-sheet",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "decisions",
+      "check": "detail-sheet",
+      "pass": true
+    },
+    {
+      "width": 1440,
+      "route": "decisions",
+      "check": "detail-links",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "home",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "cashflow",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "add",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "list",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "stats",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "settings",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "import",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "accounts",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "categories",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "budget",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "health",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "reimburse",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "recurring",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "assets",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "close",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "risk",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "targets",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "decisions",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "targets",
+      "check": "decide-sheet",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "decisions",
+      "check": "detail-sheet",
+      "pass": true
+    },
+    {
+      "width": 1100,
+      "route": "decisions",
+      "check": "detail-links",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "home",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "cashflow",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "add",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "list",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "stats",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "settings",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "import",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "accounts",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "categories",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "budget",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "health",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "reimburse",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "recurring",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "assets",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "close",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "risk",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "targets",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "decisions",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "targets",
+      "check": "decide-sheet",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "decisions",
+      "check": "detail-sheet",
+      "pass": true
+    },
+    {
+      "width": 390,
+      "route": "decisions",
+      "check": "detail-links",
+      "pass": true
+    }
+  ],
+  "errors": []
+}

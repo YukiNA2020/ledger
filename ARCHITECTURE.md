@@ -243,13 +243,16 @@ POST   /api/v1/decisions
 POST   /api/v1/decisions/{id}/events
   # 6B 已实现真实行为（键 toState / note）；非法跳转 409，事件与状态同事务提交
 POST   /api/v1/decisions/{id}/links
-  # 6D：只接受 buy；409 event_already_linked / illegal_state_for_link / invalid_link_target；422 unknown_security_event
+  # 6D 已实现：键白名单 securityEventId / note；只接受 buy；201 created、同事件重复 200 created:false
+  #   → 409 event_already_linked / illegal_state_for_link / invalid_link_target；422 unknown_security_event / unknown_decision_link；400 invalid_decision_payload（键多余、缺 securityEventId、note 越界）
 POST   /api/v1/decisions/{id}/links/unlink
-  # 6D：软删除留痕，note 必填；409 link_not_active
+  # 6D 已实现：键白名单 linkId / note（trim 必填）；软删除三列留痕，不追加状态事件
+  #   → 400 invalid_decision_payload（键多余、linkId 形状非法、note 缺失）；422 unknown_decision_link；409 link_not_active / illegal_state_for_link
 GET    /api/v1/decisions?state=&month=&recommendationId=&from=&to=
   # 月度按 decision_events.occurred_at 本地状态事件月；仅关联/解绑不新增月份；复核失败行不返回，计入 invalidCount
 GET    /api/v1/decisions/{id}
-  # 返回 decision + 完整 events 时间线 + links + 快照 + execution；复核失败 → 400 invalid_decision_record
+  # 返回 decision + 完整 events 时间线 + links + 快照 + execution + comparison（6E 补充：三时点
+  #   六类配置对照，comparable + timepoints + 恒 6 行，不可比全表不出数字）；复核失败 → 400 invalid_decision_record
 POST   /api/v1/backups
 POST   /api/v1/restores
 ```

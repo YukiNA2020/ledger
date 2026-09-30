@@ -2248,6 +2248,33 @@ function insertDecisionEventRow(db, event) {
   );
 }
 
+// Phase 6D（D-057 §3.2/§3.4）：关联行插入与软删除解绑。解绑只写 unlinked_* 三列，
+// 不删行、不追加状态事件 —— 历史由关联行自身保留（"追加更正而非擦除"）。
+function insertDecisionLinkRow(db, link) {
+  run(
+    db,
+    `INSERT INTO decision_links
+       (id, decision_id, security_event_id, linked_on, linked_at, note, unlinked_on, unlinked_at, unlink_note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [link.id, link.decisionId, link.securityEventId, link.linkedOn, link.linkedAt, link.note,
+      link.unlinkedOn, link.unlinkedAt, link.unlinkNote]
+  );
+}
+
+function markDecisionLinkUnlinked(db, linkId, unlinkedOn, unlinkedAt, unlinkNote) {
+  const info = run(
+    db,
+    'UPDATE decision_links SET unlinked_on = ?, unlinked_at = ?, unlink_note = ? WHERE id = ? AND unlinked_on IS NULL',
+    [unlinkedOn, unlinkedAt, unlinkNote, linkId]
+  );
+  return info && typeof info.changes === 'number' ? info.changes : 0;
+}
+
+function getDecisionLinkRow(db, id) {
+  const row = get(db, 'SELECT * FROM decision_links WHERE id = ?', [String(id)]);
+  return row ? hydrateDecisionLinkRow(row) : null;
+}
+
 function updateDecisionForRow(db, decision) {
   run(
     db,
@@ -3329,6 +3356,9 @@ module.exports = {
   readDecisionRows,
   readDecisionEvents,
   readDecisionLinks,
+  getDecisionLinkRow,
+  insertDecisionLinkRow,
+  markDecisionLinkUnlinked,
   getDecisionRow,
   getDecisionEvents,
   insertDecisionRow,

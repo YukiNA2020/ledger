@@ -1,6 +1,6 @@
 # Phase 6｜建议、执行与复盘：开发拆解
 
-> 2026-09-28；2026-09-29 状态：**6A 已完成（契约 D-057）、6B 已完成（`2.4.24-phase6b` / v11）、6C 已于 2026-09-29 完成（`2.4.25-phase6c-fix2` / v11 零迁移）**，6D～6F 未实施。
+> 2026-09-28；2026-09-30 状态：**6A 已完成（契约 D-057）、6B 已完成（`2.4.24-phase6b` / v11）、6C 已于 2026-09-29 完成（`2.4.25-phase6c-fix2` / v11 零迁移）、6D 已于 2026-09-29 完成（`2.4.25-phase6d` / v11 零迁移）、6E 已于 2026-09-30 全部完成（`2.4.26-phase6e` / v11 零迁移；6E-3 G5-R4 真人计时同日通过）**，6F 未实施。
 > 顺序入口：[ROADMAP.md](./ROADMAP.md)；执行入口：[NEXT_AGENT.md](./NEXT_AGENT.md)；验收：[ACCEPTANCE.md](./ACCEPTANCE.md) §8；**已冻结契约：[PHASE6_CONTRACT.md](./PHASE6_CONTRACT.md)（6B 起的唯一规则来源）**。
 
 ## 1. 目标与延期安排
@@ -18,8 +18,8 @@
 | 6A 规则与契约 | 状态矩阵、执行关联及复盘口径、接口/数据契约 | 阅读当前代码与文档 | ✅ **2026-09-29 二次复测修正后通过**：歧义清零，49 有序对例子与迁移/回滚方案已冻结在 `PHASE6_CONTRACT.md` |
 | 6B 状态机与持久化 | 纯逻辑、决策/事件/快照落库、API、备份 | 6A 验收通过 | ✅ **2026-09-29 二次复测补口后通过**：`2.4.24-phase6b` / v11，49 对全遍历；`GET /state` 与候选备份拒绝坏快照，损坏活库可由有效备份恢复；定向 18/18、全量 677/677 |
 | 6C 决定与待执行页面 | 接受、暂缓、忽略、理由、清单和详情 | 6B 验收通过 | ✅ **2026-09-29 完成**：`2.4.25-phase6c-fix2` / v11 零迁移，三类决定真实可用且刷新一致，失败不假成功；全量 679/679、wiring 36 项 × 2 轮、18 路由 × 3 宽度 + 两弹层 + 4 状态共 64 项检查 |
-| 6D 实际交易关联 | 关联既有证券事件、进度、确认执行完成 | 6C 验收通过 | 交易不重复入账，分批/异常按契约处理（**下一入口**） |
-| 6E 复盘与历史 | 配置变化复盘、月度历史、真人四问计时 | 6D 验收通过 | 复盘可重放，历史不漂移，G5-R4 有真实证据 |
+| 6D 实际交易关联 | 关联既有证券事件、进度、确认执行完成 | 6C 验收通过 | ✅ **2026-09-29 完成**：`2.4.25-phase6d` / v11 零迁移，详情关联区 + 解绑 + 执行/归档门禁全由服务端判定，交易不重复入账；全量 686/686、wiring 37 项 × 3 轮、`browser-review.py` 37 项、三档宽度 68 项 |
+| 6E 复盘与历史 | 配置变化复盘、月度历史、真人四问计时 | 6D 验收通过 | ✅ **6E-1 / 6E-2 已于 2026-09-30 完成**：`2.4.26-phase6e` / v11 零迁移，详情对照区服务端派生、不可比不出数字，复盘后只读，月度历史不漂移；全量 692/692、wiring 38 × 3、宽度 71 项；**6E-3 G5-R4 已于同日通过**（变体 C 数据 4/4 全对、自报计时 35 秒，记录 `docs/evidence/phase6/6e-r4.md`） |
 | 6F 集成验收 | 两次完整闭环、负向用例、原功能回归 | 6A～6E 全部通过 | 逐条证据齐全，明确 Phase 6 结论与 Phase 7 入口 |
 
 默认串行交付，每次任务只做一个子阶段；6E 拆为三个小任务单独交接。后续 agent 不应一次承包全部六项后才验收。涉及 `domain.js`、`repository.js`、`api.js`、`app.js` 的改动重叠很大，不建议多个 agent 同时修改这些共享文件。
@@ -83,7 +83,7 @@
 - 页面：`decisions` 路由 + 侧栏/首页入口 + 决定弹层 + 待执行清单与历史筛选 + 详情弹层（原建议、理由、时间线、时点快照）；读取失败优先于读取中判定，失败卡与重试入口明确，不落回空态。
 - 状态覆盖：初始空态、读取中（首帧与重新读取分别呈现）、读取失败、提交失败、失效建议提示；慢响应由 `decRequest` / `decSubmitSeq` / `decDetailSeq` 顺序守卫丢弃，关闭详情后切换其他弹层也不会被旧响应覆盖。
 - 实测：全量 `node --test` **679/679**（6B 677 + 6C 新增 2 条 `store-headers` 封装契约）；浏览器 wiring **36 项 × 2 轮全绿**（19041、19047）；1440/1100/390px × 18 路由 + 决定/详情两弹层共 **60 项布局**，加读取中、读取失败、重试后空态、接受成功 **4 项状态**，证据与截图见 `docs/evidence/phase6-6c-20260929/`。
-- 未做：实际交易关联与「确认执行完成」（6D），页面只呈现事实进度、不提供跳步按钮；G5-R4 真人计时（6E-3）。
+- 未做（6C 当时）：实际交易关联与「确认执行完成」——**已于 2026-09-29 由 6D 完成，见 §6**；页面在 6C 阶段只呈现事实进度、不提供跳步按钮。G5-R4 真人计时（6E-3）仍未做。
 
 ## 6. 6D｜关联实际交易并记录执行
 
@@ -95,9 +95,28 @@
 
 **验收**：单笔和分批执行；双击/重试不重复；不存在、重复占用或不合规引用拒绝；任一步失败可恢复；原证券持仓数量/费用、现金流计算不变；备份恢复后关联和状态一致。无真实交易接口或外部网络。
 
+### ✅ 6D 已于 2026-09-29 完成（`2.4.25-phase6d` / v11 零迁移）
+
+- **契约先行**：实现前把 6D 实现口径补进 `PHASE6_CONTRACT.md`（顶部「2026-09-29 6D 补充」+ §3.4 + §7 + §8.5）——`unknown_decision_link` 为 **422**（linkId 不存在或不属于路径决策，同码）、`invalid_link_target` 为 **409**、`event_already_linked` 409、同决策重复关联 → 200 `created:false`；关联载荷键白名单 `securityEventId`/`note`，解绑 `linkId`/`note`（trim 非空），多键或派生键 → 400 `invalid_decision_payload`。
+- **服务端**：`server/decisions.js` 新增 `requireLinkableDecision` / `createDecisionLink` / `unlinkDecisionLink` / `decisionLinkRows`；`decisionLinkRecordId` 增加 `occurrence` 参数（重关联按含已解绑行数递增，避免撞既有主键）；`server/repository.js` 新增 `insertDecisionLinkRow` / `markDecisionLinkUnlinked`（`unlinked_on IS NULL` 条件更新）/ `getDecisionLinkRow`；`server/api.js` 新增 `POST /api/v1/decisions/{id}/links` 与 `.../links/unlink`（先匹配 unlink），均过 `checkWrite` + `Idempotency-Key` 指纹幂等，`DOMAIN_ERROR_STATUS` 补 `unknown_decision_link: 422`。
+- **领域与前端**：`js/domain.js` 新增 `validateDecisionLinkRequest` / `validateDecisionUnlinkRequest`；`js/store.js` 新增 `createDecisionLink` / `unlinkDecisionLink`；`js/app.js` 详情弹层新增关联区（候选来自服务端 `/security-events` 的 buy、未被本决策占用）、活动/已解绑关联行、解绑理由输入、执行与归档按钮及就地错误盒，`holding:saveEvent` 保存成功后按 `decLinkPending` 自动关联（失败只提示「交易已保存，可重新关联」，不重建交易），`closeSheet` 清 `decLinkPending` 并使在途动作失效。
+- **测试**：`tests/server-phase6.test.js` 新增 6D-01～6D-05（正向关联 + 自然幂等 + 不复制事件/不写 `txns`、状态与引用门禁、幂等键回放/冲突、解绑软删除与重关联换新 id、分批 → `deviation_note_required` 400 → executed 快照一致），`tests/domain-phase6.test.js` 新增 6D-11/6D-12（请求白名单与形状），`tests/app-wiring.js` 新增第 **37** 项全流程检查。全量 `node --test` **686/686**。
+- **浏览器证据**：隔离临时库 wiring **37 项 × 3 轮全绿**（19102、19103、19104）；`browser-review.py` 数量契约 36 → **37**（原 34 + 6C 2 项 + 6D 1 项，旧断言一条未删），19121 轮 `externalRequests=[]`、`pageErrors=[]`、三项审计探针通过；三档宽度 **63 项页面 + 5 项状态 = 68 项**（19111，含「关联后详情弹层」三档截图）。证据与复跑脚本见 `docs/evidence/phase6-6d-20260929/`。
+- **未做（留给后续）**：执行进度/偏差的复盘对照与 `executed → reviewed`（6E-1）、复盘页面与月度历史（6E-2）、G5-R4 真人计时（6E-3）、Phase 6 集成验收（6F）。
+
 ## 7. 6E｜复盘、历史与理解验证（分三次交接）
 
-### 6E-1 复盘计算与封存
+### ✅ 6E-1 与 6E-2 已于 2026-09-30 完成（`2.4.26-phase6e` / v11 零迁移）
+
+- **契约先行**：实现前把对照口径补进 `PHASE6_CONTRACT.md`（顶部「2026-09-30 6E 补充」+ §4.3 末新增小节 + §8.4）——`comparison` = `comparable` + `timepoints`（present/available/reason/blockers 原样搬运）+ 恒 6 行（cell 取封存 classes 原值）；任一时点缺失或 `available:false` → 全表 cell 与 delta 全 null；0 投资池比例列 null 不算不可比；delta 只定义复盘 − 决策；`targetBps` 取 targetRef 历史版本、三时点不一致即记录损坏；漂移判定在不可比时的口径冻结（执行不可比 + 复盘可比 → with_drift；双方皆 null → no_drift）。
+- **服务端**：`js/domain.js` 新增纯函数 `decisionReviewComparison` 与 `validateDecisionComparisonShape`（只消费三份封存快照，不写第二套估值 / 偏离）；`server/decisions.js` 的 `decisionDetailResponse` 追加 `comparison` 字段，输入快照形状不合法时整体 400 fail closed。`executed → reviewed`、复盘快照封存与 `reviewed_with_drift / reviewed_no_drift` 沿用 6B 同事务实现，零状态机改动。
+- **页面（6E-2）**：详情弹层新增「配置变化对照（非收益）」区（可比 → 六类三时点 + 变化量；不可比 → 按时点原因与 blockers；复盘未开始 → 提示不渲染空表）；`decisionActionHtml` 为 executed 新增「记录复盘」入口（`#dec-review-note` 理由必填，服务端判定，复盘后关联 / 解绑 / 状态推进全部只读）；`tplDecisions` 历史新增月份筛选（`decMonths` / `decMonthFilter`，与状态筛选互为与，翻月复位不丢数据）；交易日与操作时间在关联明细与时间线分列标注。
+- **测试**：`tests/domain-phase6.test.js` 新增 6E-11/6E-12（手工三时点 fixture 逐分 / 逐 bps、0 投资池、不可比 / 缺失、形状坏 fail closed、targetBps 不一致拒止）；`tests/server-phase6.test.js` 新增 6E-01～6E-04（F-A 对照逐分核对、漂移流程、现金未核对 / 估值不正式不出伪 0、未执行形状稳定 + 备份恢复逐字段一致 + 篡改复盘快照被识别并可恢复）；`tests/app-wiring.js` 新增第 **38** 项全流程检查，原第 37 项收尾断言按拆解 §11 显式推进。全量 `node --test` **692/692**。
+- **浏览器证据**：隔离临时库 wiring **38 项 × 3 轮全绿**（19212、19213、19214）；`browser-review.py` 数量契约 37 → **38**（19221，`externalRequests=[]`、`pageErrors=[]`、三项审计探针通过）；三档宽度 **66 页面 + 5 状态 = 71 项**（19215，新增「复盘对照详情弹层」三档截图）。证据与复跑脚本见 `docs/evidence/phase6-6e-20260930/`。
+- **6E-3 已于同日通过**：受测者 S1 自测，三轮三套互斥变体数据（A/B/C，`run_6e3_demo.py --variant`），第 3 轮四题 4/4 全对且自报连续计时 35 秒 ≤60 秒；第 1 轮（未计时）、第 2 轮（方向答错）失败记录原样保留于 `docs/evidence/phase6/6e-r4.md`。
+- **未做（留给后续）**：Phase 6 集成验收（6F）。
+
+### 6E-1 复盘计算与封存（原拆解，已按上注实施）
 
 消费既有估值/偏离函数，按 6A 比较口径生成六类配置前后对照及偏差说明，记录用户复盘理由。executed → reviewed 与复盘快照原子保存。缺数据给出不可比较原因，不输出伪 0、伪收益；之后修改行情/目标/资产不能改变已封存复盘。历史追溯使用当时目标/规则版本，当前值如显示须分开标注。
 
@@ -147,7 +166,7 @@ R4 缺失时可交付代码与自动化结果，但结论必须为“Phase 6 待
 
 交付必须包含：本次子阶段与完成项；改动文件；实测命令和结果；未完成/风险；迁移与回滚；下一步入口。每步通过后再推进路线图指针；失败时保留当前阶段并记录问题，不偷跑下一项。
 
-基线全量为 648 项、旧浏览器 wiring 为 34 项，属于规划前实测数字，不是后续固定总数。新增用例必须有真实断言。`browser-review.py` 曾硬编码 34：**6C 已按本节许可同步更新 runner 的明确数量与覆盖契约为 36**（原 34 项语义全部保留，仅新增 6C 两项检查的计数），当前全量 679 项、wiring 36 项、宽度检查 18 路由 × 3 宽度；后续仍不得删断言或把数量门槛改成恒真。
+基线全量为 648 项、旧浏览器 wiring 为 34 项，属于规划前实测数字，不是后续固定总数。新增用例必须有真实断言。`browser-review.py` 曾硬编码 34：**6C 已按本节许可同步更新 runner 的明确数量与覆盖契约为 36，6D 再同步为 37**（原 34 项语义与断言全部保留，仅新增 6C 两项、6D 一项检查的计数），当前全量 **686** 项、wiring **37** 项、宽度检查 18 路由 × 3 宽度（6D 起含关联后详情弹层）；后续仍不得删断言或把数量门槛改成恒真。
 
 现有隔离入口：`node docs/evidence/phase5d-wiring-server.cjs <端口>`，搭配 `/tests/app-wiring.html`。每轮使用全新数据库和浏览器 profile，结束仅清理自己的测试服务。旧脚本在复用数据库时可能受 fixture 残留影响；先复现查因，不削弱断言。
 

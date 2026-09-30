@@ -3738,6 +3738,250 @@
       }
     });
 
+    // ⑩ Phase 6D：关联实际交易与确认执行。关联 / 解绑 / 状态推进全部是服务端命令，
+    //    页面只搬运服务端的 links 与 execution；失败就地显示原因，绝不假成功。
+    await check('6D 决策：关联 / 解绑 / 归档门禁 / 确认执行完成全走服务端，失败不假成功', async function () {
+      var TOKEN_H = Store.readSessionToken();
+      var today = Domain.localTodayISO();
+      var st0 = await apiState();
+      var acc = (st0.assets.assetAccounts || []).filter(function (a) { return a.kind === 'broker'; })[0];
+      var ins = (st0.assets.instruments || []).filter(function (i) { return i.currency === 'CNY'; })[0] ||
+        (st0.assets.instruments || [])[0];
+      assert(acc && ins, '前置：已有券商账户与标的');
+
+      // 前置：6C 检查留下的唯一一条 accepted 决策
+      var decs = await Store.listDecisions();
+      var dec = decs.items.filter(function (d) { return d.state === 'accepted'; })[0];
+      assert(dec, '前置：已有 accepted 决策（6C 检查创建）');
+
+      // 前置事实：一笔买入（服务端写入，页面从 /security-events 读候选，不猜本地缓存）
+      var evRes = await fetch('/api/v1/security-events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN_H,
+          'Idempotency-Key': 'wiring-6d-buy' },
+        body: JSON.stringify({ id: 'sev-wiring6d01', eventType: 'buy', accountId: acc.id,
+          instrumentId: ins.id, quantity: '5', priceMinor: 10000, feeMinor: 100, occurredAt: today })
+      });
+      assert(evRes.ok, '买入事件创建应成功，实际 ' + evRes.status);
+      var evId = (await evRes.json()).item.id;
+      var stEv = await apiState();
+
+      function openDetail() {
+        clickAction('#view .dec-card[data-dec-id="' + dec.id + '"] [data-action="dec:detail"]');
+      }
+
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () {
+        return document.querySelector('#view [data-change="dec:filter"]');
+      }, 8000, '决策页（含历史筛选器）');
+      // 历史筛选可能停在上一项留下的「已暂缓」：先复位到全部，避免执行后的卡片被筛掉
+      var histFilter = document.querySelector('#view [data-change="dec:filter"]');
+      histFilter.value = '';
+      histFilter.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(function () {
+        return document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+      }, 8000, '决策页卡片');
+      openDetail();
+      await waitFor(function () { return document.querySelector('#sheet [data-dec-detail]'); }, 8000, '详情弹层');
+      await waitFor(function () { return document.querySelector('#sheet #dec-link-pick'); }, 8000, '关联选择器');
+      assert(document.querySelector('#sheet [data-dec-links-empty]'), '关联前显示空态而不是编造进度');
+      assert(document.querySelector('#sheet #dec-link-pick option[value="' + evId + '"]'),
+        '候选里有刚创建的买入事件（来自服务端 /security-events）');
+      assert(document.querySelector('#sheet [data-action="dec:unlink"]') === null,
+        '没有关联行时不得出现解绑入口');
+
+      // ① 新增买入并关联：复用原「证券事件」录入弹层，不另起一套录入
+      clickAction('#sheet [data-action="dec:newtrade"]');
+      await waitFor(function () { return document.querySelector('#sheet #he-type'); }, 8000, '复用原证券事件录入弹层');
+      clickAction('#sheet .close');
+      await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); },
+        8000, '关闭录入弹层');
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () {
+        return document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+      }, 8000, '回到决策页');
+      openDetail();
+      await waitFor(function () { return document.querySelector('#sheet #dec-link-pick'); }, 8000, '重新打开详情');
+
+      // ② 关联：服务端落一条活动关联，不复制证券事件、不写记账流水
+      document.querySelector('#sheet #dec-link-pick').value = evId;
+      clickAction('#sheet [data-action="dec:link"]');
+      await waitFor(function () {
+        return document.querySelector('#sheet [data-dec-link][data-dec-link-state="active"]');
+      }, 8000, '关联行出现');
+      assert(/已关联 1 笔买入/.test(document.querySelector('#sheet').textContent), '进度显示 1 笔买入');
+      assert(document.querySelector('#sheet [data-action="dec:unlink"]'), '活动关联给出解绑入口');
+      var st1 = await apiState();
+      equal(st1.decisionLinks.filter(function (l) {
+        return l.decisionId === dec.id && l.unlinkedOn == null;
+      }).length, 1, '服务端活动关联 1 条');
+      equal(st1.decisionLinks.filter(function (l) { return l.decisionId === dec.id; }).length, 1,
+        '重复点击不得产生第二条关联');
+      equal(st1.assets.securityEvents.length, stEv.assets.securityEvents.length,
+        '关联不得复制第二笔证券事件');
+      equal(st1.txns.length, stEv.txns.length, '关联不得写入记账流水');
+      equal(st1.assets.assetUnits.filter(function (u) { return u.id === 'c6-u-cny'; })[0].balanceMinor,
+        stEv.assets.assetUnits.filter(function (u) { return u.id === 'c6-u-cny'; })[0].balanceMinor,
+        '关联不自动改写现金余额');
+
+      // ③ 归档门禁：还有活动关联时归档必须被服务端拒绝，状态不推进
+      document.querySelector('#sheet #dec-exec-note').value = '先尝试归档（应当被拒绝）';
+      clickAction('#sheet [data-action="dec:event"][data-to="archived"]');
+      await waitFor(function () {
+        var box = document.querySelector('#sheet [data-dec-action-error]');
+        return box && !box.hidden && box.textContent.length > 0;
+      }, 8000, '归档失败就地显示原因');
+      assert(/解绑/.test(document.querySelector('#sheet [data-dec-action-error]').textContent),
+        '错误信息说明要先解绑活动关联');
+      equal(document.querySelector('#sheet [data-dec-chip]').getAttribute('data-dec-chip'), 'accepted',
+        '失败不假成功：状态仍是 accepted');
+
+      // ④ 解绑：理由为空被挡下（关联保持），填理由后软删除、历史行保留、进度回 0
+      clickAction('#sheet [data-action="dec:unlink"]');
+      await new Promise(function (r) { setTimeout(r, 400); });
+      assert(document.querySelector('#sheet [data-dec-link][data-dec-link-state="active"]'),
+        '空理由不得解除关联');
+      var unInput = document.querySelector('#sheet input[data-unlink-note]');
+      assert(unInput, '解绑理由输入框存在');
+      unInput.value = '挂错账户，先解绑';
+      clickAction('#sheet [data-action="dec:unlink"]');
+      await waitFor(function () {
+        return document.querySelector('#sheet [data-dec-link][data-dec-link-state="unlinked"]');
+      }, 8000, '解绑后历史行保留');
+      assert(/已关联 0 笔买入/.test(document.querySelector('#sheet').textContent), '进度回到 0 笔');
+      var st2 = await apiState();
+      equal(st2.decisionLinks.filter(function (l) { return l.decisionId === dec.id && l.unlinkedOn == null; }).length,
+        0, '活动关联已清零');
+      equal(st2.decisionLinks.filter(function (l) { return l.decisionId === dec.id; }).length, 1,
+        '解绑是软删除，不删行');
+      equal(st2.decisions.filter(function (d) { return d.id === dec.id; })[0].state, 'accepted',
+        '解绑不改状态、不追加状态事件');
+      equal(st2.decisionEvents.filter(function (e) { return e.decisionId === dec.id; }).length, 1,
+        '解绑没有新增状态事件');
+
+      // ⑤ 解绑后同一笔买入可以重新挂回，再确认执行完成（服务端命令）
+      document.querySelector('#sheet #dec-link-pick').value = evId;
+      clickAction('#sheet [data-action="dec:link"]');
+      await waitFor(function () {
+        return document.querySelector('#sheet [data-dec-link][data-dec-link-state="active"]');
+      }, 8000, '重新关联成功');
+      document.querySelector('#sheet #dec-exec-note').value = '按实际买入确认执行，偏差说明见关联记录';
+      clickAction('#sheet [data-action="dec:event"][data-to="executed"]');
+      await waitFor(function () {
+        var chip = document.querySelector('#sheet [data-dec-chip]');
+        return chip && chip.getAttribute('data-dec-chip') === 'executed';
+      }, 8000, '确认执行完成');
+      var st3 = await apiState();
+      equal(st3.decisions.filter(function (d) { return d.id === dec.id; })[0].state, 'executed',
+        '服务端状态推进到 executed');
+      assert(document.querySelector('#sheet [data-dec-snap="执行时点快照"]'), '执行时点快照已封存');
+      assert(document.querySelectorAll('#sheet [data-tl="link"]').length >= 2,
+        '时间线保留关联与解绑两条记录');
+
+      // ⑥ 已执行状态仍可解绑 / 补记；状态推进入口只剩「记录复盘」（6E 起提供；
+      //    原 6D 断言「无任何推进入口」按拆解 §11 显式推进为「仅复盘入口、无归档入口」）
+      assert(document.querySelector('#sheet [data-action="dec:unlink"]'), 'executed 仍可解绑');
+      assert(document.querySelector('#sheet [data-action="dec:event"][data-to="reviewed"]'),
+        'executed 提供「记录复盘」入口（6E）');
+      assert(!document.querySelector('#sheet [data-action="dec:event"][data-to="archived"]') &&
+        !document.querySelector('#sheet [data-action="dec:event"][data-to="executed"]'),
+        'executed 不得提供归档或重复执行入口');
+      clickAction('#sheet .close');
+      await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); },
+        8000, '关闭详情');
+      // 卡片同步刷新为已执行，且仍只在历史里（待执行清单只列 accepted）
+      await waitFor(function () {
+        var card = document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+        return card && card.getAttribute('data-dec-state') === 'executed';
+      }, 8000, '卡片状态同步');
+      var execCard = document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+      equal(execCard.getAttribute('data-dec-state'), 'executed', '卡片仍是这一条，状态已推进');
+    });
+
+    // ⑪ Phase 6E：记录复盘（executed → reviewed，理由必填）与复盘对照 / 月度历史。
+    //    对照表只搬运服务端 comparison；月份筛选基于服务端 eventMonths；禁止收益表述。
+    await check('6E 决策：记录复盘理由必填、复盘后只读，配置变化对照与月度历史不重算不漂移', async function () {
+      var decs = await Store.listDecisions();
+      var dec = decs.items.filter(function (d) { return d.state === 'executed'; })[0];
+      assert(dec, '前置：已有 executed 决策（6D 检查推进）');
+      var month = (dec.eventMonths || [])[0];
+      assert(month, '前置：决策至少有一个事件月');
+
+      function openDetail() {
+        clickAction('#view .dec-card[data-dec-id="' + dec.id + '"] [data-action="dec:detail"]');
+      }
+
+      // ① 复盘理由为空被挡下（客户端拦截，服务端同样拒绝）：状态不推进
+      clickAction('[data-action="nav:decisions"]');
+      await waitFor(function () {
+        return document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+      }, 8000, '决策页卡片');
+      openDetail();
+      await waitFor(function () { return document.querySelector('#sheet [data-dec-detail]'); }, 8000, '详情弹层');
+      assert(document.querySelector('#sheet #dec-review-note'), '复盘理由输入框存在');
+      assert(document.querySelector('#sheet [data-dec-comparison-pending]'),
+        '复盘前对照区显示「未开始」提示而不是空表');
+      clickAction('#sheet [data-action="dec:event"][data-to="reviewed"]');
+      await new Promise(function (r) { setTimeout(r, 400); });
+      equal(document.querySelector('#sheet [data-dec-chip]').getAttribute('data-dec-chip'), 'executed',
+        '空理由不推进状态');
+
+      // ② 填理由记录复盘：状态推进、复盘快照封存、对照表出现
+      document.querySelector('#sheet #dec-review-note').value =
+        '宽度检查：对照显示买入后仍在目标区间附近，下月按新增资金继续补低配类别。';
+      clickAction('#sheet [data-action="dec:event"][data-to="reviewed"]');
+      await waitFor(function () {
+        var chip = document.querySelector('#sheet [data-dec-chip]');
+        return chip && chip.getAttribute('data-dec-chip') === 'reviewed';
+      }, 8000, '记录复盘成功');
+      assert(document.querySelector('#sheet [data-dec-snap="复盘时点快照"]'), '复盘时点快照已封存');
+      var cmpBox = document.querySelector('#sheet [data-dec-comparison]');
+      assert(cmpBox, '可比时渲染配置变化对照表');
+      equal(cmpBox.querySelectorAll('[data-cmp-class]').length, 6, '对照表恒 6 行（六类）');
+      var cmpText = document.querySelector('#sheet').textContent;
+      assert(cmpText.indexOf('配置变化对照') !== -1, '标题写「配置变化对照」');
+      assert(!/建议收益|跑赢目标|赚了/.test(cmpText), '页面禁止收益 / 跑赢目标表述');
+      var detail = await Store.decisionDetail(dec.id);
+      equal(detail.comparison.comparable, true, '服务端对照可比');
+      var driftRow = detail.comparison.rows.filter(function (row) { return row.assetClass === 'broad_equity'; })[0];
+      equal(driftRow.deltaValueMinor, driftRow.review.valueMinor - driftRow.decision.valueMinor,
+        '变化量 = 复盘时点 − 决策时点（服务端已复算）');
+
+      // ③ 复盘后一切只读：不提供关联 / 解绑 / 状态推进入口
+      assert(!document.querySelector('#sheet #dec-link-pick'), 'reviewed 不提供关联选择器');
+      assert(!document.querySelector('#sheet [data-action="dec:unlink"]'), 'reviewed 不提供解绑入口');
+      assert(!document.querySelector('#sheet [data-action="dec:event"]'), 'reviewed 不提供状态推进入口');
+      var stR = await apiState();
+      equal(stR.decisions.filter(function (d) { return d.id === dec.id; })[0].state, 'reviewed',
+        '服务端状态 reviewed');
+      equal(stR.decisionEvents.filter(function (e) { return e.decisionId === dec.id; }).length, 3,
+        '状态事件恰好 3 条（接受 / 执行 / 复盘）');
+      clickAction('#sheet .close');
+      await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); },
+        8000, '关闭详情');
+
+      // ④ 月度历史：按服务端 eventMonths 过滤，翻月与复位不丢数据、不出错
+      var monthSel = document.querySelector('#view [data-change="dec:month"]');
+      assert(monthSel, '月份筛选器存在');
+      monthSel.value = month;
+      monthSel.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(function () {
+        return document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+      }, 8000, '选定月份下决策可见');
+      monthSel.value = '';
+      monthSel.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(function () {
+        return document.querySelector('#view .dec-card[data-dec-id="' + dec.id + '"]');
+      }, 8000, '复位到全部月份后仍在');
+      // 完整时间线：接受 / 执行 / 复盘三条状态事件都在详情里
+      openDetail();
+      await waitFor(function () { return document.querySelector('#sheet [data-dec-timeline]'); }, 8000, '时间线');
+      equal(document.querySelectorAll('#sheet [data-tl="state"]').length, 3, '时间线含三条状态事件');
+      clickAction('#sheet .close');
+      await waitFor(function () { return document.querySelector('#sheet-mask').classList.contains('hidden'); },
+        8000, '关闭详情');
+    });
+
     render();
   }
 

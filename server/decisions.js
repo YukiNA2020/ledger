@@ -34,8 +34,13 @@ function decisionEventId(decisionId, seq) {
   return 'dev-' + crypto.createHash('sha256').update('decision-event:' + decisionId + ':' + seq).digest('hex').slice(0, 16);
 }
 
-function decisionLinkRecordId(decisionId, securityEventId) {
-  return 'lnk-' + crypto.createHash('sha256').update('decision-link:' + decisionId + ':' + securityEventId).digest('hex').slice(0, 16);
+// occurrence = 该 (决策, 事件) 组合已存在的行数（含已解绑的历史行）：解绑是软删除、行仍在
+// （契约 §3.4「追加更正而非擦除」），所以解绑后重新关联同一事件必须换一个新 id，
+// 否则主键撞车。occurrence = 0（首次关联）时与既有 fixture 的派生式完全一致。
+function decisionLinkRecordId(decisionId, securityEventId, occurrence) {
+  const seed = 'decision-link:' + decisionId + ':' + securityEventId +
+    (occurrence ? ':' + occurrence : '');
+  return 'lnk-' + crypto.createHash('sha256').update(seed).digest('hex').slice(0, 16);
 }
 
 /* ------------------------------ 快照与执行汇总 ------------------------------ */
@@ -99,6 +104,32 @@ function executionSummary(rec, decisionId, links, securityEvents, fxRates) {
       .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(b.id))
       .map((ev) => ev.id)
   };
+}
+
+// 关联行的对外形状（详情与关联 / 解绑响应同一份）：内嵌交易事实，页面直接显示，
+// 不需要再按 securityEventId 去查一次事件（6D 页面搬运服务端值，不自己折算）。
+function decisionLinkRows(links, eventsById) {
+  return links.map((l) => {
+    const ev = eventsById.get(l.securityEventId) || null;
+    return {
+      id: l.id,
+      securityEventId: l.securityEventId,
+      event: ev ? {
+        eventType: ev.eventType,
+        occurredAt: ev.occurredAt,
+        quantity: ev.quantity,
+        priceMinor: ev.priceMinor,
+        feeMinor: ev.feeMinor,
+        currency: ev.currency,
+        instrumentId: ev.instrumentId,
+        accountId: ev.accountId
+      } : null,
+      linkedOn: l.linkedOn,
+      unlinkedOn: l.unlinkedOn,
+      note: l.note,
+      unlinkNote: l.unlinkNote
+    };
+  });
 }
 
 // 契约 §4.2 快照：三时点各封存一份；available=false 时数字字段全 null（不出伪 0），
@@ -417,6 +448,116 @@ function appendDecisionEvent(db, decisionId, payload, ctx) {
   };
 }
 
+/* ------------------------------ 关联与解绑（POST .../links、.../links/unlink，6D） ------------------------------ */
+
+// 关联 / 解绑的共同前置（契约 §3.2 / §3.4）：决策必须存在、事件链复核通过、
+// 状态只允许 accepted / executed —— 其余状态一律 409 illegal_state_for_link。
+function requireLinkableDecision(db, decisionId) {
+  const decision = R.getDecisionRow(db, decisionId);
+  if (!decision) {
+    decisionFail('unknown_decision', '决策不存在：' + decisionId);
+  }
+  const events = R.getDecisionEvents(db, decisionId);
+  const chain = Domain.validateDecisionEventChain(decision, events);
+  if (!chain.ok) {
+    decisionFail('invalid_decision_record', '决策事件链复核失败：' + chain.error.detail);
+  }
+  if (decision.state !== 'accepted' && decision.state !== 'executed') {
+    decisionFail('illegal_state_for_link',
+      '只有 accepted / executed 状态可以关联或解绑实际交易（当前 ' + decision.state + '）');
+  }
+  const recEntry = R.getRecommendation(db, decision.recommendationId);
+  if (!recEntry) {
+    decisionFail('invalid_decision_record', '决策引用的建议不存在：' + decision.recommendationId);
+  }
+  return { decision: decision, rec: recEntry.record };
+}
+
+// 关联后的执行汇总（§3.3）：列表、详情、关联响应与快照必须是同一份计算。
+function linkExecution(db, rec, decisionId) {
+  const state = R.readState(db, { decisionView: true });
+  const links = R.readDecisionLinks(db);
+  const securityEvents = R.readSecurityEvents(db);
+  return executionSummary(rec, decisionId, links, securityEvents, state.assets && state.assets.fxRates || []);
+}
+
+// 契约 §3.1 / §3.2 / §8.5：把一笔 buy 事件关联到决策。
+// 关联不写状态事件、不改 decisions 行、不复制证券事件、不写 txns、不改现金余额（D-042 ④）。
+// 自然幂等：同一事件已活动关联到本决策 → created:false；关联到另一条决策 → 409。
+function createDecisionLink(db, decisionId, payload, ctx) {
+  const checked = Domain.validateDecisionLinkRequest(payload && typeof payload === 'object' ? payload : {});
+  if (!checked.ok) {
+    decisionFail(checked.error.code, '关联请求不合法：' + checked.error.detail);
+  }
+  const req = checked.value;
+  const { decision, rec } = requireLinkableDecision(db, decisionId);
+
+  const securityEvent = R.getSecurityEvent(db, req.securityEventId);
+  if (!securityEvent) {
+    decisionFail('unknown_security_event', '关联引用的证券事件不存在：' + req.securityEventId);
+  }
+  if (securityEvent.eventType !== 'buy') {
+    decisionFail('invalid_link_target', '只有 buy 事件可以关联（sell / dividend / fee 不参与本金）');
+  }
+
+  const allLinks = R.readDecisionLinks(db);
+  const active = allLinks.find((l) => l.securityEventId === req.securityEventId && l.unlinkedOn == null) || null;
+  if (active) {
+    if (active.decisionId === decision.id) {
+      return { created: false, decisionId: decision.id, link: active, execution: linkExecution(db, rec, decision.id) };
+    }
+    decisionFail('event_already_linked', '该证券事件已活动关联到另一条决策，不能重复占用：' + req.securityEventId);
+  }
+
+  // 同 (决策, 事件) 已有历史行（含解绑行）时递增 occurrence，保证 id 不撞主键
+  let id = null;
+  const existingIds = new Set(allLinks.map((l) => l.id));
+  for (let occurrence = 0; ; occurrence++) {
+    id = decisionLinkRecordId(decision.id, req.securityEventId, occurrence);
+    if (!existingIds.has(id)) break;
+  }
+  const link = {
+    id: id,
+    decisionId: decision.id,
+    securityEventId: req.securityEventId,
+    linkedOn: ctx.today,
+    linkedAt: ctx.nowIso,
+    note: req.note,
+    unlinkedOn: null,
+    unlinkedAt: null,
+    unlinkNote: null
+  };
+  R.insertDecisionLinkRow(db, link);
+  return { created: true, decisionId: decision.id, link: link, execution: linkExecution(db, rec, decision.id) };
+}
+
+// 契约 §3.4：解绑 = 软删除（写 unlinked_* 三列），不删行、不追加状态事件、状态不变。
+// linkId 是载荷引用：不存在或不属于本决策 → 422 unknown_decision_link；非活动关联 → 409 link_not_active。
+function unlinkDecisionLink(db, decisionId, payload, ctx) {
+  const checked = Domain.validateDecisionUnlinkRequest(payload && typeof payload === 'object' ? payload : {});
+  if (!checked.ok) {
+    decisionFail(checked.error.code, '解绑请求不合法：' + checked.error.detail);
+  }
+  const req = checked.value;
+  const { decision, rec } = requireLinkableDecision(db, decisionId);
+
+  const link = R.getDecisionLinkRow(db, req.linkId);
+  if (!link || link.decisionId !== decision.id) {
+    decisionFail('unknown_decision_link', '解绑引用的关联行不存在或不属于本决策：' + req.linkId);
+  }
+  if (link.unlinkedOn != null) {
+    decisionFail('link_not_active', '该关联已解除，无需重复解绑：' + req.linkId);
+  }
+  const changes = R.markDecisionLinkUnlinked(db, link.id, ctx.today, ctx.nowIso, req.note);
+  if (changes !== 1) {
+    decisionFail('link_not_active', '该关联已解除，无需重复解绑：' + req.linkId);
+  }
+  const updated = Object.assign({}, link, {
+    unlinkedOn: ctx.today, unlinkedAt: ctx.nowIso, unlinkNote: req.note
+  });
+  return { decisionId: decision.id, link: updated, execution: linkExecution(db, rec, decision.id) };
+}
+
 /* ------------------------------ 只读视图（GET /api/v1/decisions[/id]） ------------------------------ */
 
 function recommendationSummary(rec, view, assetsSig) {
@@ -572,27 +713,21 @@ function decisionDetailResponse(db, decisionId, ctx) {
   };
   const decisionPoint = checked.events.find((e) => e.fromState === 'proposed');
 
-  const linkRows = links.map((l) => {
-    const ev = eventsById.get(l.securityEventId) || null;
-    return {
-      id: l.id,
-      securityEventId: l.securityEventId,
-      event: ev ? {
-        eventType: ev.eventType,
-        occurredAt: ev.occurredAt,
-        quantity: ev.quantity,
-        priceMinor: ev.priceMinor,
-        feeMinor: ev.feeMinor,
-        currency: ev.currency,
-        instrumentId: ev.instrumentId,
-        accountId: ev.accountId
-      } : null,
-      linkedOn: l.linkedOn,
-      unlinkedOn: l.unlinkedOn,
-      note: l.note,
-      unlinkNote: l.unlinkNote
-    };
-  });
+  // 契约 §4.3（6E 补充）：六类配置对照由共享领域层从三份封存快照派生，页面只搬运。
+  // 输入快照已经过完整性复核，这里再校验一次形状；不合法 → 详情整体 fail closed。
+  const comparison = Domain.decisionReviewComparison(
+    decisionPoint ? decisionPoint.snapshot : null,
+    snapshotAt('executed'),
+    snapshotAt('reviewed'));
+  if (!comparison.ok) {
+    decisionFail('invalid_decision_record', '复盘对照计算失败：' + (comparison.error && comparison.error.detail));
+  }
+  const comparisonShape = Domain.validateDecisionComparisonShape(comparison.value);
+  if (!comparisonShape.ok) {
+    decisionFail('invalid_decision_record', '复盘对照形状不合法：' + (comparisonShape.error && comparisonShape.error.detail));
+  }
+
+  const linkRows = decisionLinkRows(links, eventsById);
 
   const timeline = checked.events.map((e) => ({
     at: e.occurredAt,
@@ -637,6 +772,7 @@ function decisionDetailResponse(db, decisionId, ctx) {
       reviewed: snapshotAt('reviewed'),
       archived: snapshotAt('archived')
     },
+    comparison: comparison.value,
     execution: execution,
     timeline: timeline
   };
@@ -652,6 +788,9 @@ module.exports = {
   acceptanceRecheck,
   createDecision,
   appendDecisionEvent,
+  createDecisionLink,
+  unlinkDecisionLink,
+  decisionLinkRows,
   decisionListResponse,
   decisionDetailResponse
 };

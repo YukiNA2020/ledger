@@ -1,0 +1,321 @@
+"""6E 复盘与月度历史：三档宽度与关键状态检查（隔离 fixture，绝不触碰私人账本）。
+
+在 6D 全部检查的基础上追加：
+  6) 记录复盘（理由必填）→ 复盘后只读；
+  7) 配置变化对照表（6 行六类 + 变化量）三档不溢出、不裁切、无收益表述；
+  8) 月份筛选器翻月与复位不丢数据。
+
+用法：python3 width_check.py <端口>
+  先启动隔离服务：node docs/evidence/phase5d-wiring-server.cjs <端口>
+覆盖：
+  1) 决策页首帧「读取中」（延迟响应）、读取失败（500）、重试恢复三态；
+  2) 1440 / 1100 / 390 三档 × 18 条路由无装饰表情、无横向溢出；
+  3) 决定弹层、详情弹层（无关联 / 已关联）三档不溢出、不裁切；
+  4) 关联区（选择器 + 关联说明 + 解绑理由输入）三档不挤压、不横向滚动；
+  5) 决定入口行、卡片理由与月份换行不挤压按钮。
+输出：width-result.json 与 width-*.png 截图。
+"""
+import json, re, sys, time
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+base = 'http://127.0.0.1:' + sys.argv[1]
+out = Path(__file__).parent
+report = {'states': [], 'pages': [], 'errors': []}
+emoji = re.compile('[\U0001F000-\U0001FAFF☀-➿]')
+routes = ['home', 'cashflow', 'add', 'list', 'stats', 'settings', 'import', 'accounts',
+          'categories', 'budget', 'health', 'reimburse', 'recurring', 'assets', 'close',
+          'risk', 'targets', 'decisions']
+
+
+def ok(cond, label):
+    if not cond:
+        raise AssertionError(label)
+
+
+def seed(page):
+    """写入 6C 事实链：虚拟资产 + 正式月结 + 风险评估 + 目标版本 + 认可标的。"""
+    status = page.evaluate('''async () => {
+      const TOKEN = Store.readSessionToken();
+      const today = Domain.localTodayISO();
+      const ty = +today.slice(0, 4), tm = +today.slice(5, 7);
+      const monthEnd = today.slice(0, 8) + String(new Date(Date.UTC(ty, tm, 0)).getUTCDate()).padStart(2, '0');
+      const dates = Array.from(new Set([today, monthEnd]));
+      const rows = (ins, price, currency) => dates.map(d =>
+        ({ instrumentId: ins, priceMinor: price, currency: currency, priceDate: d, provider: 'manual', status: 'ok' }));
+      const a = Domain.emptyAssets();
+      a.assetAccounts = [
+        { id: 'c6-acc-cash', name: '投资现金户', kind: 'deposit', pool: 'investable', institution: 'C6' },
+        { id: 'c6-acc-broker', name: '券商户', kind: 'broker', pool: 'investable', institution: 'C6' },
+        { id: 'c6-acc-safe', name: '应急金', kind: 'deposit', pool: 'safety', institution: 'C6' }
+      ];
+      a.assetUnits = [
+        { id: 'c6-u-cny', accountId: 'c6-acc-cash', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' },
+        { id: 'c6-u-safe', accountId: 'c6-acc-safe', currency: 'CNY', balanceMinor: 50000000, asOf: today, sourceType: 'manual' }
+      ];
+      a.instruments = [
+        { id: 'c6-ins-bond', symbol: 'C6BND', exchange: 'NASDAQ', currency: 'USD', name: '债基', instrumentType: 'etf', assetClass: 'fixed_income', exposureMarket: 'US', classificationStatus: 'confirmed' },
+        { id: 'c6-ins-voo', symbol: 'C6VOO', exchange: 'SSE', currency: 'CNY', name: '宽基A', instrumentType: 'etf', assetClass: 'broad_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' },
+        { id: 'c6-ins-thm', symbol: 'C6THM', exchange: 'SSE', currency: 'CNY', name: '主题', instrumentType: 'fund', assetClass: 'theme_equity', exposureMarket: 'CN', classificationStatus: 'confirmed' }
+      ];
+      a.holdings = [
+        { id: 'c6-h-bond', accountId: 'c6-acc-broker', instrumentId: 'c6-ins-bond', quantity: '5000', costMinor: 5000000, asOf: today },
+        { id: 'c6-h-voo', accountId: 'c6-acc-broker', instrumentId: 'c6-ins-voo', quantity: '50000', costMinor: 5000000, asOf: today },
+        { id: 'c6-h-thm', accountId: 'c6-acc-broker', instrumentId: 'c6-ins-thm', quantity: '70000', costMinor: 7000000, asOf: today }
+      ];
+      a.quotes = rows('c6-ins-bond', 1000, 'USD').concat(rows('c6-ins-voo', 100, 'CNY')).concat(rows('c6-ins-thm', 100, 'CNY'));
+      a.fxRates = dates.map(d => ({ base: 'USD', quote: 'CNY', rateDecimal: '7.0000', rateDate: d, provider: 'manual', status: 'ok' }));
+
+      const base = await (await fetch('/api/v1/state', { headers: { Accept: 'application/json' } })).json();
+      const st = Object.assign({}, base, {
+        accounts: [], categories: [], txns: [], settings: {}, assets: a,
+        riskAssessments: [], allocationTargets: [], approvedInstruments: [], recommendations: [],
+        decisions: [], decisionEvents: [], decisionLinks: []
+      });
+      const put = await fetch('/api/v1/state', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN },
+        body: JSON.stringify({ state: st })
+      });
+      if (put.status !== 200) return 'put:' + put.status;
+      const post = async (path, body) => (await fetch('/api/v1/' + path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN },
+        body: JSON.stringify(body)
+      })).status;
+      const close = await post('monthly-closes', { month: today.slice(0, 7) });
+      if (close !== 201 && close !== 200) return 'close:' + close;
+      const CAP = Domain.RISK_QUESTIONS.filter(q => q.kind === 'capacity');
+      const WIL = Domain.RISK_QUESTIONS.filter(q => q.kind === 'willingness');
+      const pick = (list, scores) => list.map((q, i) =>
+        ({ questionId: q.id, optionId: q.options.filter(o => o.score === scores[i])[0].id }));
+      const answers = pick(CAP, [1, 1, 1, 2, 2]).concat(pick(WIL, [2, 2, 1, 1]));
+      const risk = await post('risk-assessments', { answers: answers, assessedAt: today, reason: 'initial' });
+      if (risk !== 201) return 'risk:' + risk;
+      const tgt = await post('targets', {});
+      if (tgt !== 201 && tgt !== 200) return 'targets:' + tgt;
+      const inst = await post('approved-instruments', { assetClass: 'broad_equity', instrumentIds: ['c6-ins-voo'] });
+      if (inst !== 200) return 'inst:' + inst;
+      return 'ok';
+    }''')
+    ok(status == 'ok', '前置事实链写入失败：' + str(status))
+
+
+def run_advice(page, amount):
+    """生成一笔新的正式建议，返回结果块是否带可决策入口。"""
+    page.evaluate("(a)=>location.hash='targets'", amount)
+    page.wait_for_selector('#view [data-action="target:reload"]')
+    page.locator('#view [data-action="target:reload"]').first.click()
+    page.wait_for_selector('#view [data-action="advice:run"]')
+    page.evaluate('''(amount) => {
+      const inp = document.querySelector('#view [data-input="advice:amount"]');
+      inp.value = String(amount);
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#view [data-action="advice:run"]').click();
+    }''', amount)
+    page.wait_for_function('''(amount) => {
+      const b = document.querySelector('#view [data-advice-result]');
+      return b && b.getAttribute('data-advice-allocated') === String(amount * 100);
+    }''', arg=amount, timeout=20000)
+
+
+def sheet_ok(page, width, route, name):
+    page.wait_for_selector('#sheet-mask:not(.hidden)')
+    time.sleep(0.2)
+    text = page.locator('#sheet').inner_text()
+    ok(not emoji.search(text), (width, route, name, 'emoji'))
+    ok(page.locator('#sheet').evaluate('(e)=>e.scrollWidth<=e.clientWidth'), (width, route, name, 'sheet overflow'))
+    ok(page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width, route, name, 'page overflow'))
+    page.screenshot(path=str(out / f'{name}-{width}.png'))
+    report['pages'].append({'width': width, 'route': route, 'check': name, 'pass': True})
+
+
+with sync_playwright() as p:
+    b = p.chromium.launch(headless=True)
+    q = b.new_page(viewport={'width': 1440, 'height': 900})
+    q.on('pageerror', lambda e: report['errors'].append(str(e)))
+    q.goto(base + '/', wait_until='networkidle')
+    seed(q)
+
+    # ① 首帧读取中：延迟决策读取，不得把「还没读到」渲染成空清单
+    held = []
+    q.route('**/api/v1/decisions*', lambda r: held.append(r))   # 扣住响应，读取中状态可稳定截图
+    q.evaluate("()=>location.hash='decisions'")
+    q.wait_for_selector('#view.view-decisions [data-dec-loading]', timeout=6000)
+    ok('还没有待执行的决策' not in q.locator('#view').inner_text(), '读取中不得渲染空态')
+    q.screenshot(path=str(out / 'decisions-loading-1440.png'))
+    report['states'].append({'state': 'loading', 'pass': True})
+    held[0].continue_()
+    q.unroute('**/api/v1/decisions*')
+    q.wait_for_selector('#view.view-decisions [data-action="dec:reload"]', timeout=15000)
+
+    # ② 读取失败：必须显式失败卡 + 重试入口，且不冒充「还没有决策」
+    q.route('**/api/v1/decisions*', lambda r: r.fulfill(
+        status=500, content_type='application/json',
+        body='{"error":{"code":"internal_error","message":"模拟读取失败","retryable":true}}'))
+    q.locator('#view [data-action="dec:reload"]').first.click()
+    q.wait_for_selector('#view.view-decisions [data-dec-error]', timeout=6000)
+    ok('决策读取失败' in q.locator('#view').inner_text(), '失败卡文案')
+    ok(q.locator('#view [data-dec-empty]').count() == 0, '失败不得冒充空态')
+    ok('还没有待执行的决策' not in q.locator('#view').inner_text(), '失败不得出现空态文案')
+    q.screenshot(path=str(out / 'decisions-error-1440.png'))
+    report['states'].append({'state': 'error', 'pass': True})
+    q.unroute('**/api/v1/decisions*')
+
+    # ③ 重试恢复
+    q.locator('#view [data-dec-error] [data-action="dec:reload"]').click()
+    q.wait_for_selector('#view.view-decisions [data-dec-empty]', timeout=15000)
+    report['states'].append({'state': 'empty-after-retry', 'pass': True})
+
+    # ④ 生成正式建议并接受一单（决定弹层 + 卡片 + 详情弹层都要三档过检）
+    run_advice(q, 2000)
+    ok(q.locator('#view [data-action="dec:open"]').count() == 1, '决定入口可见')
+    q.locator('#view [data-action="dec:open"]').click()
+    q.wait_for_selector('#dec-note')
+    q.evaluate('''() => {
+      const box = document.querySelector('#dec-note');
+      box.value = '宽度检查：把闲置现金先按目标配置投入宽基，按目标配置执行，理由充分且可复核。';
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    }''')
+    q.locator('#sheet [data-action="dec:submit"][data-intent="accepted"]').click()
+    q.wait_for_function("()=>document.querySelector('#sheet-mask').classList.contains('hidden')", timeout=8000)
+    report['states'].append({'state': 'accepted', 'pass': True})
+
+    # ④-b 前置事实：一笔服务端买入事件（6D 关联候选只能来自 /security-events）
+    sev = q.evaluate('''async () => {
+      const TOKEN = Store.readSessionToken();
+      const today = Domain.localTodayISO();
+      const r = await fetch('/api/v1/security-events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-ledger-token': TOKEN,
+                   'Idempotency-Key': 'width-6d-buy' },
+        body: JSON.stringify({ id: 'sev-width6d01', eventType: 'buy', accountId: 'c6-acc-broker',
+          instrumentId: 'c6-ins-voo', quantity: '10', priceMinor: 10000, feeMinor: 100, occurredAt: today })
+      });
+      const j = await r.json();
+      return r.status + ':' + ((j.item && j.item.id) || j.error && j.error.code);
+    }''')
+    ok(sev.endswith(':sev-width6d01'), '买入事件写入失败：' + str(sev))
+    report['states'].append({'state': 'buy-event-seeded', 'pass': True})
+
+    for width in [1440, 1100, 390]:
+        if width != 1440:
+            q.close()
+            q = b.new_page(viewport={'width': width, 'height': 900})
+            q.on('pageerror', lambda e: report['errors'].append(str(e)))
+            q.goto(base + '/', wait_until='networkidle')
+        for route in routes:
+            q.evaluate('(r)=>location.hash=r', route)
+            q.wait_for_selector('#view.view-' + route)
+            q.wait_for_timeout(120)
+            text = q.locator('#view').inner_text()
+            ok(not emoji.search(text), (width, route, 'emoji'))
+            ok(q.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width, route, 'overflow'))
+            if route == 'targets':
+                entry = q.locator('#view [data-dec-entry]')
+                ok(entry.count() <= 1, (width, route, '决定入口数量'))
+                if entry.count():
+                    ok(entry.first.evaluate('(e)=>e.scrollWidth<=e.clientWidth'), (width, route, '决定入口行溢出'))
+            if route == 'decisions':
+                q.screenshot(path=str(out / f'decisions-{width}.png'))
+            report['pages'].append({'width': width, 'route': route, 'pass': True})
+
+        # 决定弹层：换一个新金额重新生成建议，保证入口仍未决策
+        q.evaluate("(a)=>location.hash='targets'", 3000)
+        run_advice(q, 3000)
+        if q.locator('#view [data-action="dec:open"]').count():
+            q.locator('#view [data-action="dec:open"]').click()
+            q.wait_for_selector('#dec-note')
+            sheet_ok(q, width, 'targets', 'decide-sheet')
+            q.locator('#sheet .close').click()
+            q.wait_for_function("()=>document.querySelector('#sheet-mask').classList.contains('hidden')")
+
+        # 详情弹层：先「还没关联」一档
+        q.evaluate("()=>location.hash='decisions'")
+        q.wait_for_selector('#view.view-decisions [data-action="dec:detail"]')
+        q.locator('#view [data-action="dec:detail"]').first.click()
+        q.wait_for_selector('#sheet [data-dec-links]')
+        sheet_ok(q, width, 'decisions', 'detail-sheet')
+
+        # 关联实际交易后同一弹层再拍一档：关联区不得横向溢出或裁切
+        if q.locator('#sheet [data-dec-link][data-dec-link-state="active"]').count() == 0:
+            q.wait_for_selector('#dec-link-pick')
+            ok(q.locator('#dec-link-pick option').count() >= 1, (width, '关联候选非空'))
+            q.evaluate('''() => {
+              const pick = document.getElementById('dec-link-pick');
+              pick.value = pick.options[0].value;
+              document.getElementById('dec-link-note').value = '宽度检查：按目标配置分批买入第一批宽基。';
+              document.querySelector('#sheet [data-action="dec:link"]').click();
+            }''')
+            q.wait_for_selector('#sheet [data-dec-link][data-dec-link-state="active"]', timeout=10000)
+        ok(q.locator('#sheet [data-dec-link][data-dec-link-state="active"]').count() >= 1,
+           (width, '活动关联行'))
+        # 6D 原断言「解绑理由输入可见」随 6E 显式推进：reviewed 起决策只读，关联行保留但
+        # 不再提供解绑入口；仅 accepted / executed 档要求输入框可见。
+        if q.locator('#sheet [data-dec-chip][data-dec-chip="reviewed"]').count() == 0:
+            ok(q.locator('#sheet input[data-unlink-note]').count() >= 1, (width, '解绑理由输入可见'))
+        sheet_ok(q, width, 'decisions', 'detail-links')
+
+        # 6E-① 记录复盘：首档空理由被挡下、填理由 executed → reviewed；后两档复用已复盘
+        # 决策直接检查对照表与只读状态。
+        if q.locator('#sheet [data-dec-chip][data-dec-chip="reviewed"]').count() == 0:
+            if q.locator('#sheet [data-dec-chip][data-dec-chip="executed"]').count() == 0:
+                q.evaluate('''() => {
+                  document.getElementById('dec-exec-note').value = '宽度检查：按实际买入确认执行完成。';
+                  document.querySelector('#sheet [data-action="dec:event"][data-to="executed"]').click();
+                }''')
+                q.wait_for_selector('#sheet [data-dec-chip][data-dec-chip="executed"]', timeout=10000)
+            q.evaluate('''() => {
+              document.querySelector('#sheet [data-action="dec:event"][data-to="reviewed"]').click();
+            }''')
+            q.wait_for_timeout(300)
+            ok(q.locator('#sheet [data-dec-chip][data-dec-chip="executed"]').count() == 1,
+               (width, '空复盘理由不推进'))
+            q.evaluate('''() => {
+              document.getElementById('dec-review-note').value =
+                '宽度检查：对照显示买入后仍在目标区间附近，下月按新增资金继续补低配类别。';
+              document.querySelector('#sheet [data-action="dec:event"][data-to="reviewed"]').click();
+            }''')
+            q.wait_for_selector('#sheet [data-dec-chip][data-dec-chip="reviewed"]', timeout=10000)
+        ok(q.locator('#sheet [data-dec-snap="复盘时点快照"]').count() == 1, (width, '复盘快照已封存'))
+        cmp_rows = q.locator('#sheet [data-cmp-class]').count()
+        ok(cmp_rows == 6, (width, '对照表恒 6 行', cmp_rows))
+        ok(q.locator('#sheet [data-cmp-delta]').count() == 6, (width, '每行有变化量'))
+        sheet_text = q.locator('#sheet').inner_text()
+        ok('配置变化对照' in sheet_text, (width, '对照标题'))
+        ok(not re.search('建议收益|跑赢目标|赚了', sheet_text), (width, '禁止收益表述'))
+        ok(q.locator('#sheet #dec-link-pick').count() == 0, (width, 'reviewed 无关联选择器'))
+        ok(q.locator('#sheet [data-action="dec:event"]').count() == 0, (width, 'reviewed 无状态推进按钮'))
+        ok(q.locator('#sheet [data-action="dec:unlink"]').count() == 0, (width, 'reviewed 无解绑入口'))
+        sheet_ok(q, width, 'decisions', 'detail-review')
+        q.locator('#sheet .close').click()
+        q.wait_for_function("()=>document.querySelector('#sheet-mask').classList.contains('hidden')")
+
+        # 6E-② 月份筛选：选定决策月仍可见，复位到全部月份不丢数据
+        month_value = q.evaluate('''async () => {
+          const items = (await Store.listDecisions()).items;
+          const dec = items.filter(d => d.state === 'reviewed')[0];
+          return (dec.eventMonths || [''])[0];
+        }''')
+        ok(bool(month_value), (width, '决策有事件月'))
+        q.wait_for_selector('#view [data-change="dec:month"]')
+        q.evaluate('''(m) => {
+          const sel = document.querySelector('#view [data-change="dec:month"]');
+          sel.value = m;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }''', month_value)
+        q.wait_for_timeout(200)
+        ok(q.locator('#view .dec-card[data-dec-state="reviewed"]').count() >= 1, (width, '选定月份可见'))
+        q.evaluate('''() => {
+          const sel = document.querySelector('#view [data-change="dec:month"]');
+          sel.value = '';
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }''')
+        q.wait_for_timeout(200)
+        ok(q.locator('#view .dec-card[data-dec-state="reviewed"]').count() >= 1, (width, '复位后仍可见'))
+
+        # 卡片理由与月份换行不挤压按钮
+        ok(q.locator('#view .dec-card').first.evaluate('(e)=>e.scrollWidth<=e.clientWidth'), (width, 'decisions', 'card overflow'))
+    b.close()
+
+assert not report['errors'], report['errors']
+(out / 'width-result.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+print('states', len(report['states']), '· page checks', len(report['pages']), 'passed')

@@ -3,6 +3,8 @@
 > 2026-09-28；执行子阶段：**6A 规则与契约**。基线代码 `2.4.23-ui-polish` / SQLite **v10**。
 > **2026-09-29 复核勘误**（不改四条已确认产品口径，只修实现口径）：①有序对计数为完整矩阵 **7×7 = 49**（合法 6 / 非法 43，含自转移）；②`RESTRICT` + 软删除 ⇒ 曾被关联（含已解绑）的证券事件一律不可物理删除；③F-A 正向 fixture 修正为 20 × 100.00 = 2,000.00 本金；④归档理由首次尝试按关联历史判定（**已被下条二次复测规则取代**）；⑤零事件 `proposed` 决策为合法空序列、无快照，读取校验豁免链式检查；⑥§4.4 `reason` 公式补 `available` 判定。明细见 DECISIONS D-057 勘误。
 > **2026-09-29 二次复测修正**：跨月关联不新增 `eventMonths`；缺汇率时 CNY 汇总与剩余金额返回 `null`；归档理由按建议金额与关联历史唯一判定；三时点表与非法计数对齐矩阵。对应反例见 §10.2，详见 D-057 二次勘误。
+> **2026-09-29 6D 补充**（实现前先补规则，D-057 附属）：关联 / 解绑的请求键白名单、`note` 必填口径与载荷引用错误码 `unknown_decision_link`（422）写入 §3.4 / §7 / §8.5；四条已确认产品口径、状态机与金额口径不变。
+> **2026-09-30 6E 补充**（实现前先补规则，D-057 附属）：§4.3 的六类配置对照以服务端派生的 `comparison` 对象进详情响应（§8.4），字段形状、不可比口径与 delta 定义见 §4.3 末新增小节；`reviewed_with_drift / reviewed_no_drift` 在任一时点不可比时的判定口径一并冻结。状态机、快照结构与错误码不变。
 > 顺序入口：[ROADMAP.md](./ROADMAP.md)；任务来源：[PHASE6_BREAKDOWN.md](./PHASE6_BREAKDOWN.md) §3；执行入口：[NEXT_AGENT.md](./NEXT_AGENT.md)。
 > **本文件是 6A～6F 的唯一规则来源。** 与本文件冲突的旧文档、旧测试注释或代码注释，一律以本文件为准，并按 §11 更新；发现本文件未覆盖的分歧，先在本文件补一条规则再实现，不得在代码里就地裁定。
 
@@ -210,6 +212,7 @@ archived   已归档放弃（终态，6A 新增）
 
 - 解绑 = 把 `decision_links` 行标记 `unlinked_on` + `unlink_note`（必填），**不删除行、不追加第二条状态事件**；历史由关联行自身保留（"追加更正而非擦除"的落地形式）。
 - 解绑后该事件可重新关联到任意决策（部分唯一索引只约束活动行）。
+- 解绑请求里的 `linkId` 是**载荷引用**（§7 口径）：`linkId` 不存在，或存在但不属于路径上的这条决策，一律 **422 `unknown_decision_link`**（不区分「查无此行」与「张冠李戴」——从该决策视角两者都是引用不到该决策的关联行），且不写入任何变更。
 - 解绑不删除关联行，外键引用随之保留——**解绑不会使证券事件变得可删除**（§3.2）。
 - 解绑后决策的 `state` **不变**；若解绑导致活动关联归零且决策仍在 `accepted`，决策照常可归档（L5）或继续接受新关联。
 - `reviewed` 之后任何关联 / 解绑请求 → 409 `illegal_state_for_link`（复盘不可静默改变）。
@@ -306,6 +309,39 @@ archived   已归档放弃（终态，6A 新增）
 - 三份快照中任一份 `available === false` → 该行标记**不可比**并给出该快照的 `reason` + `blockers`，**不出数字、不出伪 0**。
 - `pctBps` 为 `null`（投资池为 0）→ 该时点比例列显示「不可用」，**不算不可比**，金额列照常显示。
 - 参照目标恒为 `targetRef`；页面如需展示当前目标，必须单独区块、单独标注「当前生效目标（非决策时目标）」。
+
+**6E 补充：详情响应的 `comparison` 对象（服务端派生，页面只搬运）。** 形状与口径冻结如下：
+
+```jsonc
+"comparison": {
+  "comparable": true,              // 三时点快照齐全（均存在）且全部 available === true
+  "timepoints": {                  // 每个时点的在场性与可用性，含不可比原因（原样搬运封存值）
+    "decision": { "present": true, "available": true, "reason": null, "blockers": [] },
+    "executed": { "present": true, "available": true, "reason": null, "blockers": [] },
+    "reviewed": { "present": true, "available": true, "reason": null, "blockers": [] }
+  },
+  "rows": [                        // 恒按 Domain.RISK_CLASSES 序 6 行；comparable=false 时
+    {                              // 全部 cell 与 delta 一律 null（不出任何数字）
+      "assetClass": "cash",
+      "targetBps": 2000,           // 参照目标区间中值；三时点恒同（同一 targetRef 历史版本）；
+                                   // 无任何可比时点时为 null
+      "decision": { "valueMinor": 50000000, "pctBps": 5154, "deviationBps": 3154, "band": "above_max" },
+      "executed": { "valueMinor": 48000000, "pctBps": 5010, "deviationBps": 3010, "band": "above_max" },
+      "review":   { "valueMinor": 49500000, "pctBps": 5100, "deviationBps": 3100, "band": "above_max" },
+      "deltaValueMinor": -500000,  // review.valueMinor − decision.valueMinor；任一端 cell 为 null → null
+      "deltaPctBps": -54           // review.pctBps − decision.pctBps；任一端 cell 为 null 或 pctBps
+                                   // 为 null（0 投资池）→ null
+    }
+  ]
+}
+```
+
+- 时点 cell 规则：对应快照**不存在**（尚未走到该时点）**或 `available === false`** → cell 为 `null`；快照可比时 cell 取该时点封存 `classes` 行的 `valueMinor / pctBps / deviationBps / band` 原值，页面不换算。`pctBps` 为 `null`（0 投资池）的快照仍是可比快照：cell 保留 `valueMinor`、比例与区间字段为 `null`。
+- `comparable === false` 时 `rows` 仍恒 6 行（保持形状稳定），但所有 cell 与 delta 为 `null`；不可比原因看 `timepoints`（快照缺失 → `present:false`；快照在但 `available:false` → 该时点 `reason` + `blockers` 原样给出）。各可比时点的数字仍可在详情的时点快照区看到，对照表本身不输出任何部分数字。
+- `delta` 只在 `comparable === true` 时输出：`deltaValueMinor = review.valueMinor − decision.valueMinor`（恒为安全整数）；`deltaPctBps = review.pctBps − decision.pctBps`（任一端 `pctBps` 为 `null` → `null`）。不定义 executed 与 decision / review 之间的 delta（执行时点是过程事实，对照只回答「决定前 vs 复盘时」）。
+- `targetBps` 取该行在任一可比时点 `classes` 行的 `targetBps`；同一 `targetRef` 下三时点恒同，若不一致即记录损坏（`invalid_decision_record`），不挑一个用。
+- `comparison` 由共享领域层唯一实现（`Domain.decisionReviewComparison` 纯函数），`GET /api/v1/decisions/{id}` 在快照完整性复核通过后计算并随详情返回；任何输入快照形状不合法 → 详情整体 400 `invalid_decision_record`（fail closed，不输出残缺对照）。
+- 漂移判定（§6.3 `reviewed_with_drift / reviewed_no_drift`）在不可比时的口径：逐字节比较两份封存 `classes`——执行时点不可比（`classes=null`）而复盘可比 → 视为「不可证相同」→ `reviewed_with_drift`；两时点皆不可比（同为 `null`）→ `reviewed_no_drift`。理由码只描述封存值是否一致，不新生成任何数字。
 
 **禁止表述**（写入页面文案与验收断言）：不得出现「建议收益」「这次操作赚了」「跑赢目标」等把配置变化说成收益的措辞；必须写「配置变化对照」。三时点对照是**配置事实**，不是业绩归因——归因（`computeReturnAttribution`）是月结的独立功能，两者不合并。
 
@@ -476,6 +512,7 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 | `idempotency_conflict` | 409 | 同 `Idempotency-Key` 不同请求体（沿用） |
 | `unknown_recommendation` | 422 | 载荷中的 `recommendationId` 不存在 |
 | `unknown_security_event` | 422 | 载荷中的 `securityEventId` 不存在 |
+| `unknown_decision_link` | 422 | 载荷中的 `linkId` 不存在，或不属于路径上的这条决策 |
 | `invalid_asset_collection` | 400 | 伴随集合非数组（沿用） |
 
 响应体沿用现有 `fail(res, status, code, message, retryable)` 形状；**消息为中文、可重试性显式**；不得只返回自由文本堆栈。
@@ -610,6 +647,12 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
                       "explanationVersion": "1", "adviceStaleReasons": [] },
   "snapshots": { "decision": { "…": "§4.2" }, "executed": null, "reviewed": null,
                  "archived": null },
+  "comparison": { "comparable": false,
+                  "timepoints": { "decision": { "present": true, "available": true, "reason": null, "blockers": [] },
+                                  "executed": { "present": false, "available": false, "reason": null, "blockers": [] },
+                                  "reviewed": { "present": false, "available": false, "reason": null, "blockers": [] } },
+                  "rows": [ { "assetClass": "cash", "targetBps": null, "decision": null, "executed": null,
+                              "review": null, "deltaValueMinor": null, "deltaPctBps": null } ] },
   "execution": { "…": "§8.3" },
   "timeline": [ { "at": "2026-10-15", "kind": "state", "…": "…" },
                 { "at": "2026-10-21", "kind": "link", "…": "…" } ]
@@ -617,10 +660,18 @@ reviewed_no_drift         executed → reviewed 且与执行时点逐项相同
 ```
 
 - `timeline` = 状态事件 + 关联 / 解绑按 `occurred_at` 合并升序（关联行用 `linked_on` / `unlinked_on`），是 6E-2 时间线的数据源。
+- `comparison`（6E 补充）= §4.3 末定义的六类配置对照；本例为尚未执行的决策（只有决策时点快照），`comparable:false` 且各行 cell / delta 为 `null`。
 - `recommendation.adviceStaleReasons` 只做展示（D-054），**不改变决策状态**。
 - 任一复核失败 → 400 `invalid_decision_record`，detail 点名检查项。
 
 ### 8.5 关联与解绑
+
+请求键白名单（严格，多一个键即 400 `invalid_decision_payload`；派生键按 §6.2 拒绝）：
+
+| 端点 | 必填 | 可选 |
+|---|---|---|
+| `POST .../links` | `securityEventId` | `note`（≤ 2000 字符，关联说明，可空） |
+| `POST .../links/unlink` | `linkId`、`note`（解绑理由，trim 后非空） | 无 |
 
 ```jsonc
 // POST /api/v1/decisions/{id}/links

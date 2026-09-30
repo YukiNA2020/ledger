@@ -368,3 +368,192 @@ test('6B-10 复盘漂移：六类金额或比例与执行时点不同 → drift�
   assert.strictEqual(errCode(Domain.decisionReviewDrift(executed, snapshotFixture({ schemaVersion: 2 }))),
     'invalid_decision_record', '形状不合法的快照不能参与漂移判定');
 });
+
+/* ================= Phase 6D：关联 / 解绑请求白名单（契约 §8.5，6D 补充） ================= */
+
+test('6D-11 关联请求白名单：securityEventId 必填、note 可选且去空白、派生键与多余键一律 400', () => {
+  const ok = Domain.validateDecisionLinkRequest({ securityEventId: 'sev-6d00000000000001', note: ' 第一笔买入 ' });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.value.securityEventId, 'sev-6d00000000000001');
+  assert.strictEqual(ok.value.note, '第一笔买入', 'note 去空白');
+  const noNote = Domain.validateDecisionLinkRequest({ securityEventId: 'sev-6d00000000000001' });
+  assert.strictEqual(noNote.ok, true, '关联 note 可省略');
+  assert.strictEqual(noNote.value.note, null);
+
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest({})), 'invalid_decision_payload');
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest({ securityEventId: '' })), 'invalid_decision_payload');
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest({ securityEventId: '   ' })), 'invalid_decision_payload');
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest({ securityEventId: 60001 })), 'invalid_decision_payload');
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest({ securityEventId: 'sev-1', note: 42 })),
+    'invalid_decision_payload');
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest({ securityEventId: 'sev-1', note: 'x'.repeat(2001) })),
+    'invalid_decision_payload', 'note 上限 2000 字符');
+
+  // 派生键（契约 §6.2）与无关键不得由客户端提交
+  ['id', 'decisionId', 'linkedOn', 'linkedAt', 'unlinkedOn', 'unlinkedAt', 'unlinkNote', 'actor', 'event'].forEach((k) => {
+    const payload = { securityEventId: 'sev-1' };
+    payload[k] = 'x';
+    assert.strictEqual(errCode(Domain.validateDecisionLinkRequest(payload)), 'invalid_decision_payload',
+      '载荷出现键 ' + k + ' 必须拒绝');
+  });
+  const proto = Object.create({ securityEventId: 'sev-1' });
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest(proto)), 'invalid_decision_payload', '原型链注入拒绝');
+  assert.strictEqual(errCode(Domain.validateDecisionLinkRequest(null)), 'invalid_decision_payload');
+  assert.strictEqual(Domain.DECISION_LINK_REQUEST_KEYS.length, 2, '白名单键数固定：securityEventId / note');
+  assert.strictEqual(Object.isFrozen(Domain.DECISION_LINK_REQUEST_KEYS), true);
+});
+
+test('6D-12 解绑请求白名单：linkId 必须是 lnk-<16hex> 且 note 必填（解绑必须写理由）', () => {
+  const ok = Domain.validateDecisionUnlinkRequest({ linkId: 'lnk-0123456789abcdef', note: ' 选错了账户 ' });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.value.linkId, 'lnk-0123456789abcdef');
+  assert.strictEqual(ok.value.note, '选错了账户');
+
+  assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest({})), 'invalid_decision_payload');
+  assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest({ linkId: 'lnk-0123456789abcdef' })),
+    'invalid_decision_payload', '解绑必须填写理由');
+  assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest({ linkId: 'lnk-0123456789abcdef', note: '   ' })),
+    'invalid_decision_payload', '空白理由不算理由');
+  assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest({ linkId: 'lnk-0123456789abcdef', note: null })),
+    'invalid_decision_payload');
+  ['nope', 'lnk-ZZ23456789abcdef', 'dec-0123456789abcdef', 'lnk-0123456789abcde'].forEach((bad) => {
+    assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest({ linkId: bad, note: '理由' })),
+      'invalid_decision_payload', 'linkId 形状不合法必须 400：' + bad);
+  });
+  ['id', 'unlinkedOn', 'unlinkedAt', 'unlinkNote', 'securityEventId', 'decisionId'].forEach((k) => {
+    const payload = { linkId: 'lnk-0123456789abcdef', note: '理由' };
+    payload[k] = 'x';
+    assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest(payload)), 'invalid_decision_payload',
+      '载荷出现键 ' + k + ' 必须拒绝');
+  });
+  assert.strictEqual(errCode(Domain.validateDecisionUnlinkRequest(null)), 'invalid_decision_payload');
+  assert.strictEqual(Domain.DECISION_UNLINK_REQUEST_KEYS.length, 2, '白名单键数固定：linkId / note');
+  assert.strictEqual(Object.isFrozen(Domain.DECISION_UNLINK_REQUEST_KEYS), true);
+});
+
+/* ================= Phase 6E：六类配置对照（契约 §4.3 6E 补充） ================= */
+
+// 逐分 / 逐 basis point 的手工 fixture：三类有值、三类为 0（0 投资池行），三时点各不相同。
+function comparisonSnapshot(classesValues, over) {
+  const snap = snapshotFixture();
+  snap.classes = Domain.RISK_CLASSES.map((k, i) => {
+    const v = classesValues[i];
+    return {
+      assetClass: k, valueMinor: v[0], pctBps: v[1], minBps: 500,
+      targetBps: 1000, maxBps: 2000, band: v[1] == null ? null : 'within', deviationBps: v[1] == null ? null : v[1] - 1000
+    };
+  });
+  return Object.assign(snap, over || {});
+}
+
+test('6E-11 对照逐分核对：三时点 cell 取封存原值、delta 可复算、0 投资池不算不可比', () => {
+  // 手工指定六个类别的三时点值：[金额分, bps]；比例 null 表示 0 投资池行
+  const decision = comparisonSnapshot([
+    [50000000, 5154], [10000000, 1031], [37000000, 3815], [0, 0], [0, 0], [0, 0]
+  ]);
+  const executed = comparisonSnapshot([
+    [48000000, 5000], [10000000, 1042], [38000000, 3958], [0, 0], [0, 0], [0, 0]
+  ]);
+  const reviewed = comparisonSnapshot([
+    [49500000, 5100], [10000000, 1031], [38500000, 3869], [0, 0], [0, 0], [0, 0]
+  ]);
+  const cmp = Domain.decisionReviewComparison(decision, executed, reviewed);
+  assert.strictEqual(cmp.ok, true);
+  const c = cmp.value;
+  assert.strictEqual(c.comparable, true, '三时点齐全且可比');
+  assert.strictEqual(c.rows.length, 6, '恒 6 行');
+  assert.deepStrictEqual(c.rows.map((r) => r.assetClass), Domain.RISK_CLASSES.slice(), '恒按 RISK_CLASSES 序');
+
+  // 逐分核对：每个 cell 与封存 classes 原值一致；delta 恰为 review − decision
+  const byPoint = { decision: decision.classes, executed: executed.classes, review: reviewed.classes };
+  Domain.RISK_CLASSES.forEach((cls, i) => {
+    const row = c.rows[i];
+    ['decision', 'executed', 'review'].forEach((pt) => {
+      const src = byPoint[pt][i];
+      assert.deepStrictEqual(row[pt], {
+        valueMinor: src.valueMinor, pctBps: src.pctBps,
+        deviationBps: src.deviationBps, band: src.band
+      }, cls + ' @ ' + pt + ' 必须取封存原值');
+    });
+    assert.strictEqual(row.deltaValueMinor, reviewed.classes[i].valueMinor - decision.classes[i].valueMinor,
+      cls + ' deltaValueMinor = review − decision（逐分）');
+    assert.strictEqual(row.deltaPctBps, reviewed.classes[i].pctBps - decision.classes[i].pctBps,
+      cls + ' deltaPctBps = review − decision（逐 bps）');
+    assert.strictEqual(row.targetBps, 1000, 'targetBps 取参照目标历史版本');
+  });
+  assert.strictEqual(c.rows[0].deltaValueMinor, -500000, '现金 495.00 − 500.00 = −5.00 元 = −500 分');
+  assert.strictEqual(c.rows[0].deltaPctBps, -54, '5100 − 5154 = −54 bps');
+  assert.strictEqual(Domain.validateDecisionComparisonShape(c).ok, true);
+
+  // 时点元数据：可比时 reason 恒 null、blockers 原样搬运
+  ['decision', 'executed', 'reviewed'].forEach((k) => {
+    assert.deepStrictEqual(c.timepoints[k], { present: true, available: true, reason: null, blockers: [] });
+  });
+
+  // 0 投资池行：比例与区间为 null 但金额照常输出，不算不可比
+  const zeroRow = c.rows[3];
+  assert.deepStrictEqual(zeroRow.decision, { valueMinor: 0, pctBps: 0, deviationBps: -1000, band: 'within' },
+    'pctBps=0（非 null）是真实比例，照常输出');
+});
+
+test('6E-12 对照不可比与缺失：任一时点不可比 → 全表不出数字；快照缺失 → present:false；形状坏 → fail closed', () => {
+  const decision = comparisonSnapshot([[50000000, 5154], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]);
+  const executed = comparisonSnapshot([[48000000, 5000], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]);
+  const reviewedAvailable = comparisonSnapshot([[49500000, 5100], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]);
+  const reviewedUnavailable = comparisonSnapshot([[0, null], [0, null], [0, null], [0, null], [0, null], [0, null]], {
+    available: false, reason: 'cash_not_reconciled',
+    blockers: [{ code: 'balance_stale', detail: '现金余额未核对' }],
+    netWorthMinor: null, investableTotalMinor: null, classes: null
+  });
+
+  // ① 复盘时点不可比：comparable=false，全部 cell 与 delta 为 null，不出伪 0
+  const cmp1 = Domain.decisionReviewComparison(decision, executed, reviewedUnavailable);
+  assert.strictEqual(cmp1.ok, true);
+  assert.strictEqual(cmp1.value.comparable, false);
+  cmp1.value.rows.forEach((row) => {
+    assert.strictEqual(row.decision, null);
+    assert.strictEqual(row.executed, null);
+    assert.strictEqual(row.review, null);
+    assert.strictEqual(row.deltaValueMinor, null);
+    assert.strictEqual(row.deltaPctBps, null);
+    assert.strictEqual(row.targetBps, null, '无可比时点时 targetBps 也不输出');
+  });
+  assert.strictEqual(cmp1.value.timepoints.reviewed.present, true);
+  assert.strictEqual(cmp1.value.timepoints.reviewed.available, false);
+  assert.strictEqual(cmp1.value.timepoints.reviewed.reason, 'cash_not_reconciled');
+  assert.deepStrictEqual(cmp1.value.timepoints.reviewed.blockers,
+    [{ code: 'balance_stale', detail: '现金余额未核对' }], 'blockers 原样搬运');
+  assert.strictEqual(cmp1.value.timepoints.decision.available, true, '其余时点可用性照实记录');
+  assert.strictEqual(Domain.validateDecisionComparisonShape(cmp1.value).ok, true);
+
+  // ② 快照缺失（尚未执行 / 复盘）：present:false、comparable=false、无数字
+  const cmp2 = Domain.decisionReviewComparison(decision, null, null);
+  assert.strictEqual(cmp2.value.comparable, false);
+  assert.strictEqual(cmp2.value.timepoints.executed.present, false);
+  assert.strictEqual(cmp2.value.timepoints.reviewed.present, false);
+  assert.strictEqual(cmp2.value.rows[0].decision, null);
+  assert.strictEqual(cmp2.value.rows[0].deltaValueMinor, null);
+
+  // ③ 0 投资池三时点：可比、金额为 0、比例列 null 且 deltaPctBps 为 null（不算不可比）
+  const zero = comparisonSnapshot([[0, null], [0, null], [0, null], [0, null], [0, null], [0, null]]);
+  zero.investableTotalMinor = 0;
+  const cmp3 = Domain.decisionReviewComparison(zero, comparisonSnapshot(
+    [[0, null], [0, null], [0, null], [0, null], [0, null], [0, null]], { investableTotalMinor: 0 }), zero);
+  assert.strictEqual(cmp3.value.comparable, true, '0 投资池是合法可比状态');
+  assert.strictEqual(cmp3.value.rows[0].decision.valueMinor, 0);
+  assert.strictEqual(cmp3.value.rows[0].decision.pctBps, null);
+  assert.strictEqual(cmp3.value.rows[0].deltaValueMinor, 0);
+  assert.strictEqual(cmp3.value.rows[0].deltaPctBps, null, '两端比例不可用 → deltaPctBps null');
+  assert.strictEqual(cmp3.value.rows[0].targetBps, 1000, 'targetBps 照常给出');
+  assert.strictEqual(Domain.validateDecisionComparisonShape(cmp3.value).ok, true);
+
+  // ④ 输入快照形状不合法 → fail closed（服务端详情整体 400）
+  assert.strictEqual(Domain.decisionReviewComparison(decision, executed, snapshotFixture({ schemaVersion: 2 })).ok, false);
+  assert.strictEqual(Domain.decisionReviewComparison(null, executed, reviewedAvailable).value.comparable, false,
+    '决策时点缺失也是可比性缺失，不是异常');
+
+  // ⑤ 同一 targetRef 下 targetBps 不一致 → 记录损坏
+  const inconsistent = comparisonSnapshot([[49500000, 5100], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]);
+  inconsistent.classes[0].targetBps = 2000;
+  assert.strictEqual(Domain.decisionReviewComparison(decision, executed, inconsistent).ok, false);
+});

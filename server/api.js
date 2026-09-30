@@ -366,7 +366,8 @@ const DOMAIN_ERROR_STATUS = {
   invalid_link_target: 409,
   linked_event_missing: 409,
   unknown_recommendation: 422,
-  unknown_security_event: 422
+  unknown_security_event: 422,
+  unknown_decision_link: 422
 };
 
 // 幂等键必须绑定“同一路径的同一份请求语义”，不能让同一个 key 悄悄吞掉另一笔事件。
@@ -1891,6 +1892,67 @@ async function handleDecisionEvent(ctx, rawId, req, res) {
   }
 }
 
+// Phase 6D：关联与解绑（POST，路径参数 + mode）。写接口走同一道 token / Origin / Content-Type
+// 门禁；幂等键绑定「同一路径的同一份请求语义」（契约 §8.6：关联另有 securityEventId 活动唯一的
+// 自然幂等，重复关联到同一决策回 200 created:false；解绑没有自然幂等，靠 Idempotency-Key 防双击）。
+// 关联 / 解绑都不写状态事件、不改 decisions 行 —— 只落 decision_links 与执行汇总。
+async function handleDecisionLink(ctx, rawId, req, res, mode) {
+  let decisionId = '';
+  try {
+    decisionId = decodeURIComponent(String(rawId));
+  } catch (_) {
+    return fail(res, 400, 'invalid_id', '决策 id 不合法', false);
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(decisionId)) {
+    return fail(res, 400, 'invalid_id', '决策 id 不合法', false);
+  }
+  const body = await readBody(req);
+  const idemKey = req.headers['idempotency-key'];
+  const actionPath = '/api/v1/decisions/' + decisionId + '/links' + (mode === 'unlink' ? '/unlink' : '');
+  const fingerprint = requestFingerprint(body);
+  if (idemKey) {
+    const cached = R.findIdempotent(ctx.db, String(idemKey), 'POST', actionPath);
+    if (cached) {
+      if (cached.__requestFingerprint) {
+        if (!safeEqual(cached.__requestFingerprint, fingerprint)) {
+          return fail(res, 409, 'idempotency_conflict', '同一 Idempotency-Key 已用于另一次关联操作', false);
+        }
+        return sendJson(res, 200, cached.response, { 'X-Ledger-Idempotent': 'replay' });
+      }
+      return sendJson(res, 200, cached, { 'X-Ledger-Idempotent': 'replay' });
+    }
+  }
+  const today = typeof ctx.today === 'function' ? ctx.today() : localDateStr();
+  const nowIso = typeof ctx.nowIso === 'function' ? ctx.nowIso() : new Date().toISOString();
+  try {
+    const payload = dbm.transaction(ctx.db, () => {
+      const result = mode === 'unlink'
+        ? Decisions.unlinkDecisionLink(ctx.db, decisionId, body, { today: today, nowIso: nowIso })
+        : Decisions.createDecisionLink(ctx.db, decisionId, body, { today: today, nowIso: nowIso });
+      const eventsById = new Map(R.readSecurityEvents(ctx.db).map((e) => [e.id, e]));
+      const links = R.readDecisionLinks(ctx.db).filter((l) => l.decisionId === result.decisionId);
+      const out = {
+        ok: true,
+        link: result.link,
+        links: Decisions.decisionLinkRows(links, eventsById),
+        execution: result.execution
+      };
+      if (result.created != null) out.created = result.created;
+      if (idemKey) {
+        R.rememberIdempotent(ctx.db, String(idemKey), 'POST', actionPath, {
+          __requestFingerprint: fingerprint,
+          response: out
+        });
+      }
+      return out;
+    });
+    if (mode === 'unlink') return sendJson(res, 200, payload);
+    return sendJson(res, payload.created ? 201 : 200, payload);
+  } catch (err) {
+    return upsertFailDispatcher(err, res);
+  }
+}
+
 // Phase 6B：决策详情（GET，路径参数）。任一复核失败 → 400 invalid_decision_record（fail closed）。
 function handleDecisionDetail(ctx, rawId, res) {
   let decisionId = '';
@@ -2014,6 +2076,19 @@ function createHandlerEntry(ctx) {
       const denied = checkWrite(req, ctx);
       if (denied) return fail(res, denied.status, denied.code, denied.message, denied.retryable);
       return handleDecisionEvent(ctx, decisionEventMatch[1], req, res);
+    }
+    // Phase 6D：关联与解绑（POST 写接口，先过写门禁；两条路径各自幂等）
+    const unlinkMatch = /^POST \/api\/v1\/decisions\/([^/]+)\/links\/unlink$/.exec(key);
+    if (unlinkMatch) {
+      const denied = checkWrite(req, ctx);
+      if (denied) return fail(res, denied.status, denied.code, denied.message, denied.retryable);
+      return handleDecisionLink(ctx, unlinkMatch[1], req, res, 'unlink');
+    }
+    const linkMatch = /^POST \/api\/v1\/decisions\/([^/]+)\/links$/.exec(key);
+    if (linkMatch) {
+      const denied = checkWrite(req, ctx);
+      if (denied) return fail(res, denied.status, denied.code, denied.message, denied.retryable);
+      return handleDecisionLink(ctx, linkMatch[1], req, res, 'link');
     }
     const decisionDetailMatch = /^GET \/api\/v1\/decisions\/([^/]+)$/.exec(key);
     if (decisionDetailMatch) {

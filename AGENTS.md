@@ -16,7 +16,7 @@
 
 `Ledger_Plan.md`、`Ledger_PRD.md`、`Ledger_Implementation_Roadmap.md`、`STATUS.md` 和 `docs/stages/` 是 v1/v2 历史资料。内容冲突时，以本文件及上述 v3 文档为准。
 
-当前代码实现至 v3 Phase 6C（`2.4.25-phase6c-fix2` / schema v11），桌面天空蓝与细节优化已获用户认可。Phase 5 排除 G5-R4 的限定范围复验通过，原完整验收仍待真人计时。**Phase 6A 契约冻结在 `PHASE6_CONTRACT.md`（D-057）；6B 状态机、事件、存储与 API 已于 2026-09-29 二次复测补口后通过；6C 决定与待执行页面已于 2026-09-29 完成，全量测试 679/679、浏览器 wiring 36 项 × 2 轮、18 路由 × 3 宽度通过。下一位 agent 只领取 6D，复用 6B 服务端 API 与 6C 页面资产，不得就地改契约规则。G5-R4 安排到 6E-3，不阻塞前半程，但必须在 6F 最终验收前通过。** 详见 `PHASE6_CONTRACT.md`、`PHASE6_BREAKDOWN.md`、`PHASE5_REVIEW.md` §9～§10 与 `NEXT_AGENT.md`。开始任务前在 `ROADMAP.md` 找到唯一当前阶段，只实现该子阶段交付物，不把规划误写成已实现。
+当前代码实现至 v3 Phase 6E（`2.4.26-phase6e` / schema v11），桌面天空蓝与细节优化已获用户认可。Phase 5 排除 G5-R4 的限定范围复验通过，原完整验收仍待真人计时。**Phase 6A 契约冻结在 `PHASE6_CONTRACT.md`（D-057，含 6D / 6E 补充）；6B 状态机、事件、存储与 API 已于 2026-09-29 二次复测补口后通过；6C 决定与待执行页面、6D 实际交易关联与确认执行已于 2026-09-29 完成，6E 复盘对照与月度历史（6E-1/6E-2）已于 2026-09-30 完成，全量测试 692/692、浏览器 wiring 38 项 × 3 轮、18 路由 × 3 宽度 + 四弹层 + 5 状态共 71 项通过。下一位 agent 只领取 6F（最终集成验收），复用 6B 服务端 API 与 6C/6D/6E 页面资产，不得就地改契约规则。G5-R4（6E-3）真人计时已于 2026-09-30 通过（变体 C 数据 4/4 全对、自报计时 35 秒 ≤60 秒，记录 `docs/evidence/phase6/6e-r4.md`），6F 硬门禁已满足。** 详见 `PHASE6_CONTRACT.md`、`PHASE6_BREAKDOWN.md`、`PHASE5_REVIEW.md` §9～§10 与 `NEXT_AGENT.md`。开始任务前在 `ROADMAP.md` 找到唯一当前阶段，只实现该子阶段交付物，不把规划误写成已实现。
 
 ## 产品范围
 
