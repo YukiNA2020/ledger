@@ -1,5 +1,11 @@
 # 变更日志
 
+## Phase 6 6F 最终集成验收（2026-09-30，代码基线仍为 `2.4.26-phase6e` / schema v11）
+
+- **Phase 6 关闭**：6A～6F 全部通过（含 G5-R4）。新增 `tests/server-phase6.test.js` 6F-01～6F-04 集成验收测试（全量 **696/696**）：场景 A / 场景 B 两套完整闭环（多月共存、事件零重叠、备份恢复逐字段追溯）+ 负向电池（暂缓/忽略/跳步/幂等冲突/失效建议/缺汇率/快照损坏/引用缺失/部分失败）。
+- 浏览器证据：全新临时库 × 不同 loopback origin × 干净 profile wiring 38 项 × 2 轮（19311、19312）、`browser-review.py` 38 项（19313，外部请求 0、pageErrors 0）、三档宽度 71 项（19314）；证据 `docs/evidence/phase6-6f-20260930/`。
+- Phase 5 的 G5-R4 缺口同日关闭（`PHASE5_REVIEW.md` §11 追加记录，历史未改写），**Phase 5 完整验收随之关闭**。未随本阶段关闭的独立事项：4A 行情源门禁、S2.3 实机启动、Phase 7 两个月真实使用验证。
+
 ## 2.4.26-phase6e（2026-09-30）
 
 - **Phase 6E「复盘与历史」实施（6E-1 复盘计算与封存 + 6E-2 复盘页面与月度历史）**：契约 §4.3 的六类配置对照以服务端派生 `comparison` 对象进 `GET /api/v1/decisions/{id}` 详情（`comparable` + `timepoints` + 恒 6 行；任一时点快照缺失或不可比 → 全表不出数字、不出伪 0；0 投资池比例列 null 不算不可比；`deltaValueMinor` / `deltaPctBps` = 复盘 − 决策；参照目标固定为决策引用的 `targetRef` 历史版本）。领域层新增纯函数 `decisionReviewComparison` 与形状自检 `validateDecisionComparisonShape`（只消费既有 `computeOverview` / `computeAllocationDeviation` 封存结果，不写第二套估值 / 偏离）；`server/decisions.js` 详情响应接入，输入快照形状不合法时整体 fail closed（400 `invalid_decision_record`）。契约先行：§4.3 末与 §8.4 已补 6E 对照口径（D-057 附属，含 `reviewed_with_drift / reviewed_no_drift` 在不可比时的判定口径）。

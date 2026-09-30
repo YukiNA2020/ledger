@@ -1742,3 +1742,312 @@ test('6E-04 对照形状稳定与恢复重放：未执行决策 comparison 全 n
     ctx.close();
   }
 });
+
+/* ================= Phase 6F｜最终集成验收（拆解 §8） =================
+ * 两套完整闭环共用一本临时账本（真实使用形态：多月共存），事件完全不重叠；
+ * 负向电池覆盖：暂缓 / 忽略 / 非法跳步 / 并发重复 / 失效建议 / 缺汇率 /
+ * 快照损坏 / 引用缺失 / 部分失败不落半条。全部走真实 HTTP 入口 + 注入时钟。 */
+
+test('6F-01 场景 A：正式建议 → 接受 → 单笔买入 → 现金核对 → 执行 → 复盘（对照可比、复盘只读）', async () => {
+  const ctx = setup('ledger-p6fa-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    assert.strictEqual(rec.status, 'formal');
+    const accepted = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec.id, intent: 'accepted', note: '场景 A：按建议一次买入' });
+    assert.strictEqual(accepted.status, 201, JSON.stringify(accepted.json));
+    const decisionA = accepted.json.decision.id;
+
+    const buyRes = await post(srv.port, '/api/v1/security-events', {
+      id: 'sev-6fa', eventType: 'buy', accountId: 'acc-broker', instrumentId: 'ins-voo',
+      quantity: '20', priceMinor: 10000, feeMinor: 500, occurredAt: TODAY
+    });
+    assert.strictEqual(buyRes.status, 201, JSON.stringify(buyRes.json));
+    const link = await post(srv.port, '/api/v1/decisions/' + decisionA + '/links',
+      { securityEventId: 'sev-6fa', note: '一次性买入' });
+    assert.strictEqual(link.status, 201, JSON.stringify(link.json));
+
+    // 核对现金（余额已是当月，现金口径未失效）→ 执行（无偏差，note 可省）→ 复盘
+    const executed = await post(srv.port, '/api/v1/decisions/' + decisionA + '/events', { toState: 'executed' });
+    assert.strictEqual(executed.status, 200, JSON.stringify(executed.json));
+    assert.strictEqual(executed.json.events[1].reasonCode, 'executed_as_planned');
+    const reviewed = await post(srv.port, '/api/v1/decisions/' + decisionA + '/events',
+      { toState: 'reviewed', note: '场景 A 复盘：配置与执行时点一致' });
+    assert.strictEqual(reviewed.status, 200);
+    assert.strictEqual(reviewed.json.events[2].reasonCode, 'reviewed_no_drift');
+
+    const detail = (await get(srv.port, '/api/v1/decisions/' + decisionA)).json;
+    assert.strictEqual(detail.decision.state, 'reviewed');
+    assert.strictEqual(detail.comparison.comparable, true);
+    assert.strictEqual(detail.comparison.rows.length, 6);
+    const cls = {
+      decision: detail.snapshots.decision.classes,
+      executed: detail.snapshots.executed.classes,
+      review: detail.snapshots.reviewed.classes
+    };
+    Domain.RISK_CLASSES.forEach((name, i) => {
+      const row = detail.comparison.rows[i];
+      ['decision', 'executed', 'review'].forEach((pt) => {
+        assert.deepStrictEqual(row[pt], cellOf(cls[pt][i]), name + '@' + pt + ' cell 与封存值一致');
+      });
+      assert.strictEqual(row.deltaValueMinor,
+        detail.snapshots.reviewed.classes[i].valueMinor - detail.snapshots.decision.classes[i].valueMinor);
+    });
+    assert.strictEqual(detail.timeline.filter((t) => t.kind === 'state').length, 3);
+    assert.strictEqual(detail.timeline.filter((t) => t.kind === 'link').length, 1);
+    // 复盘只读
+    const relink = await post(srv.port, '/api/v1/decisions/' + decisionA + '/links', { securityEventId: 'sev-6fa' });
+    assert.strictEqual(relink.status, 409);
+    const reEvent = await post(srv.port, '/api/v1/decisions/' + decisionA + '/events',
+      { toState: 'executed', note: '再动' });
+    assert.strictEqual(reEvent.status, 409);
+    return { decisionA, recA: rec.id };
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6F-02 场景 B：另一月建议 → 分批跨月两笔买入（含偏差）→ 执行 → 复盘 → 备份恢复追溯；与场景 A 事件零重叠', async () => {
+  const ctx = setup('ledger-p6fb-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+
+    // ---- 场景 A（9 月，单笔）----
+    const recA = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const accA = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recA.id, intent: 'accepted', note: '场景 A' });
+    const decisionA = accA.json.decision.id;
+    await post(srv.port, '/api/v1/security-events', {
+      id: 'sev-6fb-a', eventType: 'buy', accountId: 'acc-broker', instrumentId: 'ins-voo',
+      quantity: '20', priceMinor: 10000, feeMinor: 0, occurredAt: TODAY
+    });
+    await post(srv.port, '/api/v1/decisions/' + decisionA + '/links', { securityEventId: 'sev-6fb-a' });
+    await post(srv.port, '/api/v1/decisions/' + decisionA + '/events', { toState: 'executed' });
+    await post(srv.port, '/api/v1/decisions/' + decisionA + '/events',
+      { toState: 'reviewed', note: 'A 复盘' });
+
+    // ---- 场景 B（10 月建议，10/11 月分批两笔，HKD 汇率 0.9，偏差 −300）----
+    const oct = await putFullState(srv.port, (st) => {
+      st.assets.assetUnits = st.assets.assetUnits.map((u) => Object.assign({}, u, { asOf: '2026-10-04' }));
+      st.assets.quotes = st.assets.quotes.concat([
+        { instrumentId: 'ins-voo', priceMinor: 100, currency: 'CNY', priceDate: '2026-10-02', provider: 'manual', status: 'ok' }
+      ]);
+    });
+    assert.strictEqual(oct.status, 200, JSON.stringify(oct.json));
+    ctx.today = () => '2026-10-04';
+    const recB = (await post(srv.port, '/api/v1/recommendations',
+      recommendBody(facts, { newFundsMinor: 500000 }))).json.recommendation;
+    assert.strictEqual(recB.allocatedTotalMinor, 500000);
+    const accB = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recB.id, intent: 'accepted', note: '场景 B：分批执行' });
+    assert.strictEqual(accB.status, 201, JSON.stringify(accB.json));
+    const decisionB = accB.json.decision.id;
+    assert.deepStrictEqual(accB.json.decision.eventMonths, ['2026-10']);
+
+    const seeded = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([
+        { id: 'sev-6fb-b1', eventType: 'buy', accountId: 'acc-broker', instrumentId: 'ins-voo',
+          quantity: '20', priceMinor: 10000, feeMinor: 0, occurredAt: '2026-10-02' },
+        { id: 'sev-6fb-b2', eventType: 'buy', accountId: 'acc-broker', instrumentId: 'ins-hkd',
+          quantity: '30', priceMinor: 10000, feeMinor: 0, occurredAt: '2026-11-05' }
+      ]);
+      st.decisionLinks = (st.decisionLinks || []).concat([
+        activeLink('sev-6fb-b1', decisionB, 'sev-6fb-b1'),
+        activeLink('sev-6fb-b2', decisionB, 'sev-6fb-b2')
+      ]);
+      st.assets.quotes = st.assets.quotes.concat([
+        { instrumentId: 'ins-voo', priceMinor: 100, currency: 'CNY', priceDate: '2026-11-18', provider: 'manual', status: 'ok' },
+        { instrumentId: 'ins-hkd', priceMinor: 10000, currency: 'HKD', priceDate: '2026-11-18', provider: 'manual', status: 'ok' }
+      ]);
+      st.assets.fxRates = st.assets.fxRates.concat([
+        { base: 'HKD', quote: 'CNY', rateDecimal: '0.9', rateDate: '2026-11-01', provider: 'manual', status: 'ok' },
+        { base: 'HKD', quote: 'CNY', rateDecimal: '0.9', rateDate: '2026-11-18', provider: 'manual', status: 'ok' }
+      ]);
+      st.assets.assetUnits = st.assets.assetUnits.map((u) => Object.assign({}, u, { asOf: '2026-11-18' }));
+    });
+    assert.strictEqual(seeded.status, 200, JSON.stringify(seeded.json));
+    ctx.today = () => '2026-11-20';
+    const executedB = await post(srv.port, '/api/v1/decisions/' + decisionB + '/events',
+      { toState: 'executed', note: '少投 300 元保留现金' });
+    assert.strictEqual(executedB.status, 200, JSON.stringify(executedB.json));
+    assert.strictEqual(executedB.json.events[1].reasonCode, 'executed_deviation');
+    const reviewedB = await post(srv.port, '/api/v1/decisions/' + decisionB + '/events',
+      { toState: 'reviewed', note: 'B 复盘：跨月分批完成' });
+    assert.strictEqual(reviewedB.status, 200);
+
+    // 两条闭环并存：状态、月份归属、事件零重叠
+    const list = (await get(srv.port, '/api/v1/decisions')).json;
+    assert.strictEqual(list.total, 2);
+    assert.ok(list.items.every((d) => d.state === 'reviewed'));
+    const itemA = list.items.find((d) => d.id === decisionA);
+    const itemB = list.items.find((d) => d.id === decisionB);
+    assert.deepStrictEqual(itemA.eventMonths, ['2026-09']);
+    assert.deepStrictEqual(itemB.eventMonths, ['2026-10', '2026-11']);
+    const linkIdsA = new Set((await get(srv.port, '/api/v1/decisions/' + decisionA)).json.links.map((l) => l.securityEventId));
+    const linkIdsB = new Set((await get(srv.port, '/api/v1/decisions/' + decisionB)).json.links.map((l) => l.securityEventId));
+    for (const id of linkIdsB) assert.strictEqual(linkIdsA.has(id), false, '两条闭环不得复用同一证券事件');
+    // 月度筛选：各月只出现归属的决策
+    assert.deepStrictEqual((await get(srv.port, '/api/v1/decisions?month=2026-09')).json.items.map((d) => d.id), [decisionA]);
+    assert.deepStrictEqual((await get(srv.port, '/api/v1/decisions?month=2026-11')).json.items.map((d) => d.id), [decisionB]);
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions?month=2026-12')).json.items.length, 0, '空月份不出条目');
+
+    // 备份 → 清空 → 恢复：两条闭环逐字段一致
+    const before = {
+      a: (await get(srv.port, '/api/v1/decisions/' + decisionA)).json,
+      b: (await get(srv.port, '/api/v1/decisions/' + decisionB)).json
+    };
+    const backup = await post(srv.port, '/api/v1/backups', {});
+    assert.strictEqual(backup.status, 201, JSON.stringify(backup.json));
+    const clear = await request(srv.port, 'DELETE', '/api/v1/state', { headers: { 'Content-Type': 'application/json' } });
+    assert.strictEqual(clear.status, 200, JSON.stringify(clear.json));
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.total, 0);
+    const restore = await post(srv.port, '/api/v1/restores', { file: backup.json.backup.name });
+    assert.strictEqual(restore.status, 200, JSON.stringify(restore.json));
+    ctx.adopt(restore);
+    assert.deepStrictEqual((await get(srv.port, '/api/v1/decisions/' + decisionA)).json, before.a, '场景 A 恢复逐字段一致');
+    assert.deepStrictEqual((await get(srv.port, '/api/v1/decisions/' + decisionB)).json, before.b, '场景 B 恢复逐字段一致');
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.invalidCount, 0);
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6F-03 负向电池（一）：暂缓 / 忽略不进待执行清单、非法跳步、幂等回放与冲突、失效建议接受被拒', async () => {
+  const ctx = setup('ledger-p6fc-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    let seed = 0;
+    const newRec = async () => {
+      seed += 1;
+      return (await post(srv.port, '/api/v1/recommendations',
+        recommendBody(facts, { newFundsMinor: NEW_FUNDS_MINOR + seed }))).json.recommendation;
+    };
+
+    // 暂缓与忽略：可创建、不进 accepted 清单、历史可见
+    const recD = await newRec();
+    const deferred = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recD.id, intent: 'deferred', note: '等下个月再说' });
+    assert.strictEqual(deferred.status, 201);
+    const recX = await newRec();
+    const dismissed = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recX.id, intent: 'dismissed', note: '暂不构成行动' });
+    assert.strictEqual(dismissed.status, 201);
+    const acceptedOnly = (await get(srv.port, '/api/v1/decisions?state=accepted')).json;
+    assert.strictEqual(acceptedOnly.items.length, 0, '暂缓 / 忽略不进待执行清单');
+    const all = (await get(srv.port, '/api/v1/decisions')).json;
+    assert.deepStrictEqual(all.states.sort(), ['deferred', 'dismissed']);
+
+    // 非法跳步：两步式 proposed 直接 executed / reviewed 均 409，且不产生事件
+    const recP = await newRec();
+    const proposed = await post(srv.port, '/api/v1/decisions', { recommendationId: recP.id });
+    assert.strictEqual(proposed.status, 201);
+    const pid = proposed.json.decision.id;
+    for (const to of ['executed', 'reviewed']) {
+      const skip = await post(srv.port, '/api/v1/decisions/' + pid + '/events', { toState: to, note: '跳步' });
+      assert.strictEqual(skip.status, 409);
+      assert.strictEqual(skip.json.error.code, 'illegal_transition');
+    }
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions/' + pid)).json.events.length, 0, '跳步不落任何事件');
+
+    // 幂等：创建同 key 同载荷回放、异载荷冲突
+    const recI = await newRec();
+    const key = '6f-idem-1';
+    const first = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recI.id, intent: 'deferred', note: '幂等首建' }, { headers: { 'Idempotency-Key': key } });
+    assert.strictEqual(first.status, 201);
+    const replay = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recI.id, intent: 'deferred', note: '幂等首建' }, { headers: { 'Idempotency-Key': key } });
+    assert.strictEqual(replay.status, 200);
+    assert.strictEqual(replay.headers['x-ledger-idempotent'], 'replay');
+    const conflict = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recI.id, intent: 'deferred', note: '改成别的理由' }, { headers: { 'Idempotency-Key': key } });
+    assert.strictEqual(conflict.status, 409);
+    assert.strictEqual(conflict.json.error.code, 'idempotency_conflict');
+
+    // 失效建议：撤销映射后接受 409 recommendation_stale，暂缓照常（另一条新建议）
+    const recS = await newRec();
+    const remap = await post(srv.port, '/api/v1/approved-instruments',
+      { assetClass: 'broad_equity', instrumentIds: ['ins-vgt'] });
+    assert.strictEqual(remap.status, 200);
+    const stale = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recS.id, intent: 'accepted', note: '试图接受失效建议' });
+    assert.strictEqual(stale.status, 409);
+    assert.strictEqual(stale.json.error.code, 'recommendation_stale');
+    const deferredStale = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: recS.id, intent: 'deferred', note: '失效建议暂缓是合法诉求' });
+    assert.strictEqual(deferredStale.status, 201);
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});
+
+test('6F-04 负向电池（二）：缺汇率、快照损坏、引用缺失整体回滚、部分失败不落半条', async () => {
+  const ctx = setup('ledger-p6fd-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts, { newFundsMinor: 500000 }))).json.recommendation;
+    const acc = await post(srv.port, '/api/v1/decisions',
+      { recommendationId: rec.id, intent: 'accepted', note: '负向电池宿主' });
+    const decisionId = acc.json.decision.id;
+
+    // ① 缺汇率：HKD 买入无 11 月前汇率 → 三个 CNY 汇总 null、fxUnavailable 列出
+    const seeded = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.concat([
+        { id: 'sev-6fd-hkd', eventType: 'buy', accountId: 'acc-broker', instrumentId: 'ins-hkd',
+          quantity: '30', priceMinor: 10000, feeMinor: 0, occurredAt: '2026-11-05' }
+      ]);
+      st.decisionLinks = (st.decisionLinks || []).concat([activeLink('sev-6fd-hkd', decisionId, 'sev-6fd-hkd')]);
+      st.assets.quotes = st.assets.quotes.concat([
+        { instrumentId: 'ins-hkd', priceMinor: 10000, currency: 'HKD', priceDate: '2026-11-18', provider: 'manual', status: 'ok' }
+      ]);
+    });
+    assert.strictEqual(seeded.status, 200, JSON.stringify(seeded.json));
+    const fxMissing = (await get(srv.port, '/api/v1/decisions/' + decisionId)).json;
+    assert.strictEqual(fxMissing.execution.linkedCount, 1);
+    assert.strictEqual(fxMissing.execution.linkedPrincipalCnyMinor, null);
+    assert.strictEqual(fxMissing.execution.remainingMinor, null);
+    assert.deepStrictEqual(fxMissing.execution.fxUnavailable, ['sev-6fd-hkd']);
+
+    // ② 引用缺失：全量写入省略被关联引用的事件 → linked_event_missing 整体回滚
+    const dropped = await putFullState(srv.port, (st) => {
+      st.assets.securityEvents = st.assets.securityEvents.filter((e) => e.id !== 'sev-6fd-hkd');
+    });
+    assert.strictEqual(dropped.status, 409);
+    assert.strictEqual(dropped.json.error.code, 'linked_event_missing');
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions/' + decisionId)).json.links.length, 1, '回滚后关联仍在');
+
+    // ③ 部分失败不落半条：关联未知事件 → 422 且关联集合不变
+    const badLink = await post(srv.port, '/api/v1/decisions/' + decisionId + '/links',
+      { securityEventId: 'sev-not-exists' });
+    assert.strictEqual(badLink.status, 422);
+    assert.strictEqual(badLink.json.error.code, 'unknown_security_event');
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions/' + decisionId)).json.links.length, 1);
+
+    // ④ 快照损坏：改库篡改一个字节 → 列表 invalidCount、详情 400；有效备份可恢复
+    const backup = await post(srv.port, '/api/v1/backups', {});
+    assert.strictEqual(backup.status, 201);
+    const DatabaseSync = require('node:sqlite').DatabaseSync;
+    const raw = new DatabaseSync(ctx.paths.dbFile);
+    raw.prepare("UPDATE decision_events SET snapshot_json = json_set(snapshot_json, '$.netWorthMinor', 1)").run();
+    raw.close();
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.invalidCount, 1);
+    const badDetail = await get(srv.port, '/api/v1/decisions/' + decisionId);
+    assert.strictEqual(badDetail.status, 400);
+    assert.strictEqual(badDetail.json.error.code, 'invalid_decision_record');
+    const restore = await post(srv.port, '/api/v1/restores', { file: backup.json.backup.name });
+    assert.strictEqual(restore.status, 200, JSON.stringify(restore.json));
+    ctx.adopt(restore);
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions')).json.invalidCount, 0, '有效备份可恢复损坏活库');
+  } finally {
+    await srv.close();
+    ctx.close();
+  }
+});

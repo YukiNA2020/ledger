@@ -2,9 +2,11 @@
 
 > 文档用途：记录可复现的测试证据、覆盖范围、缺陷和发布判断。
 > 创建时间：2026-08-16
-> 最近更新：2026-09-30
+> 最近更新：2026-09-30（6F 关闭 Phase 6）
 
 ## 当前结论
+
+2026-09-30 Phase 6F 最终集成验收（代码基线仍为 `2.4.26-phase6e` / schema v11，零迁移）：**全量 `node --test` 696/696**（692 + 6F 新增 4 项：`tests/server-phase6.test.js` 6F-01～6F-04）。**两套完整闭环**走真实 HTTP + 注入时钟：场景 A（9 月单笔无偏差 → 对照可比 → 复盘只读）与场景 B（10 月建议、10/11 月分批两笔含 HKD 0.9 折算与 −300 偏差 → 备份/清空/恢复逐字段一致）共用一本临时账本且证券事件零重叠，月度筛选按月归属正确、空月份不出条目；**负向电池**覆盖暂缓/忽略不进待执行清单、非法跳步不落事件、幂等回放/冲突、失效建议接受被拒（暂缓照常）、缺汇率三汇总 null + fxUnavailable、快照篡改 invalidCount + 详情 400、引用缺失整体回滚、部分失败不落半条。**浏览器侧**：两套全新临时库 × 不同 loopback origin × 干净 Chromium profile wiring **38 项 × 2 轮全绿**（19311、19312）；`browser-review.py` **38 项 pass**（19313，`externalRequests=[]`、`pageErrors=[]`、三项审计探针通过）；三档宽度 **66 页面 + 5 状态 = 71 项**（19314）。`node --check` 与 `git diff --check` 通过。证据与复跑脚本见 `docs/evidence/phase6-6f-20260930/`，浏览器审计证据见 `docs/evidence/phase5-review-20260927/browser-19313.json`。**Phase 6（6A～6F + G5-R4）整体通过并关闭**；4A 行情源门禁、S2.3 实机启动与 Phase 7 两个月真实使用不因此自动关闭。
 
 2026-09-30 Phase 6E `2.4.26-phase6e`：**全量 `node --test` 692/692**（6D 基线 686 + 6E 新增 6 项：`tests/server-phase6.test.js` 6E-01～6E-04 共 4 条、`tests/domain-phase6.test.js` 6E-11/6E-12 共 2 条）；**浏览器 wiring 38 项 × 3 轮全绿**（19212、19213、19214，均为隔离临时库 + 干净 Chromium profile）；**`browser-review.py` 38 项 pass**（19221，`externalRequests=[]`、`pageErrors=[]`，撤销映射 / 行情过期 / 断网知识卡三项审计探针通过）；**三档宽度与状态 71 项**（18 路由 × 1440/1100/390 的 54 项 + 决定弹层 / 详情弹层（无关联）/ 详情弹层（已关联）/ 复盘对照弹层各 3 档共 12 项 + 读取中 / 读取失败 / 重试后空态 / 接受成功 / 买入事件写入 5 项状态）全部通过。`node --check` 与 `git diff --check` 通过。证据与复跑脚本见 `docs/evidence/phase6-6e-20260930/`（`run_wiring_6e.py`、`run_width_6e.py`、`wiring-run-*.json`、`width-result.json`、截图），浏览器审计证据见 `docs/evidence/phase5-review-20260927/browser-19221.json`。`browser-review.py` 的数量契约已按拆解 §9 由 37 同步为 **38**（原 37 项语义与断言全部保留，仅新增 6E 一项检查的计数）。6E 覆盖要点：
 
