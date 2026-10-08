@@ -1,0 +1,5 @@
+完成：38 项通过，0 项失败
+Mapping revocation probe: {"currentMappingCount": 0, "adviceStatus": "stale", "unchangedAfterRevocation": false}
+Stale quote probe: {"apiCanAdvise": false, "pageSaysEstimate": true, "adviceStatus": "stale"}
+Offline probe: {"body": "OVERVIEW / 财务全景\n资产决策台\n把资产、风险和下一步行动放在同一张桌面上 · 数据日 2026-09-30\n空状态\nYOUR FINANCIAL PICTURE\n从完整的资产视角开始\n还没有资产数据\n这里将展示净资产、可投资资产、安全储备与风险配比。\n从资产录入开始：机构 → 账户 → 余额；也可通过「我的 → 恢复备份」导入包含资产数据的备份文件。\n录入资产\n去记一笔现金流\n风险评估\n未连接服务\n风险上限的判定由本地服务按冻结规则给出。运行 start.command（或 node server/main.js）后可在这里查看当前评估。\n不依赖服务，现在就能读： 能力与意愿说明\n评估详情与历史\n开始评估问卷\n配置对照\n未连接服务\n配置对照由本地服务在同一遍估值上给出当前与目标偏离。运行 start.command（或 node server/main.js）后可在这里查看。\n不依赖服务，现在就能读： 容忍带说明\n目标配置与维护\n目标配置\n本地服务运行后可维护\n›", "catalogLoaded": true, "knowledgeEntryCount": 2, "serviceWorkerControlled": true}
+{"port": 19413, "result": "pass", "summary": "完成：38 项通过，0 项失败", "elapsedSeconds": 15.949, "externalRequests": []}

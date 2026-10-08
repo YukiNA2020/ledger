@@ -170,6 +170,7 @@ archived   已归档放弃（终态，6A 新增）
 - 分批：**多笔 buy 可以关联同一条决策**，无数量上限。
 - 手续费不单独关联：买入自带的 `fee_minor` 与另记的 `fee` 事件都只在执行汇总里作为**交易费用**单列，**不计入本金、不参与偏差计算**。
 - 换标的：卖出不关联，买入关联；标的与建议认可标的不一致时**不拒绝**，由确认完成时的 `note` 说明（差额与标的差异同一条理由）。
+  - 2026-09-30 复验补充：用封存 `result.categoryAllocations[].instruments[].instrumentId` 判定建议中的标的；关联买入含建议之外的标的时，即使本金相等也必须填写执行说明，缺说明沿用 400 `deviation_note_required`。理由码仍按 §6.3 的金额差额定义，金额相等仍为 `executed_as_planned`；该码仅表示金额一致。
 - 关联不改写 `security_events`、不写 `txns`、不自动改现金余额（D-042 ④）。
 
 ### 3.2 单事件单决策与引用完整性
@@ -195,6 +196,8 @@ archived   已归档放弃（终态，6A 新增）
 | 关联费用 | Σ 活动关联 buy 的 `fee_minor` 同法折算，**单列展示**；任一活动事件缺折算汇率时为 `null` |
 | 进度 / 剩余 | `remainingMinor = rec.allocatedTotalMinor − 关联本金`，可为负（超买）；关联本金为 `null` 时也为 `null`，**进度只反映事实，不改状态** |
 | 偏差 `diff` | `关联本金 − rec.allocatedTotalMinor`；关联本金为 `null` 时也为 `null`（不可判定） |
+
+2026-09-30 复验补充：本金、费用及剩余金额的最终 CNY 汇总必须是安全整数；无缺汇率但累加超出安全整数时拒绝为 `invalid_decision_record`，事务整体回滚，绝不输出舍入失真的金额。存在缺汇率时仍按下条规则三个汇总全为 null，与关联遍历顺序无关。
 
 - **缺汇率**：任一活动关联事件折算所需汇率不存在 → `linkedPrincipalCnyMinor`、`linkedFeeCnyMinor`、`remainingMinor` 与内部 `diff` **全部为 `null`**，`linkedCount` 仍是实际活动关联条数；`fxUnavailable` 按事件 `occurred_at`、`id` 升序列出缺汇率的事件 id。偏差**不可判定**，确认执行时按「有偏差」处理（`reason_code = executed_deviation`，`note` 必填）。列表、详情、关联响应和每份快照的 `execution` 使用同一形状；**绝不按 1:1、期末汇率、已能折算的部分小计或伪 0 兜底**。无活动关联时汇总本金与费用均为 0、剩余为建议金额、`fxUnavailable=[]`。
 

@@ -94,6 +94,25 @@ function linkFixture(over) {
 
 const errCode = (result) => (result.ok ? null : result.error.code);
 
+test('6R-01 可比快照必须有完整金额与六类，损坏输入返回错误而非对照计算崩溃', () => {
+  for (const field of ['classes', 'netWorthMinor', 'investableTotalMinor']) {
+    const broken = snapshotFixture({ [field]: null });
+    assert.strictEqual(errCode(Domain.validateDecisionSnapshotShape(broken)), 'invalid_decision_record', field);
+    assert.strictEqual(errCode(Domain.decisionReviewComparison(broken, snapshotFixture(), snapshotFixture())),
+      'invalid_decision_record', field);
+  }
+});
+
+test('6R-02 缺汇率快照必须三个汇总全 null，拒绝部分小计与伪 0', () => {
+  const fields = ['linkedPrincipalCnyMinor', 'linkedFeeCnyMinor', 'remainingMinor'];
+  for (let mask = 0; mask < 8; mask++) {
+    const execution = { ...snapshotFixture().execution, fxUnavailable: ['sev-hkd'] };
+    fields.forEach((field, i) => { if (mask & (1 << i)) execution[field] = null; });
+    const checked = Domain.validateDecisionSnapshotShape(snapshotFixture({ execution }));
+    assert.strictEqual(checked.ok, mask === 7, 'null mask=' + mask);
+  }
+});
+
 /* ================= §1.2 权威转移表：49 个有序对全遍历 ================= */
 
 test('6B-01 完整矩阵 7×7 = 49 个有序对：合法 6 / 非法 43（含自转移），逐对数据驱动', () => {

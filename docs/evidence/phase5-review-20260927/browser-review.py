@@ -44,8 +44,8 @@ try:
         assert report["result"] == "pass", report["checks"]
         # Phase5 复验原本 34 项；Phase 6C 追加 2 项（36 项）；Phase 6D 再追加 1 项
         # 「关联 / 解绑 / 归档门禁 / 确认执行完成全走服务端」（37 项）；Phase 6E 再追加 1 项
-        # 「记录复盘 / 复盘只读 / 配置变化对照 / 月度历史」（38 项）。原断言一条未删。
-        assert len(report["checks"]) == 38
+        # 「记录复盘 / 复盘只读 / 配置变化对照 / 月度历史」（38 项）；使用说明追加 1 项（39 项）。原断言一条未删。
+        assert len(report["checks"]) == 39
         assert not report["externalRequests"]
         assert not report["pageErrors"]
 

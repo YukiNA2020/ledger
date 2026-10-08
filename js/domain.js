@@ -4095,6 +4095,9 @@
     if (!numericOk(snapshot.netWorthMinor) || !numericOk(snapshot.investableTotalMinor)) {
       return decisionFail('invalid_decision_record', '快照金额字段必须是安全整数或 null');
     }
+    if (snapshot.available && (snapshot.netWorthMinor === null || snapshot.investableTotalMinor === null || snapshot.classes === null)) {
+      return decisionFail('invalid_decision_record', '可比快照必须包含金额与六类配置');
+    }
     if (!snapshot.available && (snapshot.netWorthMinor !== null || snapshot.investableTotalMinor !== null || snapshot.classes !== null)) {
       return decisionFail('invalid_decision_record', '不可比快照不得携带任何数字（不出伪 0）');
     }
@@ -4159,7 +4162,9 @@
       return decisionFail('invalid_decision_record', '快照 execution.fxUnavailable 必须是事件 id 数组');
     }
     var missing = ex.fxUnavailable.length > 0;
-    if (missing !== (ex.linkedPrincipalCnyMinor === null || ex.linkedFeeCnyMinor === null || ex.remainingMinor === null)) {
+    var totals = [ex.linkedPrincipalCnyMinor, ex.linkedFeeCnyMinor, ex.remainingMinor];
+    if (missing ? !totals.every(function (v) { return v === null; })
+      : totals.some(function (v) { return v === null; })) {
       return decisionFail('invalid_decision_record', 'execution 汇总为 null 必须且只能因缺汇率（fxUnavailable 非空）');
     }
     return { ok: true, record: snapshot };
@@ -4286,6 +4291,18 @@
     if (!a.ok) return a;
     if (!b.ok) return b;
     return { ok: true, drift: canonicalJson(a.record.classes) !== canonicalJson(b.record.classes) };
+  }
+
+  // §3.1 / §3.3：金额偏差、汇率不可判定或使用建议之外的标的，均需执行说明。
+  // 理由码仍按金额差额派生；只读取封存建议，不拿当前认可映射改写历史。
+  function decisionExecutionNeedsNote(recommendation, execution, activeEvents) {
+    if (execution.linkedPrincipalCnyMinor === null ||
+        execution.linkedPrincipalCnyMinor !== recommendation.allocatedTotalMinor) return true;
+    var planned = [];
+    recommendation.result.categoryAllocations.forEach(function (row) {
+      row.instruments.forEach(function (item) { planned.push(item.instrumentId); });
+    });
+    return activeEvents.some(function (event) { return planned.indexOf(event.instrumentId) === -1; });
   }
 
   // 契约 §4.3（6E 补充）：六类配置对照 = 三时点封存快照的横向派生表，纯函数、不改封存事实。
@@ -4652,6 +4669,7 @@
     validateDecisionLinkRecord: validateDecisionLinkRecord,
     validateDecisionEventChain: validateDecisionEventChain,
     validateDecisionSnapshotShape: validateDecisionSnapshotShape,
+    decisionExecutionNeedsNote: decisionExecutionNeedsNote,
     deriveArchiveReason: deriveArchiveReason,
     decisionSnapshotGate: decisionSnapshotGate,
     decisionReviewDrift: decisionReviewDrift,

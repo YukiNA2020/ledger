@@ -58,8 +58,9 @@ function executionSummary(rec, decisionId, links, securityEvents, fxRates) {
     if (!rateCache.has(key)) rateCache.set(key, Domain.findFxRateAsOf(fxRates, ev.currency, 'CNY', ev.occurredAt));
     return rateCache.get(key);
   };
-  let principal = 0;
-  let fee = 0;
+  // 单笔乘积已由 Domain 校验为安全整数；聚合用 BigInt，避免分批累加丢分。
+  let principal = 0n;
+  let fee = 0n;
   const fxUnavailable = [];
   active.forEach((l) => {
     const ev = eventsById.get(l.securityEventId);
@@ -87,19 +88,28 @@ function executionSummary(rec, decisionId, links, securityEvents, fxRates) {
         }
       }
     }
-    if (principalCny == null || feeCny == null) {
-      principal = null;
-      fee = null;
-    } else if (principal != null) {
-      principal += principalCny;
-      fee += feeCny;
+    if (principalCny != null && feeCny != null) {
+      principal += BigInt(principalCny);
+      fee += BigInt(feeCny);
     }
   });
+  let remaining = BigInt(rec.allocatedTotalMinor) - principal;
+  if (fxUnavailable.length) {
+    principal = fee = remaining = null;
+  } else {
+    if (![principal, fee, remaining].every((v) =>
+      v >= -BigInt(Number.MAX_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER))) {
+      decisionFail('invalid_decision_record', '关联本金、费用或剩余金额累加超出安全整数');
+    }
+    principal = Number(principal);
+    fee = Number(fee);
+    remaining = Number(remaining);
+  }
   return {
     linkedCount: active.length,
     linkedPrincipalCnyMinor: principal,
     linkedFeeCnyMinor: fee,
-    remainingMinor: principal == null ? null : rec.allocatedTotalMinor - principal,
+    remainingMinor: remaining,
     fxUnavailable: fxUnavailable
       .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(b.id))
       .map((ev) => ev.id)
@@ -387,8 +397,10 @@ function appendDecisionEvent(db, decisionId, payload, ctx) {
     }
     const hasDeviation = execution.linkedPrincipalCnyMinor === null ||
       execution.linkedPrincipalCnyMinor !== rec.allocatedTotalMinor;
-    if (hasDeviation && !req.note) {
-      decisionFail('deviation_note_required', '执行存在偏差（金额差额或汇率缺失），必须填写偏差说明 note');
+    const activeIds = new Set(links.filter((l) => l.unlinkedOn == null).map((l) => l.securityEventId));
+    const activeEvents = securityEvents.filter((event) => activeIds.has(event.id));
+    if (Domain.decisionExecutionNeedsNote(rec, execution, activeEvents) && !req.note) {
+      decisionFail('deviation_note_required', '执行存在金额差额、汇率缺失或标的差异，必须填写执行说明 note');
     }
     reasonCode = hasDeviation ? 'executed_deviation' : 'executed_as_planned';
   } else if (req.toState === 'archived') {
@@ -458,9 +470,11 @@ function requireLinkableDecision(db, decisionId) {
     decisionFail('unknown_decision', '决策不存在：' + decisionId);
   }
   const events = R.getDecisionEvents(db, decisionId);
-  const chain = Domain.validateDecisionEventChain(decision, events);
-  if (!chain.ok) {
-    decisionFail('invalid_decision_record', '决策事件链复核失败：' + chain.error.detail);
+  const links = R.readDecisionLinks(db).filter((l) => l.decisionId === decisionId);
+  const validRecIds = new Set(R.readRecommendationView(db).items.map((r) => r.id));
+  const checked = R.validateDecisionWithIntegrity(db, decision, events, links, validRecIds);
+  if (!checked.ok) {
+    decisionFail('invalid_decision_record', '决策完整性复核失败：' + checked.error.detail);
   }
   if (decision.state !== 'accepted' && decision.state !== 'executed') {
     decisionFail('illegal_state_for_link',

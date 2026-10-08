@@ -1,0 +1,74 @@
+[
+  {
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "js/domain.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "js/app.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "server/decisions.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "sw.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "tests/domain-phase6.test.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "tests/server-phase6.test.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  },
+  {
+    "command": [
+      "node",
+      "--check",
+      "tests/decision-summary.test.js"
+    ],
+    "exitCode": 0,
+    "output": ""
+  }
+]

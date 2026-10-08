@@ -580,3 +580,61 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]), select, tex
 [data-dec-entry] { flex-wrap: wrap; gap: 6px 10px; }
 [data-decide-sheet] .row { flex-wrap: wrap; gap: 8px; }
 [data-dec-detail] .small, [data-dec-detail] .db-item { overflow-wrap: anywhere; }
+/* ---------- 产品使用说明 ---------- */
+.dash-head-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
+.help-page { min-width: 0; }
+.help-start-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px; }
+.help-start.card { text-align: left; margin: 0; padding: 22px; border: 1px solid rgba(64, 138, 181, .2); background: linear-gradient(135deg, #fff, #edf8ff); }
+.help-start span { display: block; font-size: 11px; font-weight: 600; color: var(--ink-3); letter-spacing: .04em; margin-bottom: 10px; }
+.help-start b { display: block; font-size: 17px; line-height: 1.5; color: var(--ink); }
+.help-start p { font-size: 12px; line-height: 1.7; color: var(--ink-2); margin: 8px 0 0; }
+.help-start:hover { border-color: #82bbdc; }
+.help-search { margin: 0 0 22px; }
+.help-search label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.help-search > div { display: flex; align-items: center; gap: 10px; }
+.help-search input { flex: 1; min-width: 0; width: 100%; padding: 12px 16px; color: var(--ink); background: rgba(255,255,255,.9); border: 1px solid #b9d8eb; border-radius: 12px; outline: none; }
+.help-search input:focus { border-color: #338bbd; box-shadow: 0 0 0 3px rgba(72, 155, 203, .13); }
+.help-layout { display: grid; grid-template-columns: 194px minmax(0, 1fr); gap: 22px; align-items: start; }
+.help-toc.card { position: sticky; top: 24px; margin: 0; padding: 18px 14px; }
+.help-toc > b { display: block; font-size: 12px; color: var(--ink-3); padding: 0 10px 10px; }
+.help-toc nav { display: flex; flex-direction: column; gap: 3px; }
+.help-toc nav button { text-align: left; border-radius: 9px; padding: 10px; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
+.help-toc nav button:hover, .help-toc nav button:focus-visible { background: #e4f3fd; color: #164e73; }
+.help-toc .small { border-top: 1px solid #dcecf6; padding: 14px 10px 0; margin-top: 12px; line-height: 1.8; }
+.help-content { min-width: 0; }
+.help-result-count { color: var(--ink-3); font-size: 12px; margin: 0 2px 12px; }
+.help-section.card { margin: 0 0 18px; padding: 26px; scroll-margin-top: 22px; }
+.help-section-head { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 22px; }
+.help-section-num { flex: none; color: #4387b0; font-size: 12px; font-weight: 700; padding-top: 5px; }
+.help-section h2 { font-size: 21px; line-height: 1.5; margin: 0; }
+.help-section-head p { margin: 6px 0 0; color: var(--ink-3); font-size: 13px; line-height: 1.7; }
+.help-item { display: flex; gap: 12px; padding: 18px 0; border-top: 1px solid #e2edf4; }
+.help-item > div { min-width: 0; }
+.help-item h3 { font-size: 15px; line-height: 1.6; margin: 0; }
+.help-item p, .help-faq p, .help-no-results p { font-size: 14px; line-height: 1.9; color: var(--ink-2); margin: 6px 0 0; overflow-wrap: anywhere; }
+.help-step-num { flex: none; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; color: #39779e; background: #eaf4fa; border-radius: 8px; font-size: 12px; margin-top: 1px; }
+.help-shortcut { display: inline-block; margin-top: 9px; font-size: 12px; line-height: 1.6; text-align: left; }
+.help-shortcut:disabled { cursor: default; opacity: .5; }
+.help-note { background: #edf7fd; border-left: 3px solid #9ecae4; border-radius: 0 9px 9px 0; padding: 12px 14px; margin-top: 12px; font-size: 13px; line-height: 1.9; color: #325c77; }
+.help-faq { border-top: 1px solid #e2edf4; padding: 16px 0; }
+.help-faq summary { cursor: pointer; font-size: 14px; font-weight: 600; line-height: 1.8; color: var(--ink); }
+.help-faq p, .help-faq .help-shortcut { margin-left: 18px; }
+.help-footer { color: var(--ink-3); font-size: 12px; line-height: 1.8; text-align: center; padding: 12px 0 24px; }
+@media (max-width: 900px) {
+  .help-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .help-toc.card { position: static; padding: 14px; }
+  .help-toc nav { flex-direction: row; flex-wrap: wrap; gap: 4px; }
+  .help-toc nav button { background: #eef7fc; padding: 7px 10px; }
+  .help-toc .small { display: none; }
+}
+@media (max-width: 600px) {
+  .help-start-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; margin-bottom: 18px; }
+  .help-start.card { padding: 16px 18px; }
+  .help-start span { margin-bottom: 5px; }
+  .help-start b { font-size: 16px; }
+  .help-section.card { padding: 18px; }
+  .help-section h2 { font-size: 19px; }
+  .help-item p, .help-faq p { font-size: 13px; }
+  .help-section-head { gap: 10px; }
+  .dash-head-actions { justify-content: flex-start; }
+}

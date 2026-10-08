@@ -1,5 +1,13 @@
 # Ledger 架构设计
 
+## 2026-10-01 内置操作说明
+
+当前 `2.4.28-help` / schema v11。新增第 19 条路由 `help`；`js/help.js` 保存九章静态操作内容和纯文本搜索，`app.js` 渲染目录、结果和既有路由快捷入口。说明不读写财务集合、不新增 API 或依赖。搜索只更新结果区，保留输入焦点；目录定位移交标题焦点。Service Worker 缓存新增模块并递增版本；数据启动失败仍可直达 `#help`、阅读启动方法，业务快捷入口此时禁用。桌面侧栏、首页与「我的」均提供入口。
+
+## 2026-09-30 Phase 6 完整复验修复
+
+当时 `2.4.27-phase6-review` / schema v11，零迁移与新依赖。关联/解绑复用 `validateDecisionWithIntegrity`（快照原文字节、snapshotHash/payloadHash、建议与活动关联引用），拒绝损坏历史后的继续写入。执行金额用 BigInt 聚合并在返回前验证安全整数；缺汇率仍三个汇总全 null。领域层加强可比快照必备字段与全 null 一致性，并新增 `decisionExecutionNeedsNote` 按封存建议判定换标的说明要求；金额理由码与原估值/分配算法不变。证据与验证边界见 [PHASE6_REVIEW.md](./PHASE6_REVIEW.md)。
+
 ## 2026-09-29 Phase 6C 决策页面
 
 当前 `2.4.25-phase6c-fix1` / schema v11（**零迁移**：只新增前端与封装层，不改 6B 的表、API 与状态机）。前端新增第 18 条路由 `decisions`（侧栏「决策空间」分组与资产决策台首页各一个入口），只读服务端结果，不重算建议金额、状态或门禁。

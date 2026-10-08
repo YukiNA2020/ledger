@@ -1,0 +1,151 @@
+server: {"pid": 20097, "port": 19422, "dir": "/var/folders/r3/x_nhgfs13gq2_kjhlmxyb_9m0000gn/T/ledger-fix5d-browser-9iQGJe"}
+summary: 完成：38 项通过，0 项失败
+result: pass
+PASS ✅ 本地服务可达且事实源为 SQLite
+PASS ✅ 应用启动渲染资产决策台空状态并可进入现金流页
+PASS ✅ 导入向导文件选择事件触发解析预览
+PASS ✅ JSON 备份恢复入口弹出确认并覆盖恢复
+PASS ✅ v1 备份恢复后资产集合初始化为空且决策台空状态
+PASS ✅ v2 资产备份恢复后决策台展示精确口径
+PASS ✅ SQLite 是唯一事实源且 IndexedDB 未被双写
+PASS ✅ 非法写请求被拒绝且当前只读可用
+PASS ✅ JSON 恢复前强制留 pre-import 备份（节流窗口内也可回滚）
+PASS ✅ 资产录入页可维护双币种并记录不计收支的换汇，且不被全量写回抹掉
+PASS ✅ 月度结账按上月口径生成清单并可保存估算快照
+PASS ✅ 福利预设四类分流：明确余额计一次、无余额资格不计入、社保卡独立
+PASS ✅ 上月核对日期 + 手动汇率可完成正式结账，历史金额可下钻到来源
+PASS ✅ 标的目录：检索加入 → 确认分类并锁定 → 刷新不覆盖已确认值
+PASS ✅ 标的目录：缺交易所的本地标的与参考数据合成一条候选（不重复展示）
+PASS ✅ 持仓与证券事件：期初+买入−卖出推导持有数量，事件不被全量写回抹掉
+PASS ✅ 行情区块：默认不自动抓取；手动补价写入事实源并渲染价格与来源
+PASS ✅ 启动时自动更新汇率开关：默认关闭，切换可写入 settings 并回读
+PASS ✅ 刷新报告的界面渲染：逐作用域状态如实提示，且不改动已登记的手动价格
+PASS ✅ 估值下钻：四维度合计与总览自洽，逐持仓可追溯到价格与汇率来源
+PASS ✅ 收益归因：基准取自已结账月快照，价格+汇率+未分解恒等于估值变化
+PASS ✅ 篡改快照打开决策台：完整性失败时不给任何归因行
+PASS ✅ 风险评估：问卷提交 → 服务端重算落库 → 结果/复评追加/历史渲染
+PASS ✅ 目标配置：生成目标版本 → 类别偏离与总览同源 → 认可标的维护与反例
+PASS ✅ 新增资金建议：页面生成正式建议 → 金额守恒且只引用认可标的 → 门禁不过时只给估算
+PASS ✅ 5E-5 审计追溯：未封存旧建议显式标注，重复生成不倒填解释版本
+PASS ✅ 清空账本经本地服务生效
+PASS ✅ 决策台风险摘要：四态与 API、风险页同源，过期不冒充当前有效
+PASS ✅ 决策台配置对照：六类与 /targets/current 同源，缺数据不冒充
+PASS ✅ 本地知识卡：已知 id 打开、未知 id 显式降级、离线无建议边界
+PASS ✅ 服务中断时记账：不报已入账、回滚界面、进入只读降级
+PASS ✅ 5E-6 状态矩阵：无正式月结 / 0 元 / 分类未确认 / 行情过期的建议与决策台页面态
+PASS ✅ 5E-6 三层复核：领域 = API = 页面（S5.1 能力约束意愿 + S5.2 分配与解释码 + S5.3 追溯）
+PASS ✅ 5E-6 一分钟理解演练：净资产 / 可投资 / 主要风险暴露 / 新增资金方向 与 API 同源
+PASS ✅ 6C 决策：三类决定真实可用且刷新一致；估算不可决策、失效接受被拒、失败不假成功
+PASS ✅ 6C 决策：详情弹层慢响应不覆盖后打开的另一条，关闭后晚到不重弹
+PASS ✅ 6D 决策：关联 / 解绑 / 归档门禁 / 确认执行完成全走服务端，失败不假成功
+PASS ✅ 6E 决策：记录复盘理由必填、复盘后只读，配置变化对照与月度历史不重算不漂移
+LOG console.error: A bad HTTP response code (404) was received when fetching the script.
+LOG console.error: Failed to load resource: the server responded with a status of 401 (Unauthorized)
+LOG console.error: Failed to load resource: the server responded with a status of 401 (Unauthorized)
+LOG console.error: Failed to load resource: the server responded with a status of 415 (Unsupported Media Type)
+LOG console.error: Failed to load resource: the server responded with a status of 400 (Bad Request)
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[],"total":0,"invalidCount":0,"states":[],"months":[]}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[],"total":0,"invalidCount":0,"states":[],"months":[]}'
+LOG console.error: Failed to load resource: the server responded with a status of 400 (Bad Request)
+LOG console.error: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-419e1efaef3c70c9","status":"formal","inputHash":"419e1efaef3c70c9ec61a1e5089e35c08c0f2832c25a
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-419e1efaef3c70c9","createdAt":"2026-09-30T15:24:25.825Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG console.error: Failed to load resource: the server responded with a status of 400 (Bad Request)
+LOG response: 400 POST http://127.0.0.1:19422/api/v1/recommendations body='{"error":{"code":"invalid_approved_instruments","message":"认可标的只由服务端从本机事实读取，不接受请求体提交的映射","retryable":false}}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-419e1efaef3c70c9","createdAt":"2026-09-30T15:24:25.825Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-3793ce30accd684d","status":"estimate","inputHash":"3793ce30accd684da1540ff9ab1a444499b4011d4c
+LOG response: 200 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":false,"id":"rec-419e1efaef3c70c9","status":"formal","inputHash":"419e1efaef3c70c9ec61a1e5089e35c08c0f2832c25
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-3793ce30accd684d","createdAt":"2026-09-30T15:24:25.910Z","status":"estimate","ruleVersion":"risk-rules-v1","t
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-25ae289e186787e7","status":"formal","inputHash":"25ae289e186787e7342ca8f4c29b75b387e806e292d2
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-25ae289e186787e7","createdAt":"2026-09-30T15:24:26.011Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[],"invalidCount":0,"total":0,"versions":{"ruleVersion":"risk-rules-v1","targetVersion":"risk-targets-v1"}}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[],"invalidCount":0,"total":0,"versions":{"ruleVersion":"risk-rules-v1","targetVersion":"risk-targets-v1"}}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[],"invalidCount":0,"total":0,"versions":{"ruleVersion":"risk-rules-v1","targetVersion":"risk-targets-v1"}}'
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-9c68dcd9a954c182","status":"formal","inputHash":"9c68dcd9a954c1823cd181a265cba2747f6b9c8685e4
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-9c68dcd9a954c182","createdAt":"2026-09-30T15:24:26.121Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-9c68dcd9a954c182","createdAt":"2026-09-30T15:24:26.121Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-9c68dcd9a954c182","createdAt":"2026-09-30T15:24:26.121Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":false,"id":"rec-9c68dcd9a954c182","status":"formal","inputHash":"9c68dcd9a954c1823cd181a265cba2747f6b9c8685e
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-9c68dcd9a954c182","createdAt":"2026-09-30T15:24:26.121Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":false,"id":"rec-9c68dcd9a954c182","status":"formal","inputHash":"9c68dcd9a954c1823cd181a265cba2747f6b9c8685e
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-9c68dcd9a954c182","createdAt":"2026-09-30T15:24:26.121Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[],"invalidCount":0,"total":0,"versions":{"ruleVersion":"risk-rules-v1","targetVersion":"risk-targets-v1"}}'
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-9d3059956a2740dd","status":"formal","inputHash":"9d3059956a2740dde9ac74f374b5494e03b88378825e
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-9d3059956a2740dd","createdAt":"2026-09-30T15:24:28.659Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-0e95824b5d601467","status":"estimate","inputHash":"0e95824b5d601467576ea017decc2998f9e7f89daa
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-29222b0087ac7f10","status":"estimate","inputHash":"29222b0087ac7f104235261662189ff23bb12765c2
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-29222b0087ac7f10","createdAt":"2026-09-30T15:24:28.842Z","status":"estimate","ruleVersion":"risk-rules-v1","t
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-5eb17b7a3e6b969f","status":"formal","inputHash":"5eb17b7a3e6b969ff32f5009d9a21e3d79aaf5d2b33a
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-5eb17b7a3e6b969f","createdAt":"2026-09-30T15:24:29.186Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG console.log: DRILL: ① 净资产 1,470,000.00；② 可投资 970,000.00；③ 主要风险暴露 现金 500,000.00（占可投资 51.5%）；④ 新增资金方向 宽基权益偏离 -985bps 低于目标区间 → 本月可新增 500,000.00 中请求的 2,000 元已全部补宽基
+LOG console.log: DRILL: 数据同源核对 overview={"netWorthMinor":147000000,"investableMinor":97000000,"newFundsAvailableMinor":50000000,"broadEquityDeviationBps":-985,"adviceAllocatedBroadMinor":200000}
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-5eb17b7a3e6b969f","createdAt":"2026-09-30T15:24:29.186Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[],"total":0,"invalidCount":0,"states":[],"months":[]}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[],"invalidCount":0,"total":0,"versions":{"ruleVersion":"risk-rules-v1","targetVersion":"risk-targets-v1"}}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[],"invalidCount":0,"total":0,"versions":{"ruleVersion":"risk-rules-v1","targetVersion":"risk-targets-v1"}}'
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-baa17fd27178b454","status":"formal","inputHash":"baa17fd27178b45424a8bf9390e438b20a34f4545bd7
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-baa17fd27178b454","createdAt":"2026-09-30T15:24:29.638Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[],"total":0,"invalidCount":0,"states":[],"months":[]}'
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"created":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","lastSeq
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"acce
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"acce
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"acce
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"acce
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-baa17fd27178b454","createdAt":"2026-09-30T15:24:29.638Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-baa17fd27178b454","createdAt":"2026-09-30T15:24:29.638Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-399955a30f99e61e","status":"formal","inputHash":"399955a30f99e61e4c1a2823078fb463cf9be3a2caae
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-399955a30f99e61e","createdAt":"2026-09-30T15:24:30.767Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"created":true,"decision":{"id":"dec-887c05cc4241c706","recommendationId":"rec-399955a30f99e61e","state":"deferred","lastSeq
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-887c05cc4241c706","recommendationId":"rec-399955a30f99e61e","recommendationStatus":"formal","state":"defe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-887c05cc4241c706","recommendationId":"rec-399955a30f99e61e","recommendationStatus":"formal","state":"defe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-399955a30f99e61e","createdAt":"2026-09-30T15:24:30.767Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-399955a30f99e61e","createdAt":"2026-09-30T15:24:30.767Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-d7c81496e08f47d7","status":"formal","inputHash":"d7c81496e08f47d76357e3a6718654419e93b3b35a90
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-d7c81496e08f47d7","createdAt":"2026-09-30T15:24:31.126Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"created":true,"decision":{"id":"dec-6eacdda46729cc4f","recommendationId":"rec-d7c81496e08f47d7","state":"dismissed","lastSe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-6eacdda46729cc4f","recommendationId":"rec-d7c81496e08f47d7","recommendationStatus":"formal","state":"dism
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-6eacdda46729cc4f","recommendationId":"rec-d7c81496e08f47d7","recommendationStatus":"formal","state":"dism
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-d7c81496e08f47d7","createdAt":"2026-09-30T15:24:31.126Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-d7c81496e08f47d7","createdAt":"2026-09-30T15:24:31.126Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-58f6a16a5bccab79","status":"estimate","inputHash":"58f6a16a5bccab79a8c68496ed495441d5051d6a45
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-58f6a16a5bccab79","createdAt":"2026-09-30T15:24:31.585Z","status":"estimate","ruleVersion":"risk-rules-v1","t
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-58f6a16a5bccab79","createdAt":"2026-09-30T15:24:31.585Z","status":"estimate","ruleVersion":"risk-rules-v1","t
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-58f6a16a5bccab79","createdAt":"2026-09-30T15:24:31.585Z","status":"estimate","ruleVersion":"risk-rules-v1","t
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/recommendations body='{"ok":true,"created":true,"id":"rec-3cd59f5300f7ceb2","status":"formal","inputHash":"3cd59f5300f7ceb23e8a608aa2f3dfe8f3581c56c78e
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/recommendations body='{"items":[{"id":"rec-3cd59f5300f7ceb2","createdAt":"2026-09-30T15:24:31.873Z","status":"formal","ruleVersion":"risk-rules-v1","tar
+LOG console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+LOG response: 409 POST http://127.0.0.1:19422/api/v1/decisions body='{"error":{"code":"recommendation_stale","message":"建议已失效，不能接受（assets_changed）；事实变化后请重新生成建议","retryable":false}}'
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-6eacdda46729cc4f","recommendationId":"rec-d7c81496e08f47d7","recommendationStatus":"formal","state":"dism
+LOG response: 201 POST http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"created":true,"decision":{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","state":"deferred","lastSeq
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-7b983cbe48f436bf body='{"ok":true,"decision":{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","state":"deferred","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 201 POST /127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f/links body='{"ok":true,"link":{"id":"lnk-b09b1d3883e24090","decisionId":"dec-77f4b333894a9d6f","securityEventId":"sev-wiring6d
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG console.error: Failed to load resource: the server responded with a status of 409 (Conflict)
+LOG response: 409 POST 127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f/events body='{"error":{"code":"has_linked_events","message":"归档前必须先解绑全部活动关联","retryable":false}}'
+LOG response: 200 POST 0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f/links/unlink body='{"ok":true,"link":{"id":"lnk-b09b1d3883e24090","decisionId":"dec-77f4b333894a9d6f","securityEventId":"sev-wiring6d
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG response: 201 POST /127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f/links body='{"ok":true,"link":{"id":"lnk-b52f135812cf358a","decisionId":"dec-77f4b333894a9d6f","securityEventId":"sev-wiring6d
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"accepted","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-7b983cbe48f436bf","recommendationId":"rec-3cd59f5300f7ceb2","recommendationStatus":"formal","state":"defe
+LOG response: 200 POST 127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f/events body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"executed","l
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"executed","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"exec
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"exec
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"executed","la
+LOG response: 200 POST 127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f/events body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"reviewed","l
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"reviewed","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions body='{"ok":true,"items":[{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","recommendationStatus":"formal","state":"revi
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"reviewed","la
+LOG response: 200 GET http://127.0.0.1:19422/api/v1/decisions/dec-77f4b333894a9d6f body='{"ok":true,"decision":{"id":"dec-77f4b333894a9d6f","recommendationId":"rec-baa17fd27178b454","state":"reviewed","la

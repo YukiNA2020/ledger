@@ -8,13 +8,14 @@
 (function () {
   'use strict';
   var Core = window.Core, DB = window.DB, Store = window.Store, Charts = window.Charts, Domain = window.Domain;
-  var APP_VERSION = '2.4.26-phase6e';
+  var APP_VERSION = '2.4.28-help';
   // 追加式事实集合的键名只有一份定义（Store 导出），页面不另列一套（D-025）。
   var COMPANION_KEYS = Store.COMPANION_KEYS;
 
   /* ================= 状态 ================= */
   var state = {
     ready: false,
+    helpQuery: '',
     page: 'home',
     ym: null,            // 当前查看月份 'YYYY-MM'
     txns: [], accounts: [], categories: [], settings: Core.defaultSettings(),
@@ -2116,7 +2117,9 @@
       document.getElementById('view').innerHTML = '<div class="empty">数据加载失败：' +
         esc(e && e.message || e) +
         '<div class="small muted" style="margin-top:8px">请刷新重试' +
-        (kb ? '<br>不依赖服务与账户数据，现在就能读：' + kb : '') + '</div></div>';
+        (kb ? '<br>不依赖服务与账户数据，现在就能读：' + kb : '') + '</div>' +
+        '<button class="btn" data-action="nav:help" style="margin-top:14px">使用说明与启动帮助</button></div>';
+      if (location.hash === '#help') { state.page = 'help'; render(); }
     });
   }
 
@@ -2241,6 +2244,8 @@
   }
 
   function nav(page) {
+    // 启动读数失败时，说明不依赖账本，仍可阅读；不把应用伪装成正常启动。
+    if (!state.ready && page === 'help') { location.hash = 'help'; state.page = 'help'; render(); window.scrollTo(0, 0); return; }
     if (location.hash.replace('#', '') === page) route(page);
     else location.hash = page;
   }
@@ -2300,7 +2305,7 @@
   function route(page) {
     if (!state.ready) return;
     if (['home', 'cashflow', 'list', 'stats', 'settings', 'add', 'import', 'accounts', 'categories',
-      'budget', 'health', 'reimburse', 'recurring', 'assets', 'close', 'risk', 'targets', 'decisions'].indexOf(page) < 0) page = 'home';
+      'budget', 'health', 'reimburse', 'recurring', 'assets', 'close', 'risk', 'targets', 'decisions', 'help'].indexOf(page) < 0) page = 'home';
     state.page = page;
     if (page !== 'add') { state.editId = null; }
     if (page !== 'list') { state.selectMode = false; state.selectedIds = {}; }
@@ -2347,7 +2352,8 @@
       list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h1M3 12h1M3 18h1"/>',
       stats: '<path d="M4 20V11m5 9V4m5 16v-7m5 7V8"/>',
       add: '<path d="M12 4v16M4 12h16"/>',
-      settings: '<circle cx="12" cy="12" r="3"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+      settings: '<circle cx="12" cy="12" r="3"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+      help: '<path d="M4 4h6a3 3 0 0 1 3 3v14a4 4 0 0 0-4-3H4zM13 7a3 3 0 0 1 3-3h5v14h-4a4 4 0 0 0-4 3"/>'
     };
     function glyph(id) {
       return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icons[id] + '</svg>';
@@ -2380,6 +2386,7 @@
       }).join('') + '</div>' +
       '<div class="nav-footer"><div class="tab-add"><button data-action="nav:add" title="记一笔">' +
       '<span class="ti">' + glyph('add') + '</span><span class="tab-label">记一笔</span></button></div>' +
+      tab({ id: 'help', label: '使用说明', desktop: true }) +
       tab({ id: 'settings', label: '设置与数据', mobile: '我的' }) +
       '<div class="nav-local">本机运行 · 私密数据留在 Mac</div></div>';
   }
@@ -2407,6 +2414,7 @@
       case 'risk': html = tplRisk(); break;
       case 'targets': html = tplTargets(); break;
       case 'decisions': html = tplDecisions(); break;
+      case 'help': html = tplHelp(); break;
     }
     view.innerHTML = html;
   }
@@ -2723,7 +2731,8 @@
     }
     var html = '<div class="dash-head"><div><div class="dash-eyebrow">OVERVIEW / 财务全景</div>' +
       '<div class="dash-title">资产决策台</div>' +
-      '<div class="small muted">把资产、风险和下一步行动放在同一张桌面上 · 数据日 ' + esc(ov.asOf) + '</div></div>' + statusChip + '</div>';
+      '<div class="small muted">把资产、风险和下一步行动放在同一张桌面上 · 数据日 ' + esc(ov.asOf) + '</div></div>' +
+      '<div class="dash-head-actions"><button class="btn small ghost" data-action="nav:help">使用说明</button>' + statusChip + '</div></div>';
 
     /* Phase 5E-1：决策台的风险摘要卡。判定与数值只反映服务端 /risk-assessments/current
        的结果（双评分与等级、最终上限、硬封顶、评估/到期日、有效状态），
@@ -4370,6 +4379,64 @@
   }
 
   /* ================= 设置 ================= */
+  /* ---------- 使用说明：只渲染本机静态内容；搜索只替换结果，保留输入焦点 ---------- */
+  function helpResultsHtml() {
+    var guide = window.LedgerHelp;
+    if (!guide) return '<div class="card">说明内容未加载，请刷新页面重试。</div>';
+    var sections = guide.search(state.helpQuery);
+    var count = '<div class="help-result-count" role="status" aria-live="polite" data-help-count>' +
+      (state.helpQuery.trim() ? '找到 ' + sections.length + ' 个相关章节' : '共 ' + sections.length + ' 个章节 · 按需要查阅') + '</div>';
+    if (!sections.length) return count + '<div class="card help-no-results"><b>没有找到相关说明</b>' +
+      '<p>试试「导入」「现金余额」「汇率」或「复盘」，也可以清除搜索查看全部章节。</p>' +
+      '<button class="btn" data-action="help:clear">清除搜索</button></div>';
+    return count + sections.map(function (section) {
+      var index = guide.sections.indexOf(section) + 1;
+      return '<section class="card help-section" id="help-' + esc(section.id) + '" data-help-section="' + esc(section.id) + '">' +
+        '<div class="help-section-head"><span class="help-section-num">' + String(index).padStart(2, '0') + '</span>' +
+        '<div><h2 tabindex="-1">' + esc(section.title) + '</h2><p>' + esc(section.subtitle) + '</p></div></div>' +
+        '<div class="help-items' + (section.ordered ? ' help-ordered' : '') + '">' + section.items.map(function (item, i) {
+          var shortcut = item.route
+            ? '<button class="link help-shortcut" data-action="nav:' + esc(item.route) + '"' +
+              (!state.ready ? ' disabled title="先启动本地服务并刷新页面"' : '') + '>' + esc(item.label) + ' →</button>'
+            : item.cardId ? knowledgeLinkHtml(item.cardId, item.label) : '';
+          var content = '<p>' + esc(item.text) + '</p>' + shortcut;
+          if (section.kind === 'faq') return '<details class="help-faq"' + (state.helpQuery.trim() ? ' open' : '') +
+            '><summary>' + esc(item.title) + '</summary>' + content + '</details>';
+          return '<div class="help-item">' + (section.ordered ? '<span class="help-step-num">' + (i + 1) + '</span>' : '') +
+            '<div><h3>' + esc(item.title) + '</h3>' + content + '</div></div>';
+        }).join('') + '</div>' +
+        (section.note ? '<div class="help-note">' + esc(section.note) + '</div>' : '') + '</section>';
+    }).join('');
+  }
+
+  function tplHelp() {
+    var guide = window.LedgerHelp;
+    var toc = guide ? guide.sections.map(function (section) {
+      return '<button data-action="help:section" data-section="' + esc(section.id) + '">' + esc(section.title) + '</button>';
+    }).join('') : '';
+    return '<div class="help-page" data-help-page><div class="dash-head"><div>' +
+      '<div class="dash-eyebrow">LEDGER / 使用说明</div><div class="dash-title">从第一笔记录到一次完整复盘</div>' +
+      '<div class="small muted">第一次用按顺序走，遇到问题回来查。</div></div>' +
+      '<span class="dash-chip">离线可读</span></div>' +
+      (!state.ready ? '<div class="card help-note">账本数据尚未加载，说明仍可阅读。双击 <code>start.command</code> 启动本地服务，再刷新页面恢复操作。</div>' : '') +
+      '<div class="help-start-grid">' +
+      '<button class="card help-start" data-action="help:section" data-section="start"><span>01 / 首次使用</span><b>先把账本搭好</b><p>账户、持仓、风险评估与第一条建议</p></button>' +
+      '<button class="card help-start" data-action="help:section" data-section="monthly"><span>02 / 每月维护</span><b>完成一次资产结账</b><p>核对余额、行情和当月快照</p></button>' +
+      '<button class="card help-start" data-action="help:section" data-section="execution"><span>03 / 行动闭环</span><b>把决定和实际交易连起来</b><p>关联买入、确认执行、记录复盘</p></button></div>' +
+      '<div class="help-search"><label for="help-search">查找操作说明</label>' +
+      '<div><input id="help-search" type="search" maxlength="120" placeholder="搜索：导入、现金余额、汇率、复盘…"' +
+      ' value="' + esc(state.helpQuery) + '" data-input="help:q"><button class="btn small" data-action="help:clear">清除</button></div></div>' +
+      '<div class="help-layout"><aside class="card help-toc"><b>说明目录</b><nav aria-label="使用说明目录">' + toc + '</nav>' +
+      '<div class="small muted">操作位置与页面名称一致<br>更新于 ' + esc(guide ? guide.updatedAt : '') + '</div></aside>' +
+      '<div class="help-content" data-help-results>' + helpResultsHtml() + '</div></div>' +
+      '<div class="help-footer">说明介绍产品操作与金额口径。每条建议的金额、数据日和缺口，请以对应页面的实际结果为准。</div></div>';
+  }
+
+  function updateHelpResults() {
+    var results = $('[data-help-results]');
+    if (results) results.innerHTML = helpResultsHtml();
+  }
+
   function tplSettings() {
     var lock = state.settings.lock || { enabled: false };
     var txnCount = state.txns.length;
@@ -4393,6 +4460,7 @@
         setItem('清空所有数据', '需输入"清空"确认', 'set:clear') +
       '</div>' +
       '<div class="set-group"><div class="sg-title">关于</div>' +
+        setItem('使用说明', '首次设置 / 月度结账 / 决策复盘 / 常见问题', 'nav:help') +
         setItem('隐私承诺', '零网络请求 · 数据仅存本机', 'set:privacy') +
         setItem('账单导出教程', '微信 / 支付宝 / 招行 / 中行', 'set:howto') +
         setItem('安装到主屏（PWA）', '浏览器菜单选择"安装应用/添加到主屏幕"', 'set:pwa') +
@@ -5420,6 +5488,26 @@
 
   /* ================= 事件分发 ================= */
   var actions = {
+    'nav:help': function () { nav('help'); },
+    'help:clear': function () {
+      state.helpQuery = '';
+      var input = $('#help-search');
+      if (input) input.value = '';
+      updateHelpResults();
+      if (input) input.focus();
+    },
+    'help:section': function (el) {
+      state.helpQuery = '';
+      var input = $('#help-search');
+      if (input) input.value = '';
+      updateHelpResults();
+      var section = document.getElementById('help-' + el.dataset.section);
+      if (section) {
+        section.scrollIntoView({ block: 'start' });
+        var heading = section.querySelector('h2');
+        if (heading) heading.focus({ preventScroll: true });
+      }
+    },
     'nav:home': function () { nav('home'); },
     'nav:cashflow': function () { nav('cashflow'); },
     'nav:list': function () { nav('list'); },
@@ -6445,6 +6533,7 @@
   };
 
   var inputs = {
+    'help:q': function (el) { state.helpQuery = el.value; updateHelpResults(); },
     // 5D 金额输入只记在内存里：整页重绘（例如生成建议后）不丢用户刚打的数字
     'advice:amount': function (el) { state.adviceAmount = el.value; },
     // 6C 决定理由草稿：提交失败重绘弹层时不能丢用户已打的字

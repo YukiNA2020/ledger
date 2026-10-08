@@ -1,0 +1,110 @@
+✖ 6R-05 执行本金和费用累加超出安全整数时拒绝，边界值不失真 (0.956833ms)
+✔ 6R-06 缺任一汇率优先返回全 null，汇总不因遍历顺序溢出或输出部分小计 (0.602917ms)
+✖ 6R-01 可比快照必须有完整金额与六类，损坏输入返回错误而非对照计算崩溃 (5.169083ms)
+✖ 6R-02 缺汇率快照必须三个汇总全 null，拒绝部分小计与伪 0 (0.302125ms)
+✖ 6R-03 损坏快照不能继续关联或解绑，拒绝后行与幂等记录均不变 (68.838917ms)
+✖ 6R-04 换成建议之外的标的，即使本金相等也必须写说明，金额理由码保持契约定义 (41.474542ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 1
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 188.231541
+
+✖ failing tests:
+
+test at tests/decision-summary.test.js:16:1
+✖ 6R-05 执行本金和费用累加超出安全整数时拒绝，边界值不失真 (0.956833ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (/Users/jing/Desktop/some_code/account/ledger/tests/decision-summary.test.js:19:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.start (node:internal/test_runner/test:1257:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: { code: 'invalid_decision_record' },
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at tests/domain-phase6.test.js:97:1
+✖ 6R-01 可比快照必须有完整金额与六类，损坏输入返回错误而非对照计算崩溃 (5.169083ms)
+  AssertionError [ERR_ASSERTION]: classes
+  + actual - expected
+  
+  + null
+  - 'invalid_decision_record'
+  
+      at TestContext.<anonymous> (/Users/jing/Desktop/some_code/account/ledger/tests/domain-phase6.test.js:100:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.start (node:internal/test_runner/test:1257:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: 'invalid_decision_record',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/domain-phase6.test.js:106:1
+✖ 6R-02 缺汇率快照必须三个汇总全 null，拒绝部分小计与伪 0 (0.302125ms)
+  AssertionError [ERR_ASSERTION]: null mask=1
+  
+  true !== false
+  
+      at TestContext.<anonymous> (/Users/jing/Desktop/some_code/account/ledger/tests/domain-phase6.test.js:112:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/server-phase6.test.js:215:1
+✖ 6R-03 损坏快照不能继续关联或解绑，拒绝后行与幂等记录均不变 (68.838917ms)
+  AssertionError [ERR_ASSERTION]: /links: {"ok":true,"link":{"id":"lnk-e284fbeb0df9ca9e","decisionId":"dec-aebdaad101f24d06","securityEventId":"sev-review-2","linkedOn":"2026-09-30","linkedAt":"2026-09-30T08:00:00.000Z","note":null,"unlinkedOn":null,"unlinkedAt":null,"unlinkNote":null},"links":[{"id":"lnk-05b6f2d004ae803a","securityEventId":"sev-review-1","event":{"eventType":"buy","occurredAt":"2026-09-30","quantity":"20","priceMinor":10000,"feeMinor":500,"currency":"CNY","instrumentId":"ins-voo","accountId":"acc-broker"},"linkedOn":"2026-09-30","unlinkedOn":null,"note":null,"unlinkNote":null},{"id":"lnk-e284fbeb0df9ca9e","securityEventId":"sev-review-2","event":{"eventType":"buy","occurredAt":"2026-09-30","quantity":"20","priceMinor":10000,"feeMinor":500,"currency":"CNY","instrumentId":"ins-voo","accountId":"acc-broker"},"linkedOn":"2026-09-30","unlinkedOn":null,"note":null,"unlinkNote":null}],"execution":{"linkedCount":2,"linkedPrincipalCnyMinor":400000,"linkedFeeCnyMinor":1000,"remainingMinor":-200000,"fxUnavailable":[]},"created":true}
+  
+  201 !== 400
+  
+      at TestContext.<anonymous> (/Users/jing/Desktop/some_code/account/ledger/tests/server-phase6.test.js:240:14)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1404:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 201,
+    expected: 400,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/server-phase6.test.js:248:1
+✖ 6R-04 换成建议之外的标的，即使本金相等也必须写说明，金额理由码保持契约定义 (41.474542ms)
+  AssertionError [ERR_ASSERTION]: {"ok":true,"decision":{"id":"dec-8aef42a936189d19","recommendationId":"rec-aef175a42b640c2f","state":"executed","lastSeq":2,"createdAt":"2026-09-30T08:00:00.000Z","updatedAt":"2026-09-30T08:00:00.000Z","eventMonths":["2026-09"]},"events":[{"id":"dev-44e4bde3b2943c4e","decisionId":"dec-8aef42a936189d19","seq":1,"fromState":"proposed","toState":"accepted","reasonCode":"agree","note":"接受","occurredAt":"2026-09-30","recordedAt":"2026-09-30T08:00:00.000Z","actor":"local-user","snapshot":{"asOf":"2026-09-30","available":true,"blockers":[],"capturedAt":"2026-09-30T08:00:00.000Z","cashReconciled":true,"classes":[{"assetClass":"cash","band":"above_max","deviationBps":7091,"maxBps":3500,"minBps":1500,"pctBps":9091,"targetBps":2000,"valueMinor":50000000},{"assetClass":"fixed_income","band":"below_min","deviationBps":-3000,"maxBps":4500,"minBps":2000,"pctBps":0,"targetBps":3000,"valueMinor":0},{"assetClass":"broad_equity","band":"below_min","deviationBps":-3091,"maxBps":5000,"minBps":3000,"pctBps":909,"targetBps":4000,"valueMinor":5000000},{"assetClass":"theme_equity","band":"below_min","deviationBps":-1000,"maxBps":2000,"minBps":500,"pctBps":0,"targetBps":1000,"valueMinor":0},{"assetClass":"stock","band":"within","deviationBps":0,"maxBps":1000,"minBps":0,"pctBps":0,"targetBps":0,"valueMinor":0},{"assetClass":"other","band":"within","deviationBps":0,"maxBps":1000,"minBps":0,"pctBps":0,"targetBps":0,"valueMinor":0}],"execution":{"fxUnavailable":[],"linkedCount":0,"linkedFeeCnyMinor":0,"linkedPrincipalCnyMinor":0,"remainingMinor":200000},"investableTotalMinor":55000000,"netWorthMinor":105000000,"reason":null,"recommendationRef":{"allocatedTotalMinor":200000,"asOf":"2026-09-30","inputHash":"aef175a42b640c2f35af8bacab7b02ec6b48987532dbcd9383f3595534ea9f9f","recommendationId":"rec-aef175a42b640c2f","status":"formal"},"schemaVersion":1,"targetRef":{"level":3,"ruleVersion":"risk-rules-v1","targetId":"at-f0719e79882451c2","templateVersion":"risk-targets-v1"},"valuationStatus":"formal"},"snapshotHash":"9a7b998c6dc17e032e07ca0a494a775229188cfa6742f19e797844d6d2d33c61","payloadHash":"8aebb4ac36fb757516565e29253c451a5410b27928f678c17ec138d62a762374"},{"id":"dev-74a835a3fe4cb0d1","decisionId":"dec-8aef42a936189d19","seq":2,"fromState":"accepted","toState":"executed","reasonCode":"executed_as_planned","note":null,"occurredAt":"2026-09-30","recordedAt":"2026-09-30T08:00:00.000Z","actor":"local-user","snapshot":{"schemaVersion":1,"asOf":"2026-09-30","capturedAt":"2026-09-30T08:00:00.000Z","available":true,"reason":null,"blockers":[],"cashReconciled":true,"valuationStatus":"formal","netWorthMinor":105002000,"investableTotalMinor":55002000,"targetRef":{"targetId":"at-f0719e79882451c2","templateVersion":"risk-targets-v1","ruleVersion":"risk-rules-v1","level":3},"recommendationRef":{"recommendationId":"rec-aef175a42b640c2f","inputHash":"aef175a42b640c2f35af8bacab7b02ec6b48987532dbcd9383f3595534ea9f9f","asOf":"2026-09-30","status":"formal","allocatedTotalMinor":200000},"classes":[{"assetClass":"cash","valueMinor":50000000,"pctBps":9091,"minBps":1500,"targetBps":2000,"maxBps":3500,"band":"above_max","deviationBps":7091},{"assetClass":"fixed_income","valueMinor":0,"pctBps":0,"minBps":2000,"targetBps":3000,"maxBps":4500,"band":"below_min","deviationBps":-3000},{"assetClass":"broad_equity","valueMinor":5002000,"pctBps":909,"minBps":3000,"targetBps":4000,"maxBps":5000,"band":"below_min","deviationBps":-3091},{"assetClass":"theme_equity","valueMinor":0,"pctBps":0,"minBps":500,"targetBps":1000,"maxBps":2000,"band":"below_min","deviationBps":-1000},{"assetClass":"stock","valueMinor":0,"pctBps":0,"minBps":0,"targetBps":0,"maxBps":1000,"band":"within","deviationBps":0},{"assetClass":"other","valueMinor":0,"pctBps":0,"minBps":0,"targetBps":0,"maxBps":1000,"band":"within","deviationBps":0}],"execution":{"linkedCount":1,"linkedPrincipalCnyMinor":200000,"linkedFeeCnyMinor":500,"remainingMinor":0,"fxUnavailable":[]}},"snapshotHash":"5cb76a93104338ec03059de510e7a539ce0e1149cd9c028d41b0ac12afadda9e","payloadHash":"7ca14c23b8a9a7beaee96f9bdb475f3549e333cfc0ded93052ed2a2b0d9b2bea"}],"links":[{"id":"lnk-4f26a761a0652a26","securityEventId":"sev-review-alt","linkedOn":"2026-09-30","unlinkedOn":null,"note":null}],"execution":{"linkedCount":1,"linkedPrincipalCnyMinor":200000,"linkedFeeCnyMinor":500,"remainingMinor":0,"fxUnavailable":[]}}
+  
+  200 !== 400
+  
+      at TestContext.<anonymous> (/Users/jing/Desktop/some_code/account/ledger/tests/server-phase6.test.js:265:12)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1404:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 200,
+    expected: 400,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

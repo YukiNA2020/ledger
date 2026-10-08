@@ -3982,6 +3982,47 @@
         8000, '关闭详情');
     });
 
+    await check('使用说明：三处入口、搜索不丢焦点、目录定位与业务跳转，阅读不改账本', async function () {
+      // 验收骨架默认隐藏应用；本项临时显示，才能检查真实键盘焦点。
+      var app = document.getElementById('app');
+      var priorDisplay = app.style.display;
+      app.style.display = 'block';
+      try {
+      var before = JSON.stringify(await apiState());
+      location.hash = 'home';
+      await waitFor(function () { return document.querySelector('#view.view-home'); }, 8000, '首页');
+      assert(document.querySelector('#tabbar [data-action="nav:help"]'), '侧栏帮助入口');
+      clickAction('#view [data-action="nav:help"]');
+      await waitFor(function () { return document.querySelector('[data-help-page]'); }, 8000, '说明页');
+      equal(document.querySelectorAll('[data-help-section]').length, 9, '完整九章');
+      equal(document.querySelectorAll('.help-toc [data-action="help:section"]').length, 9, '九章目录');
+      assertKnowLinksResolve(document.querySelector('#view'), '操作说明');
+      var inp = document.getElementById('help-search');
+      inp.focus();
+      inp.value = '交易 汇率';
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      assert(document.activeElement === inp, '搜索后保留输入焦点');
+      assert(document.querySelector('[data-help-section="execution"]'), '找到交易操作');
+      assert(document.querySelectorAll('[data-help-section]').length < 9, '搜索筛选章节');
+      assert(document.querySelector('#help-problems details[open]'), '搜索时展开相关常见问题');
+      inp.value = '<script>no-help-match</script>';
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      assert(document.querySelector('.help-no-results'), '搜索无结果提示');
+      clickAction('.help-no-results [data-action="help:clear"]');
+      equal(document.querySelectorAll('[data-help-section]').length, 9, '清除恢复全部');
+      equal(inp.value, '', '输入同步清空');
+      clickAction('.help-toc [data-section="monthly"]');
+      assert(document.activeElement === document.querySelector('#help-monthly h2'), '目录定位并移交焦点');
+      clickAction('#help-monthly [data-action="nav:assets"]');
+      await waitFor(function () { return document.querySelector('#view.view-assets'); }, 8000, '操作页面跳转');
+      location.hash = 'settings';
+      await waitFor(function () { return document.querySelector('#view.view-settings'); }, 8000, '我的');
+      clickAction('#view [data-action="nav:help"]');
+      await waitFor(function () { return document.querySelector('[data-help-page]'); }, 8000, '我的入口');
+      equal(JSON.stringify(await apiState()), before, '阅读、搜索和跳转不改账本');
+      } finally { app.style.display = priorDisplay; }
+    });
+
     render();
   }
 

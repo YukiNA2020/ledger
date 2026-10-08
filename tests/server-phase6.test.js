@@ -212,6 +212,124 @@ async function putFullState(port, mutate) {
 
 /* ================= 1. 契约 §1.2：49 个有序对全遍历 ================= */
 
+test('6R-07 并发提交：创建和执行同键只写一次，同一买入跨决策竞争只有一个赢家', async () => {
+  const ctx = setup('ledger-p6-review-concurrent-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const body = { recommendationId: rec.id, intent: 'accepted', note: '并发接受' };
+    const created = await Promise.all(Array.from({ length: 12 }, () => post(srv.port, '/api/v1/decisions', body,
+      { headers: { 'Idempotency-Key': 'review-concurrent-create' } })));
+    assert.strictEqual(created.filter(r => r.status === 201).length, 1);
+    assert.strictEqual(created.filter(r => r.headers['x-ledger-idempotent'] === 'replay').length, 11);
+    assert.strictEqual(new Set(created.map(r => r.json.decision.id)).size, 1);
+    const id = created[0].json.decision.id;
+    assert.strictEqual((await putFullState(srv.port, st => st.assets.securityEvents.push(buyEvent('sev-concurrent')))).status, 200);
+    const rec2 = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts, { newFundsMinor: 200001 }))).json.recommendation;
+    const d2 = (await post(srv.port, '/api/v1/decisions', { recommendationId: rec2.id, intent: 'accepted', note: '第二条' })).json.decision;
+    const contenders = await Promise.all([id, d2.id].map(d => post(srv.port, '/api/v1/decisions/' + d + '/links',
+      { securityEventId: 'sev-concurrent' })));
+    assert.deepStrictEqual(contenders.map(r => r.status).sort(), [201, 409]);
+    assert.strictEqual(contenders.find(r => r.status === 409).json.error.code, 'event_already_linked');
+    assert.strictEqual(R.readDecisionLinks(ctx.db).length, 1);
+    const winner = [id, d2.id][contenders.findIndex(r => r.status === 201)];
+    const path = '/api/v1/decisions/' + winner + '/events';
+    const executed = await Promise.all(Array.from({ length: 12 }, () => post(srv.port, path,
+      { toState: 'executed', note: '完成买入' }, { headers: { 'Idempotency-Key': 'review-concurrent-execute' } })));
+    assert.ok(executed.every(r => r.status === 200));
+    assert.strictEqual(executed.filter(r => r.headers['x-ledger-idempotent'] === 'replay').length, 11);
+    const detail = (await get(srv.port, '/api/v1/decisions/' + winner)).json;
+    assert.strictEqual(detail.events.length, 2);
+    assert.strictEqual(detail.decision.lastSeq, 2);
+  } finally { await srv.close(); ctx.close(); }
+});
+
+test('6R-08 事件 INSERT 中途失败回滚状态与幂等键，解除故障后同键可重试', async () => {
+  const ctx = setup('ledger-p6-review-rollback-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const created = await post(srv.port, '/api/v1/decisions', { recommendationId: rec.id, intent: 'accepted', note: '接受' });
+    const id = created.json.decision.id;
+    assert.strictEqual((await putFullState(srv.port, st => st.assets.securityEvents.push(buyEvent('sev-rollback')))).status, 200);
+    assert.strictEqual((await post(srv.port, '/api/v1/decisions/' + id + '/links', { securityEventId: 'sev-rollback' })).status, 201);
+    const before = (await get(srv.port, '/api/v1/state')).json;
+    ctx.db.exec("CREATE TRIGGER review_abort_event BEFORE INSERT ON decision_events WHEN NEW.seq=2 BEGIN SELECT RAISE(ABORT, 'review injected failure'); END");
+    const eventPath = '/api/v1/decisions/' + id + '/events';
+    const options = { headers: { 'Idempotency-Key': 'review-rollback-key' } };
+    const rejected = await post(srv.port, eventPath, { toState: 'executed' }, options);
+    assert.strictEqual(rejected.status, 500);
+    assert.deepStrictEqual((await get(srv.port, '/api/v1/state')).json, before);
+    assert.ok(!R.findIdempotent(ctx.db, 'review-rollback-key', 'POST', eventPath));
+    ctx.db.exec('DROP TRIGGER review_abort_event');
+    const retried = await post(srv.port, eventPath, { toState: 'executed' }, options);
+    assert.strictEqual(retried.status, 200, JSON.stringify(retried.json));
+    assert.strictEqual(retried.json.events.length, 2);
+    assert.strictEqual(retried.json.decision.state, 'executed');
+  } finally { await srv.close(); ctx.close(); }
+});
+
+test('6R-03 损坏快照不能继续关联或解绑，拒绝后行与幂等记录均不变', async () => {
+  const ctx = setup('ledger-p6-review-integrity-');
+  const srv = await startServer(ctx);
+  try {
+    const facts = await seedAdviceChain(srv.port);
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const created = await post(srv.port, '/api/v1/decisions', { recommendationId: rec.id, intent: 'accepted', note: '接受' });
+    const id = created.json.decision.id;
+    assert.strictEqual((await putFullState(srv.port, st => {
+      st.assets.securityEvents.push(buyEvent('sev-review-1'), buyEvent('sev-review-2'));
+    })).status, 200);
+    const linked = await post(srv.port, '/api/v1/decisions/' + id + '/links', { securityEventId: 'sev-review-1' });
+    assert.strictEqual(linked.status, 201);
+    const event = ctx.db.prepare('SELECT id, snapshot_json FROM decision_events WHERE decision_id=?').get(id);
+    const broken = JSON.parse(event.snapshot_json);
+    broken.netWorthMinor += 1;
+    ctx.db.prepare('UPDATE decision_events SET snapshot_json=? WHERE id=?').run(R.canonicalJson(broken), event.id);
+    assert.strictEqual((await get(srv.port, '/api/v1/decisions/' + id)).status, 400);
+    const before = R.readDecisionLinks(ctx.db);
+    for (const [suffix, body] of [
+      ['/links', { securityEventId: 'sev-review-2' }],
+      ['/links/unlink', { linkId: linked.json.link.id, note: '更正' }]
+    ]) {
+      const key = 'review-integrity-' + suffix;
+      const response = await post(srv.port, '/api/v1/decisions/' + id + suffix, body, { headers: { 'Idempotency-Key': key } });
+      assert.strictEqual(response.status, 400, suffix + ': ' + JSON.stringify(response.json));
+      assert.strictEqual(response.json.error.code, 'invalid_decision_record');
+      assert.deepStrictEqual(R.readDecisionLinks(ctx.db), before);
+      assert.ok(!R.findIdempotent(ctx.db, key, 'POST', '/api/v1/decisions/' + id + suffix));
+    }
+  } finally { await srv.close(); ctx.close(); }
+});
+
+test('6R-04 换成建议之外的标的，即使本金相等也必须写说明，金额理由码保持契约定义', async () => {
+  const ctx = setup('ledger-p6-review-substitution-');
+  const srv = await startServer(ctx);
+  try {
+    const assets = investmentAssets();
+    assets.instruments.push({ ...assets.instruments[0], id: 'ins-alt', symbol: 'ALT', name: '替代宽基' });
+    assets.quotes.push({ ...assets.quotes[0], instrumentId: 'ins-alt' });
+    const facts = await seedAdviceChain(srv.port, { assets });
+    const rec = (await post(srv.port, '/api/v1/recommendations', recommendBody(facts))).json.recommendation;
+    const created = await post(srv.port, '/api/v1/decisions', { recommendationId: rec.id, intent: 'accepted', note: '接受' });
+    const id = created.json.decision.id;
+    assert.strictEqual((await putFullState(srv.port, st => {
+      st.assets.securityEvents.push(buyEvent('sev-review-alt', { instrumentId: 'ins-alt' }));
+    })).status, 200);
+    assert.strictEqual((await post(srv.port, '/api/v1/decisions/' + id + '/links', { securityEventId: 'sev-review-alt' })).status, 201);
+    const before = (await get(srv.port, '/api/v1/state')).json;
+    const noNote = await post(srv.port, '/api/v1/decisions/' + id + '/events', { toState: 'executed' });
+    assert.strictEqual(noNote.status, 400, JSON.stringify(noNote.json));
+    assert.strictEqual(noNote.json.error.code, 'deviation_note_required');
+    assert.deepStrictEqual((await get(srv.port, '/api/v1/state')).json, before);
+    const executed = await post(srv.port, '/api/v1/decisions/' + id + '/events', { toState: 'executed', note: '使用替代宽基，金额保持一致' });
+    assert.strictEqual(executed.status, 200, JSON.stringify(executed.json));
+    assert.strictEqual(executed.json.events[1].reasonCode, 'executed_as_planned');
+  } finally { await srv.close(); ctx.close(); }
+});
+
 test('6B-11 数据驱动全遍历 49 个有序对：合法 6 恰好追加 1 条事件，非法 43 全部整体回滚', async () => {
   const ctx = setup('ledger-p6a-');
   const srv = await startServer(ctx);
